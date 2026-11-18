@@ -2,14 +2,18 @@ import Foundation
 import ImageIO
 import UniformTypeIdentifiers
 
-/// A meal logged from a photo and one line, or from a barcode, as it is
-/// kept on this phone until the backend has it.
+/// A meal built from parts, or one thing logged from a photo and a line, a
+/// barcode or typed figures, as it is kept on this phone until the backend
+/// has it.
 public struct FoodCapture: Codable, Equatable, Sendable, Identifiable {
     /// Made here when the meal is logged, so sending it twice logs it once.
     public var id: UUID
     public var eatenAt: Date
     public var slot: MealSlot
     public var kind: Kind
+    /// The built meal this is a part of: one already logged, which it
+    /// joins, or one still being built here, which a photo is sent ahead of.
+    public var partOf: UUID?
 
     public enum Kind: Codable, Equatable, Sendable {
         /// The photo itself is kept beside the list, as a file named by the
@@ -18,13 +22,19 @@ public struct FoodCapture: Codable, Equatable, Sendable, Identifiable {
         /// `product` is what this phone knew of the code when it was
         /// scanned, to show until the backend has it.
         case barcode(code: String, grams: Double, product: Product?)
+        /// A food typed by hand, weighed or whole.
+        case typed(Ingredient)
+        /// A meal built from parts, in the order added. Its photos are
+        /// captures of their own, sent ahead of it.
+        case built(name: String, parts: [MealPart])
     }
 
-    public init(id: UUID = UUID(), eatenAt: Date, slot: MealSlot, kind: Kind) {
+    public init(id: UUID = UUID(), eatenAt: Date, slot: MealSlot, kind: Kind, partOf: UUID? = nil) {
         self.id = id
         self.eatenAt = eatenAt
         self.slot = slot
         self.kind = kind
+        self.partOf = partOf
     }
 
     /// What the meal is called while it waits to be sent.
@@ -35,6 +45,11 @@ public struct FoodCapture: Codable, Equatable, Sendable, Identifiable {
             return trimmed.isEmpty ? "Photo meal" : trimmed
         case .barcode(let code, _, let product):
             return product?.name ?? "Barcode \(code)"
+        case .typed(let food):
+            return food.name
+        case .built(let name, _):
+            let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? slot.title : trimmed
         }
     }
 }

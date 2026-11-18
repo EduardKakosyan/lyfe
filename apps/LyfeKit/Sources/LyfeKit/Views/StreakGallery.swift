@@ -291,7 +291,7 @@
     /// launched with LYFE_DEBUG_FOOD set to `day` (breakfast and lunch
     /// logged), `morning`, `done`, `over`, `recovering`, `offline`, `empty`
     /// (nothing set up yet), `editor`, `new` or `targets`, or one of the
-    /// photo and barcode screens (`CaptureGallery`).
+    /// builder, photo and barcode screens (`CaptureGallery`).
     public struct FoodGallery: View {
         var screen: String
 
@@ -334,9 +334,9 @@
                 case _ where CaptureGallery.screens.contains(screen):
                     CaptureGallery(screen: screen)
                 case "editor":
-                    MealEditorView(start: MealDraft(editing: Self.lunch), onSave: { _ in nil }, onRemove: { _ in nil }, onClose: {})
+                    MealBuilderView(draft: MealDraft(editing: Self.lunch), onChange: { _ in }, onSave: { nil }, onClose: {})
                 case "new":
-                    MealEditorView(start: MealDraft(), onSave: { _ in nil }, onRemove: { _ in nil }, onClose: {})
+                    MealBuilderView(draft: MealDraft(), onChange: { _ in }, onSave: { nil }, onClose: {})
                 case "targets":
                     FoodTargetsView(current: Self.target, today: Self.today, onSave: { _ in nil }, onClose: {})
                 default:

@@ -111,13 +111,14 @@ struct LyfeApp: App {
             }
         }
 
-        /// With LYFE_DEBUG_OPEN set to `food`, `meal`, `targets`, `photo`,
-        /// `scan` or `progress`, a signed-in development build opens that
+        /// With LYFE_DEBUG_OPEN set to `food`, `meal`, `build`, `targets`,
+        /// `photo`, `scan` or `progress`, a signed-in development build opens that
         /// screen by itself once Home has arrived. With LYFE_DEBUG_FOOD_TAP
         /// set as well it first logs the meal the Food screen's bar offers,
         /// as one tap would; with LYFE_DEBUG_FOOD_PHOTO set to a line it
         /// logs a made-up plate as a photo meal with that line and opens its
-        /// estimate. Use either against a local backend, since the meal is
+        /// estimate, or with `build` adds it to the meal being built as a
+        /// part. Use either against a local backend, since the meal is
         /// recorded.
         private func openFromEnvironment() async {
             let environment = ProcessInfo.processInfo.environment
@@ -127,6 +128,11 @@ struct LyfeApp: App {
             }
             if environment["LYFE_DEBUG_FOOD_TAP"] != nil, let meal = model.nextMeal {
                 await model.logMeal(meal)
+            }
+            if let line = environment["LYFE_DEBUG_FOOD_PHOTO"], screen == "build" {
+                model.openMealBuilder()
+                await model.addPhoto(note: line, photo: DebugSample.plate())
+                return
             }
             if let line = environment["LYFE_DEBUG_FOOD_PHOTO"] {
                 model.openFood()
@@ -138,6 +144,7 @@ struct LyfeApp: App {
             case "photo": model.openPhotoMeal()
             case "scan": model.openScan()
             case "meal": model.openMealEditor(model.home?.food?.meals.first)
+            case "build": model.openMealBuilder()
             case "targets": model.openTargets()
             case "progress": model.openProgress()
             default: break

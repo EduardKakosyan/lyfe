@@ -11,10 +11,11 @@
 //! with nothing logged is reported as open, and the day's total is only
 //! what was logged.
 //!
-//! Meals that are not saved meals come from a photo and one line, which a
-//! model estimates, or from a barcode and the label's figures. The day
-//! keeps what was measured (saved meals, labels) apart from what was
-//! estimated (photos), and a meal whose figures are not known yet (a photo
+//! Meals that are not saved meals are built from parts: a barcode and the
+//! label's figures, a food typed by hand, or a photo and one line, which a
+//! model estimates. A meal is what its parts add up to. The day keeps what
+//! was measured (saved meals, labels, typed figures) apart from what was
+//! estimated (photos), and a part whose figures are not known yet (a photo
 //! still being estimated, a barcode not in the database) is logged but
 //! left out of the total: unknown, not zero.
 //!
@@ -44,6 +45,9 @@ pub const MAX_GRAMS: f64 = 20_000.0;
 /// Pure fat is 900 kcal per 100 g; nothing has more.
 pub const MAX_KCAL_PER_100G: f64 = 900.0;
 pub const MAX_PROTEIN_PER_100G: f64 = 100.0;
+/// The most one thing typed whole can come to: a batch's jar of sauce.
+pub const MAX_WHOLE_KCAL: f64 = 10_000.0;
+pub const MAX_WHOLE_PROTEIN_G: f64 = 1_000.0;
 /// The most portions one tap can log.
 pub const MAX_SERVINGS: f64 = 10.0;
 /// Daily targets taken. Anything outside is a typing slip, not a target.
@@ -93,6 +97,16 @@ impl Slot {
             Slot::Snack => "snack",
         }
     }
+
+    /// What a meal with no name of its own is called.
+    pub fn title(self) -> &'static str {
+        match self {
+            Slot::Breakfast => "Breakfast",
+            Slot::Lunch => "Lunch",
+            Slot::Dinner => "Dinner",
+            Slot::Snack => "Snack",
+        }
+    }
 }
 
 /// When the logging prompt goes out.
@@ -109,14 +123,96 @@ impl Default for FoodSettings {
     }
 }
 
-/// One thing that went into a recipe: its weight, and the figures from
-/// its label.
+/// How much of something there is, and so what it comes to.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum Quantity {
+    /// Weighed, with the figures per 100 g from its label.
+    Weighed { grams: f64, kcal_per_100g: f64, protein_per_100g: f64 },
+    /// Just what it comes to: a menu's figures, or a photo's estimate.
+    Whole { kcal: f64, protein_g: f64 },
+}
+
+impl Quantity {
+    /// Its kcal and grams of protein, unrounded.
+    pub fn kcal_and_protein(self) -> (f64, f64) {
+        match self {
+            Quantity::Weighed { grams, kcal_per_100g, protein_per_100g } => {
+                (grams * kcal_per_100g / 100.0, grams * protein_per_100g / 100.0)
+            }
+            Quantity::Whole { kcal, protein_g } => (kcal, protein_g),
+        }
+    }
+
+    /// What it comes to, rounded as a logged meal is.
+    pub fn amount(self) -> Amount {
+        let (kcal, protein_g) = self.kcal_and_protein();
+        Amount { kcal: kcal.round() as u32, protein_dg: (protein_g * 10.0).round() as u32 }
+    }
+}
+
+/// One thing that goes into a meal: weighed, with the figures from its
+/// label, or just what it comes to.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Ingredient {
     pub name: String,
-    pub grams: f64,
-    pub kcal_per_100g: f64,
-    pub protein_per_100g: f64,
+    #[serde(flatten)]
+    pub quantity: Quantity,
+    /// True for what a photo was estimated at: it stays an estimate
+    /// however often the meal is logged.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub estimated: bool,
+    /// The barcode it was scanned from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+}
+
+impl Ingredient {
+    /// Weighed and typed from its label.
+    pub fn weighed(name: &str, grams: f64, kcal_per_100g: f64, protein_per_100g: f64) -> Ingredient {
+        Ingredient {
+            name: name.into(),
+            quantity: Quantity::Weighed { grams, kcal_per_100g, protein_per_100g },
+            estimated: false,
+            code: None,
+        }
+    }
+
+    /// Typed as what it comes to.
+    pub fn whole(name: &str, kcal: f64, protein_g: f64) -> Ingredient {
+        Ingredient { name: name.into(), quantity: Quantity::Whole { kcal, protein_g }, estimated: false, code: None }
+    }
+
+    /// The ingredient as it is kept, or what is wrong with it.
+    pub fn checked(self) -> Result<Ingredient, &'static str> {
+        let name = clean_name(&self.name).ok_or("an ingredient's name must be 1 to 60 characters")?;
+        match self.quantity {
+            Quantity::Weighed { grams, kcal_per_100g, protein_per_100g } => {
+                if !(grams.is_finite() && grams > 0.0 && grams <= MAX_GRAMS) {
+                    return Err("an ingredient's weight must be above 0 and at most 20000 g");
+                }
+                if !within(kcal_per_100g, 0.0, MAX_KCAL_PER_100G) {
+                    return Err("kcal per 100 g must be 0 to 900");
+                }
+                if !within(protein_per_100g, 0.0, MAX_PROTEIN_PER_100G) {
+                    return Err("protein per 100 g must be 0 to 100");
+                }
+            }
+            Quantity::Whole { kcal, protein_g } => {
+                if !within(kcal, 0.0, MAX_WHOLE_KCAL) {
+                    return Err("an ingredient's kcal must be 0 to 10000");
+                }
+                if !within(protein_g, 0.0, MAX_WHOLE_PROTEIN_G) {
+                    return Err("an ingredient's protein must be 0 to 1000 g");
+                }
+            }
+        }
+        let code = match &self.code {
+            Some(code) => Some(super::product::normalize_code(code).ok_or("a barcode is 8 to 14 digits")?),
+            None => None,
+        };
+        Ok(Ingredient { name, code, ..self })
+    }
 }
 
 /// Calories and protein of something eaten. Protein is in tenths of a
@@ -135,6 +231,14 @@ impl Amount {
     fn plus(self, other: Amount) -> Amount {
         Amount { kcal: self.kcal + other.kcal, protein_dg: self.protein_dg + other.protein_dg }
     }
+
+    /// What is left of it without `part`, which is never more than it.
+    fn minus(self, part: Amount) -> Amount {
+        Amount {
+            kcal: self.kcal.saturating_sub(part.kcal),
+            protein_dg: self.protein_dg.saturating_sub(part.protein_dg),
+        }
+    }
 }
 
 /// Where a logged meal's figures came from.
@@ -147,6 +251,11 @@ pub enum Source {
     Photo,
     /// A packaged food's label and the grams eaten. Measured.
     Barcode,
+    /// A food typed by hand: weighed with its label's figures, or just
+    /// what it came to. Measured.
+    Typed,
+    /// A meal made of parts. Its figures are its parts'.
+    Built,
 }
 
 impl Source {
@@ -155,11 +264,9 @@ impl Source {
             Source::Saved => "saved",
             Source::Photo => "photo",
             Source::Barcode => "barcode",
+            Source::Typed => "typed",
+            Source::Built => "built",
         }
-    }
-
-    pub fn is_estimated(self) -> bool {
-        self == Source::Photo
     }
 }
 
@@ -215,13 +322,26 @@ pub struct PhotoDetail {
     pub problem: Option<String>,
 }
 
+/// The figures per 100 g on a label.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct Label {
+    pub kcal_per_100g: f64,
+    pub protein_per_100g: f64,
+}
+
 /// What a logged meal carries, by where it came from.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum Detail {
     #[default]
     Saved,
     Photo(PhotoDetail),
-    Barcode { code: String, grams: f64 },
+    /// `label` is the label's figures as they stood when it was logged;
+    /// none while the code is not known.
+    Barcode { code: String, grams: f64, label: Option<Label> },
+    /// Weighed, with its grams and label, or typed whole, with neither.
+    Typed { grams: Option<f64>, label: Option<Label> },
+    /// A meal made of parts, which are entries of their own.
+    Built,
 }
 
 impl Detail {
@@ -230,6 +350,8 @@ impl Detail {
             Detail::Saved => Source::Saved,
             Detail::Photo(_) => Source::Photo,
             Detail::Barcode { .. } => Source::Barcode,
+            Detail::Typed { .. } => Source::Typed,
+            Detail::Built => Source::Built,
         }
     }
 }
@@ -272,30 +394,34 @@ impl SavedMeal {
         if ingredients.is_empty() || ingredients.len() > MAX_INGREDIENTS {
             return Err("a meal has 1 to 40 ingredients");
         }
-        let mut cleaned = Vec::with_capacity(ingredients.len());
-        for ingredient in ingredients {
-            let name = clean_name(&ingredient.name).ok_or("an ingredient's name must be 1 to 60 characters")?;
-            if !(ingredient.grams.is_finite() && ingredient.grams > 0.0 && ingredient.grams <= MAX_GRAMS) {
-                return Err("an ingredient's weight must be above 0 and at most 20000 g");
-            }
-            if !within(ingredient.kcal_per_100g, 0.0, MAX_KCAL_PER_100G) {
-                return Err("kcal per 100 g must be 0 to 900");
-            }
-            if !within(ingredient.protein_per_100g, 0.0, MAX_PROTEIN_PER_100G) {
-                return Err("protein per 100 g must be 0 to 100");
-            }
-            cleaned.push(Ingredient { name, ..ingredient });
-        }
-        Ok(SavedMeal { id, name, slot, portions, ingredients: cleaned })
+        let ingredients = ingredients.into_iter().map(Ingredient::checked).collect::<Result<Vec<_>, _>>()?;
+        Ok(SavedMeal { id, name, slot, portions, ingredients })
+    }
+
+    /// What `servings` portions of the ingredients picked by `counts` come to.
+    fn sum(&self, servings: f64, counts: impl Fn(&Ingredient) -> bool) -> Amount {
+        let (kcal, protein_g) =
+            self.ingredients.iter().filter(|i| counts(i)).fold((0.0, 0.0), |(kcal, protein), i| {
+                let (k, p) = i.quantity.kcal_and_protein();
+                (kcal + k, protein + p)
+            });
+        let share = servings / f64::from(self.portions);
+        Amount { kcal: (kcal * share).round() as u32, protein_dg: (protein_g * share * 10.0).round() as u32 }
     }
 
     /// What `servings` portions of the recipe come to.
     pub fn amount(&self, servings: f64) -> Amount {
-        let (kcal, protein_g) = self.ingredients.iter().fold((0.0, 0.0), |(kcal, protein), i| {
-            (kcal + i.grams * i.kcal_per_100g / 100.0, protein + i.grams * i.protein_per_100g / 100.0)
-        });
-        let share = servings / f64::from(self.portions);
-        Amount { kcal: (kcal * share).round() as u32, protein_dg: (protein_g * share * 10.0).round() as u32 }
+        self.sum(servings, |_| true)
+    }
+
+    /// The part of that which comes from estimated ingredients: what a
+    /// photo in the recipe was estimated at. Zero for a meal that was all
+    /// weighed.
+    pub fn estimated(&self, servings: f64) -> Amount {
+        let estimated = self.sum(servings, |i| i.estimated);
+        let whole = self.amount(servings);
+        // Rounded apart from the whole, it could pass it by one.
+        Amount { kcal: estimated.kcal.min(whole.kcal), protein_dg: estimated.protein_dg.min(whole.protein_dg) }
     }
 }
 
@@ -315,10 +441,39 @@ pub struct Entry {
     pub meal_id: Option<Uuid>,
     pub name: String,
     pub servings: f64,
-    /// Zero while `figures` is not known.
+    /// Zero while `figures` is not known, and for a built meal, whose
+    /// figures are its parts'.
     pub amount: Amount,
+    /// The part of `amount` that is an estimate, for a saved meal with a
+    /// photo's estimate among its ingredients. Zero otherwise.
+    pub estimated: Amount,
     pub figures: Figures,
     pub detail: Detail,
+    /// The built meal this is a part of.
+    pub part_of: Option<Uuid>,
+    /// Where it stands among that meal's parts, in the order added.
+    pub position: i32,
+}
+
+impl Entry {
+    /// What of it was measured, and what estimated.
+    fn split(&self) -> (Amount, Amount) {
+        match &self.detail {
+            Detail::Photo(_) => (Amount::default(), self.amount),
+            Detail::Saved => (self.amount.minus(self.estimated), self.estimated),
+            Detail::Barcode { .. } | Detail::Typed { .. } | Detail::Built => (self.amount, Amount::default()),
+        }
+    }
+
+    /// The kcal of it that carry a range: a model's estimate the owner has
+    /// not replaced with typed figures.
+    fn ranged_kcal(&self) -> u32 {
+        match &self.detail {
+            Detail::Photo(detail) if self.figures == Figures::Known && !detail.typed => self.amount.kcal,
+            Detail::Saved => self.estimated.kcal,
+            _ => 0,
+        }
+    }
 }
 
 /// The calorie and protein targets in force from a day on.
@@ -479,11 +634,17 @@ pub struct EntryView {
     pub kcal: u32,
     pub protein_g: f64,
     pub source: Source,
+    /// For a built meal, known once every part is; until then, what the
+    /// first part still waiting is waiting for.
     pub figures: Figures,
-    /// True for a photo meal, whose figures are a model's estimate.
+    /// True when any of its figures are a model's estimate: a photo meal,
+    /// or a meal with a photo among its parts or ingredients.
     pub estimated: bool,
-    /// How far either way an estimate may be. Only for a photo meal with
-    /// known figures the owner did not type.
+    /// The kcal of it that are estimated.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub kcal_estimated: u32,
+    /// How far either way the estimated part may take it. Only when part
+    /// of it is a model's estimate the owner did not replace.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kcal_low: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -492,6 +653,25 @@ pub struct EntryView {
     pub photo: Option<PhotoView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub barcode: Option<BarcodeView>,
+    /// The grams and the label's figures, for a scanned or typed food
+    /// that has them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weighed: Option<WeighedView>,
+    /// A built meal's parts, in the order added.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parts: Option<Vec<EntryView>>,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
+/// A food by its weight and the figures per 100 g on its label.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WeighedView {
+    pub grams: f64,
+    pub kcal_per_100g: f64,
+    pub protein_per_100g: f64,
 }
 
 /// A photo meal's line, what the model saw, and the oil question.
@@ -538,6 +718,10 @@ pub struct MealView {
     /// One portion.
     pub kcal: u32,
     pub protein_g: f64,
+    /// The kcal of a portion that are estimated: a photo among the
+    /// ingredients.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub kcal_estimated: u32,
     pub ingredients: Vec<Ingredient>,
 }
 
@@ -573,8 +757,12 @@ pub struct FoodDay {
     /// Main meals (breakfast, lunch, dinner) with nothing logged: unknown,
     /// not zero.
     pub open_slots: Vec<Slot>,
-    /// Today's entries, by slot and then in the order logged.
+    /// Today's meals, by slot and then in the order logged. A built meal
+    /// carries its parts.
     pub entries: Vec<EntryView>,
+    /// Photos sent to be estimated for a meal still being put together on
+    /// the phone. On no day, and in no total, until that meal is logged.
+    pub drafts: Vec<EntryView>,
     /// The saved meals, by slot, the one logged most recently first.
     pub meals: Vec<MealView>,
     /// Packaged food logged lately, most recent first, so a code scanned
@@ -583,15 +771,20 @@ pub struct FoodDay {
     pub streak: DayStreak,
 }
 
-/// An entry as the apps show it.
+/// The range a total may really be in, when `ranged` kcal of it are a
+/// model's estimate.
+fn widened(kcal: u32, ranged: u32, range_pct: u32) -> Option<(u32, u32)> {
+    (ranged > 0).then(|| {
+        let (low, high) = photo::range(ranged, range_pct);
+        let rest = kcal.saturating_sub(ranged);
+        (rest + low, rest + high)
+    })
+}
+
+/// An entry that is not a built meal, as the apps show it.
 fn entry_view(entry: &Entry, range_pct: u32) -> EntryView {
-    let source = entry.detail.source();
-    let known = entry.figures == Figures::Known;
-    let ranged = match &entry.detail {
-        Detail::Photo(detail) => known && !detail.typed,
-        _ => false,
-    };
-    let range = ranged.then(|| photo::range(entry.amount.kcal, range_pct));
+    let range = widened(entry.amount.kcal, entry.ranged_kcal(), range_pct);
+    let estimated = entry.split().1;
     EntryView {
         id: entry.id,
         slot: entry.slot,
@@ -600,9 +793,10 @@ fn entry_view(entry: &Entry, range_pct: u32) -> EntryView {
         servings: entry.servings,
         kcal: entry.amount.kcal,
         protein_g: entry.amount.protein_g(),
-        source,
+        source: entry.detail.source(),
         figures: entry.figures,
-        estimated: source.is_estimated(),
+        estimated: matches!(entry.detail, Detail::Photo(_)) || estimated != Amount::default(),
+        kcal_estimated: estimated.kcal,
         kcal_low: range.map(|(low, _)| low),
         kcal_high: range.map(|(_, high)| high),
         photo: match &entry.detail {
@@ -633,25 +827,73 @@ fn entry_view(entry: &Entry, range_pct: u32) -> EntryView {
             _ => None,
         },
         barcode: match &entry.detail {
-            Detail::Barcode { code, grams } => Some(BarcodeView { code: code.clone(), grams: *grams }),
+            Detail::Barcode { code, grams, .. } => Some(BarcodeView { code: code.clone(), grams: *grams }),
             _ => None,
         },
+        weighed: match &entry.detail {
+            Detail::Barcode { grams, label: Some(label), .. } | Detail::Typed { grams: Some(grams), label: Some(label) } => {
+                Some(WeighedView {
+                    grams: *grams,
+                    kcal_per_100g: label.kcal_per_100g,
+                    protein_per_100g: label.protein_per_100g,
+                })
+            }
+            _ => None,
+        },
+        parts: None,
     }
 }
 
+/// A built meal as the apps show it: what its parts with known figures add
+/// up to, and the parts themselves.
+fn built_view(meal: &Entry, parts: &[&Entry], range_pct: u32) -> EntryView {
+    let known = || parts.iter().filter(|part| part.figures == Figures::Known);
+    let total = known().fold(Amount::default(), |sum, part| sum.plus(part.amount));
+    let estimated = known().fold(Amount::default(), |sum, part| sum.plus(part.split().1));
+    let range = widened(total.kcal, parts.iter().map(|part| part.ranged_kcal()).sum(), range_pct);
+    EntryView {
+        kcal: total.kcal,
+        protein_g: total.protein_g(),
+        figures: parts.iter().map(|part| part.figures).find(|figures| *figures != Figures::Known).unwrap_or(Figures::Known),
+        estimated: parts.iter().any(|part| matches!(part.detail, Detail::Photo(_))),
+        kcal_estimated: estimated.kcal,
+        kcal_low: range.map(|(low, _)| low),
+        kcal_high: range.map(|(_, high)| high),
+        parts: Some(parts.iter().map(|part| entry_view(part, range_pct)).collect()),
+        ..entry_view(meal, range_pct)
+    }
+}
+
+/// Photos waiting for the meal they are a part of, as the apps show them.
+pub fn draft_views(drafts: &[Entry], range_pct: u32) -> Vec<EntryView> {
+    drafts.iter().map(|draft| entry_view(draft, range_pct)).collect()
+}
+
 /// Everything the apps show about food, as of `today`. `meals` are the
-/// saved meals still in use; `entries` every entry not taken back.
-/// `range_pct` is how far either way a photo estimate may be.
+/// saved meals still in use; `entries` every entry not taken back, the
+/// parts of built meals among them. `range_pct` is how far either way a
+/// photo estimate may be.
 pub fn day(today: NaiveDate, meals: &[SavedMeal], entries: &[Entry], targets: &[Target], range_pct: u32) -> FoodDay {
-    let mut todays: Vec<&Entry> = entries.iter().filter(|entry| entry.eaten_local.date() == today).collect();
+    // The meals of the day; a part is shown under its meal.
+    let mut todays: Vec<&Entry> =
+        entries.iter().filter(|entry| entry.part_of.is_none() && entry.eaten_local.date() == today).collect();
     todays.sort_by_key(|entry| (entry.slot, entry.eaten_local, entry.id));
-    let known = || todays.iter().filter(|entry| entry.figures == Figures::Known);
-    let sum = |estimated: bool| {
-        known()
-            .filter(|entry| entry.detail.source().is_estimated() == estimated)
-            .fold(Amount::default(), |sum, entry| sum.plus(entry.amount))
+    let parts_of = |meal: &Entry| {
+        let mut parts: Vec<&Entry> = entries.iter().filter(|entry| entry.part_of == Some(meal.id)).collect();
+        parts.sort_by_key(|part| (part.position, part.id));
+        parts
     };
-    let (measured, estimated) = (sum(false), sum(true));
+    // What carries figures: each meal of one thing, and each part of a
+    // built one.
+    let counted: Vec<&Entry> = todays
+        .iter()
+        .flat_map(|entry| if entry.detail == Detail::Built { parts_of(entry) } else { vec![*entry] })
+        .collect();
+    let (measured, estimated) = counted
+        .iter()
+        .filter(|entry| entry.figures == Figures::Known)
+        .map(|entry| entry.split())
+        .fold((Amount::default(), Amount::default()), |(measured, estimated), (m, e)| (measured.plus(m), estimated.plus(e)));
     let eaten = measured.plus(estimated);
     let estimated_range = photo::range(estimated.kcal, range_pct);
     let target = target_on(targets, today);
@@ -673,13 +915,23 @@ pub fn day(today: NaiveDate, meals: &[SavedMeal], entries: &[Entry], targets: &[
         protein_estimated_g: estimated.protein_g(),
         kcal_low: measured.kcal + estimated_range.0,
         kcal_high: measured.kcal + estimated_range.1,
-        unknown: todays.iter().filter(|entry| entry.figures != Figures::Known).count() as u32,
+        unknown: counted.iter().filter(|entry| entry.figures != Figures::Known).count() as u32,
         estimate_range_pct: range_pct,
         kcal_left: target.map(|target| i64::from(target.kcal) - i64::from(eaten.kcal)),
         protein_left_g: target
             .map(|target| (f64::from(target.protein_g) * 10.0 - f64::from(eaten.protein_dg)) / 10.0),
         open_slots: Slot::MAIN.into_iter().filter(|slot| !todays.iter().any(|entry| entry.slot == *slot)).collect(),
-        entries: todays.iter().map(|entry| entry_view(entry, range_pct)).collect(),
+        entries: todays
+            .iter()
+            .map(|entry| {
+                if entry.detail == Detail::Built {
+                    built_view(entry, &parts_of(entry), range_pct)
+                } else {
+                    entry_view(entry, range_pct)
+                }
+            })
+            .collect(),
+        drafts: Vec::new(),
         meals: ordered
             .into_iter()
             .map(|meal| {
@@ -691,6 +943,7 @@ pub fn day(today: NaiveDate, meals: &[SavedMeal], entries: &[Entry], targets: &[
                     portions: meal.portions,
                     kcal: portion.kcal,
                     protein_g: portion.protein_g(),
+                    kcal_estimated: meal.estimated(1.0).kcal,
                     ingredients: meal.ingredients.clone(),
                 }
             })
@@ -710,7 +963,7 @@ mod tests {
     }
 
     fn ingredient(name: &str, grams: f64, kcal: f64, protein: f64) -> Ingredient {
-        Ingredient { name: name.into(), grams, kcal_per_100g: kcal, protein_per_100g: protein }
+        Ingredient::weighed(name, grams, kcal, protein)
     }
 
     /// Oats, milk and whey: 303.2 + 126 + 113.1 kcal and 10.6 + 8.5 + 24 g.
@@ -755,8 +1008,11 @@ mod tests {
             name: meal.name.clone(),
             servings,
             amount: meal.amount(servings),
+            estimated: meal.estimated(servings),
             figures: Figures::Known,
             detail: Detail::Saved,
+            part_of: None,
+            position: 0,
         }
     }
 
@@ -951,6 +1207,7 @@ mod tests {
             name: "stir fry, rice".into(),
             servings: 1.0,
             amount,
+            estimated: Amount::default(),
             figures,
             detail: Detail::Photo(PhotoDetail {
                 note: "stir fry, rice".into(),
@@ -959,6 +1216,8 @@ mod tests {
                 oil_asked,
                 ..Default::default()
             }),
+            part_of: None,
+            position: 0,
         }
     }
 
@@ -984,8 +1243,15 @@ mod tests {
             name: "Protein bar".into(),
             servings: 1.0,
             amount: Amount { kcal: 210, protein_dg: 198 },
+            estimated: Amount::default(),
             figures: Figures::Known,
-            detail: Detail::Barcode { code: "96385074".into(), grams: 60.0 },
+            detail: Detail::Barcode {
+                code: "96385074".into(),
+                grams: 60.0,
+                label: Some(Label { kcal_per_100g: 350.0, protein_per_100g: 33.0 }),
+            },
+            part_of: None,
+            position: 0,
         };
         let entries = [
             entry(1, "2026-11-17 07:05", &b, 1.0),
@@ -1043,6 +1309,205 @@ mod tests {
         assert_eq!(day.entries[0].photo.as_ref().unwrap().oil_kcal, 0);
         // Still estimated: typed from a menu or a guess, not weighed.
         assert_eq!(day.kcal_estimated, 650);
+    }
+
+    // --- Meals built from parts ---
+
+    /// A part of meal number `meal`, standing at `position` in it.
+    fn part(n: u128, meal: u128, position: i32, name: &str, amount: Amount, detail: Detail) -> Entry {
+        Entry {
+            id: Uuid::from_u128(n),
+            eaten_local: NaiveDateTime::parse_from_str("2026-11-17 07:30", "%Y-%m-%d %H:%M").unwrap(),
+            slot: Slot::Breakfast,
+            meal_id: None,
+            name: name.into(),
+            servings: 1.0,
+            amount,
+            estimated: Amount::default(),
+            figures: Figures::Known,
+            detail,
+            part_of: Some(Uuid::from_u128(meal)),
+            position,
+        }
+    }
+
+    fn built(n: u128, name: &str) -> Entry {
+        Entry { part_of: None, position: 0, ..part(n, 0, 0, name, Amount::default(), Detail::Built) }
+    }
+
+    /// A scanned bar, a typed banana, a coffee typed whole and a photo.
+    fn breakfast_parts(meal: u128) -> Vec<Entry> {
+        let label = |kcal_per_100g, protein_per_100g| Some(Label { kcal_per_100g, protein_per_100g });
+        let photo = Entry {
+            part_of: Some(Uuid::from_u128(meal)),
+            position: 4,
+            ..photo_entry(54, "2026-11-17 07:30", Slot::Breakfast, Figures::Known, rice_and_chicken(), true)
+        };
+        vec![
+            // Out of order, as the database may hand them over.
+            part(53, meal, 3, "Flat white", Amount { kcal: 120, protein_dg: 60 }, Detail::Typed { grams: None, label: None }),
+            part(
+                51,
+                meal,
+                1,
+                "Protein bar",
+                Amount { kcal: 210, protein_dg: 198 },
+                Detail::Barcode { code: "96385074".into(), grams: 60.0, label: label(350.0, 33.0) },
+            ),
+            photo,
+            part(
+                52,
+                meal,
+                2,
+                "Banana",
+                Amount { kcal: 107, protein_dg: 13 },
+                Detail::Typed { grams: Some(120.0), label: label(89.0, 1.1) },
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_built_meal_is_what_its_parts_add_up_to() {
+        let mut entries = vec![built(50, "Breakfast")];
+        entries.extend(breakfast_parts(50));
+        let day = day(date("2026-11-17"), &[], &entries, &[], 35);
+
+        // One meal on the day, with its parts in the order added.
+        assert_eq!(day.entries.len(), 1);
+        let meal = &day.entries[0];
+        assert_eq!((meal.source, meal.name.as_str(), meal.figures), (Source::Built, "Breakfast", Figures::Known));
+        let parts = meal.parts.as_ref().unwrap();
+        let names: Vec<&str> = parts.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["Protein bar", "Banana", "Flat white", "stir fry, rice"]);
+        assert_eq!((meal.kcal, meal.protein_g), (210 + 107 + 120 + 578, 60.1));
+        // Only the photo is estimated, and only it widens the meal.
+        assert_eq!((meal.estimated, meal.kcal_estimated), (true, 578));
+        assert_eq!((meal.kcal_low, meal.kcal_high), (Some(437 + 380), Some(437 + 780)));
+
+        // Each part keeps what it is: the label and the typed figures are
+        // measured, the photo estimated.
+        assert_eq!((parts[0].source, parts[0].estimated), (Source::Barcode, false));
+        assert_eq!(parts[0].weighed, Some(WeighedView { grams: 60.0, kcal_per_100g: 350.0, protein_per_100g: 33.0 }));
+        assert_eq!((parts[1].source, parts[1].weighed.as_ref().map(|w| w.grams)), (Source::Typed, Some(120.0)));
+        assert_eq!((parts[2].source, parts[2].weighed.is_none(), parts[2].kcal), (Source::Typed, true, 120));
+        assert_eq!((parts[3].source, parts[3].estimated, parts[3].kcal_low), (Source::Photo, true, Some(380)));
+        assert!(parts.iter().all(|p| p.parts.is_none()));
+
+        // The day counts each part once, by what it is.
+        assert_eq!((day.kcal, day.protein_g), (1015, 60.1));
+        assert_eq!((day.kcal_measured, day.kcal_estimated), (437, 578));
+        assert_eq!((day.kcal_low, day.kcal_high), (437 + 380, 437 + 780));
+        assert_eq!(day.open_slots, vec![Slot::Lunch, Slot::Dinner]);
+        assert_eq!((day.streak.state, day.unknown), (State::Kept, 0));
+    }
+
+    #[test]
+    fn a_built_meal_counts_what_is_known_while_a_part_is_not() {
+        let mut entries = vec![built(50, "Breakfast")];
+        entries.extend(breakfast_parts(50));
+        // The photo is still with the model.
+        let photo = entries.iter_mut().find(|e| e.id == Uuid::from_u128(54)).unwrap();
+        photo.figures = Figures::Estimating;
+        photo.amount = Amount::default();
+        let day = day(date("2026-11-17"), &[], &entries, &[], 35);
+
+        let meal = &day.entries[0];
+        assert_eq!((meal.figures, meal.kcal, meal.kcal_estimated), (Figures::Estimating, 437, 0));
+        // A photo among the parts marks the meal as estimated even before
+        // its figures arrive; there is no range until they do.
+        assert_eq!((meal.estimated, meal.kcal_low), (true, None));
+        assert_eq!((day.kcal, day.kcal_measured, day.unknown), (437, 437, 1));
+    }
+
+    #[test]
+    fn a_meal_with_no_parts_left_counts_for_the_day_but_adds_nothing() {
+        let day = day(date("2026-11-17"), &[], &[built(50, "Breakfast")], &[], 35);
+        assert_eq!((day.kcal, day.entries[0].kcal, day.entries[0].parts.as_ref().unwrap().len()), (0, 0, 0));
+        assert_eq!(day.open_slots, vec![Slot::Lunch, Slot::Dinner]);
+    }
+
+    #[test]
+    fn photos_sent_ahead_of_their_meal_are_shown_apart_from_the_day() {
+        let ahead = Entry {
+            part_of: Some(Uuid::from_u128(50)),
+            ..photo_entry(54, "2026-11-17 07:30", Slot::Breakfast, Figures::Known, rice_and_chicken(), true)
+        };
+        let drafts = draft_views(std::slice::from_ref(&ahead), 35);
+        assert_eq!((drafts[0].kcal, drafts[0].kcal_low, drafts[0].source), (578, Some(380), Source::Photo));
+    }
+
+    // --- Saved meals with more than weighed ingredients ---
+
+    /// Yogurt scanned, a coffee typed whole, and eggs on toast from a photo.
+    fn mixed_breakfast() -> SavedMeal {
+        SavedMeal::new(
+            Uuid::from_u128(7),
+            "Café breakfast",
+            Slot::Breakfast,
+            1,
+            vec![
+                Ingredient { code: Some("0 64200 11589 6".into()), ..Ingredient::weighed("Greek yogurt", 175.0, 63.0, 11.0) },
+                Ingredient::whole("Flat white", 120.0, 6.0),
+                Ingredient { estimated: true, ..Ingredient::whole("Eggs on toast", 192.4, 23.0) },
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_saved_meal_adds_up_weighed_and_whole_ingredients() {
+        let meal = mixed_breakfast();
+        // 110.25 + 120 + 192.4 kcal and 19.25 + 6 + 23 g.
+        assert_eq!(meal.amount(1.0), Amount { kcal: 423, protein_dg: 483 });
+        assert_eq!(meal.estimated(1.0), Amount { kcal: 192, protein_dg: 230 });
+        // Half a portion is half of everything, whole figures included.
+        assert_eq!(meal.amount(0.5), Amount { kcal: 211, protein_dg: 241 });
+        assert_eq!(meal.estimated(0.5), Amount { kcal: 96, protein_dg: 115 });
+        assert_eq!(meal.ingredients[0].code.as_deref(), Some("064200115896"));
+        // A meal that was all weighed has nothing estimated in it.
+        assert_eq!(breakfast().estimated(1.0), Amount::default());
+    }
+
+    #[test]
+    fn a_photos_estimate_in_a_saved_meal_stays_an_estimate_each_time_it_is_logged() {
+        let meal = mixed_breakfast();
+        let entries = [entry(1, "2026-11-17 07:05", &meal, 1.0)];
+        let day = day(date("2026-11-17"), std::slice::from_ref(&meal), &entries, &[], 35);
+        assert_eq!((day.kcal, day.kcal_measured, day.kcal_estimated), (423, 231, 192));
+        assert_eq!((day.protein_measured_g, day.protein_estimated_g), (25.3, 23.0));
+        // 192 estimated kcal may be 120 to 260.
+        assert_eq!((day.kcal_low, day.kcal_high), (231 + 120, 231 + 260));
+        let logged = &day.entries[0];
+        assert_eq!((logged.source, logged.estimated, logged.kcal_estimated), (Source::Saved, true, 192));
+        assert_eq!((logged.kcal_low, logged.kcal_high), (Some(351), Some(491)));
+        assert_eq!((day.meals[0].kcal, day.meals[0].kcal_estimated), (423, 192));
+    }
+
+    #[test]
+    fn an_ingredient_is_sent_as_what_it_is() {
+        let meal = mixed_breakfast();
+        assert_eq!(
+            serde_json::to_value(&meal.ingredients).unwrap(),
+            serde_json::json!([
+                {"name": "Greek yogurt", "grams": 175.0, "kcal_per_100g": 63.0, "protein_per_100g": 11.0,
+                 "code": "064200115896"},
+                {"name": "Flat white", "kcal": 120.0, "protein_g": 6.0},
+                {"name": "Eggs on toast", "kcal": 192.4, "protein_g": 23.0, "estimated": true},
+            ])
+        );
+    }
+
+    #[test]
+    fn a_whole_ingredient_that_makes_no_sense_is_refused() {
+        assert!(Ingredient::whole("Flat white", 120.0, 6.0).checked().is_ok());
+        assert!(Ingredient::whole("Flat white", 0.0, 0.0).checked().is_ok());
+        assert!(Ingredient::whole(" ", 120.0, 6.0).checked().is_err());
+        assert!(Ingredient::whole("Flat white", -1.0, 6.0).checked().is_err());
+        assert!(Ingredient::whole("Flat white", 10_001.0, 6.0).checked().is_err());
+        assert!(Ingredient::whole("Flat white", 120.0, 1_001.0).checked().is_err());
+        assert!(Ingredient::whole("Flat white", f64::NAN, 6.0).checked().is_err());
+        let scanned = Ingredient { code: Some("123".into()), ..Ingredient::weighed("Oats", 80.0, 379.0, 13.2) };
+        assert!(scanned.checked().is_err());
     }
 
     // --- The logging streak ---

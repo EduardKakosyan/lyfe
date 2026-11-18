@@ -225,16 +225,19 @@ import Testing
         let world = World.signedIn()
         let model = world.launch()
         model.openMealEditor()
-        var draft = try #require(model.mealDraft)
+        let draft = try #require(model.mealDraft)
         #expect(draft.isNew)
+        #expect(draft.purpose == .recipe)
         #expect(model.screen == .food)
-        draft.name = " Usual breakfast "
-        draft.slot = .breakfast
-        draft.ingredients = [Ingredient(name: "Oats", grams: 80, kcalPer100g: 379, proteinPer100g: 13.2)]
-        let route = "PUT /v1/food/meals/\(draft.id.uuidString.lowercased())"
+        model.changeDraft {
+            $0.name = " Usual breakfast "
+            $0.slot = .breakfast
+            $0.foods = [Ingredient(name: "Oats", grams: 80, kcalPer100g: 379, proteinPer100g: 13.2)]
+        }
+        let route = "PUT /v1/food/meals/\(draft.mealId.uuidString.lowercased())"
         world.backend.on(route, .ok(Fixture.home(food: Fixture.food())))
 
-        #expect(await model.saveMeal(draft) == nil)
+        #expect(await model.saveMeal() == nil)
 
         let body = try #require(sent(world, route).first)
         #expect(body["name"] as? String == "Usual breakfast")
@@ -245,6 +248,8 @@ import Testing
         #expect(ingredient["grams"] as? Double == 80)
         #expect(ingredient["kcal_per_100g"] as? Double == 379)
         #expect(ingredient["protein_per_100g"] as? Double == 13.2)
+        // Weighed and typed: nothing says estimated, and there is no code.
+        #expect(Set(ingredient.keys) == ["name", "grams", "kcal_per_100g", "protein_per_100g"])
         #expect(model.mealDraft == nil)
         #expect(model.home?.food?.meals.count == 2)
     }
@@ -253,10 +258,9 @@ import Testing
         let world = World.signedIn()
         let model = world.launch()
         model.openMealEditor()
-        var draft = model.mealDraft!
-        #expect(await model.saveMeal(draft) == "Give the meal a name.")
-        draft.name = "Oats"
-        #expect(await model.saveMeal(draft) == "Add what goes into it.")
+        #expect(await model.saveMeal() == "Give the meal a name.")
+        model.changeDraft { $0.name = "Oats" }
+        #expect(await model.saveMeal() == "Add what goes into it.")
         #expect(world.backend.requests.isEmpty)
         #expect(model.mealDraft != nil)
     }
@@ -268,10 +272,10 @@ import Testing
         model.openMealEditor(lunch)
         let draft = model.mealDraft!
         #expect(!draft.isNew)
-        #expect(draft.id == Fixture.lunchID)
+        #expect(draft.mealId == Fixture.lunchID)
         #expect(draft.portions == 5)
 
-        let problem = await model.saveMeal(draft)
+        let problem = await model.saveMeal()
 
         #expect(problem?.hasPrefix("Could not save the meal: can't reach the server") == true)
         #expect(model.mealDraft != nil)
@@ -284,8 +288,9 @@ import Testing
         model.openMealEditor(lunch)
         let draft = model.mealDraft!
         world.backend.on(
-            "PUT /v1/food/meals/\(draft.id.uuidString.lowercased())", .init(status: 400, body: #"{"error": "bad_request"}"#))
-        #expect(await model.saveMeal(draft) == "The server would not save the meal (400).")
+            "PUT /v1/food/meals/\(draft.mealId.uuidString.lowercased())",
+            .init(status: 400, body: #"{"error": "bad_request"}"#))
+        #expect(await model.saveMeal() == "The server would not save the meal (400).")
         #expect(model.mealDraft != nil)
     }
 
@@ -376,7 +381,7 @@ import Testing
             }
             return nil
         }
-        #expect(slip(" ", "80", "379", "13.2") == "Name the ingredient")
+        #expect(slip(" ", "80", "379", "13.2") == "Name it")
         #expect(slip("Oats", "", "379", "13.2") == "Type its weight in grams, like 80")
         #expect(slip("Oats", "0", "379", "13.2") == "Type its weight in grams, like 80")
         // The decimal point slipped: nothing has 3790 kcal in 100 g.
@@ -401,47 +406,48 @@ import Testing
     @Test func theEditorPreviewsAPortionTheWayTheServerWorksItOut() {
         // The same recipes as the backend's tests, and the same answers.
         var breakfast = MealDraft()
-        breakfast.ingredients = [
+        breakfast.foods = [
             Ingredient(name: "Oats", grams: 80, kcalPer100g: 379, proteinPer100g: 13.2),
             Ingredient(name: "Milk 2%", grams: 250, kcalPer100g: 50.4, proteinPer100g: 3.4),
             Ingredient(name: "Whey", grams: 30, kcalPer100g: 377, proteinPer100g: 80),
         ]
-        #expect(breakfast.portion == (542, 43.1))
+        #expect(breakfast.portion() == (542, 43.1))
 
         var lunch = MealDraft()
         lunch.portions = 5
-        lunch.ingredients = [
+        lunch.foods = [
             Ingredient(name: "Chicken thigh", grams: 900, kcalPer100g: 177, proteinPer100g: 24),
             Ingredient(name: "Rice, dry", grams: 300, kcalPer100g: 360, proteinPer100g: 7),
             Ingredient(name: "Olive oil", grams: 15, kcalPer100g: 884, proteinPer100g: 0),
             Ingredient(name: "Frozen vegetables", grams: 400, kcalPer100g: 0, proteinPer100g: 2),
         ]
-        #expect(lunch.portion == (561, 49.0))
-        #expect(MealDraft.kcal(of: lunch.ingredients[0]) == 1593)
-        #expect(MealDraft().portion == (0, 0))
+        #expect(lunch.portion() == (561, 49.0))
+        #expect(MealDraft.kcal(of: lunch.foods[0]) == 1593)
+        #expect(MealDraft().portion() == (0, 0))
     }
 
     @Test func aDraftSaysWhatStillStopsItBeingSaved() {
         var draft = MealDraft()
-        #expect(draft.missing == "Give the meal a name")
+        #expect(draft.missing() == "Give the meal a name")
         draft.name = String(repeating: "x", count: 61)
-        #expect(draft.missing == "The name is too long")
+        #expect(draft.missing() == "The name is too long")
         draft.name = "Oats"
-        #expect(draft.missing == "Add what goes into it")
-        draft.ingredients = [Ingredient(name: "Oats", grams: 80, kcalPer100g: 379, proteinPer100g: 13.2)]
-        #expect(draft.missing == nil)
+        #expect(draft.missing() == "Add what goes into it")
+        draft.foods = [Ingredient(name: "Oats", grams: 80, kcalPer100g: 379, proteinPer100g: 13.2)]
+        #expect(draft.missing() == nil)
     }
 
     @Test func changingASavedMealKeepsItsIdSoTheRecipeIsReplaced() {
         let meal = Fixture.foodDay().meals[1]
         let draft = MealDraft(editing: meal)
-        #expect(draft.id == meal.id)
+        #expect(draft.mealId == meal.id)
         #expect(!draft.isNew)
+        #expect(draft.purpose == .recipe)
         #expect(draft.name == "Batch lunch")
         #expect(draft.slot == .lunch)
         #expect(draft.portions == 5)
-        #expect(draft.ingredients == meal.ingredients)
-        #expect(MealDraft().id != MealDraft().id)
+        #expect(draft.foods == meal.ingredients)
+        #expect(MealDraft().mealId != MealDraft().mealId)
     }
 }
 
@@ -637,12 +643,12 @@ import Testing
         #expect(FoodText.editorBar(draft, saving: false) == ("GIVE THE MEAL A NAME", "SAVE MEAL"))
         draft.name = "Batch lunch"
         draft.portions = 5
-        draft.ingredients = [Ingredient(name: "Chicken thigh", grams: 900, kcalPer100g: 177, proteinPer100g: 24)]
+        draft.foods = [Ingredient(name: "Chicken thigh", grams: 900, kcalPer100g: 177, proteinPer100g: 24)]
         #expect(FoodText.editorBar(draft, saving: false) == ("EACH OF 5 PORTIONS · 319 KCAL · 43 G PROTEIN", "SAVE MEAL"))
         draft.portions = 1
         #expect(FoodText.editorBar(draft, saving: true) == ("THE PORTION · 1,593 KCAL · 216 G PROTEIN", "SAVING"))
         #expect(
-            FoodText.ingredientLabel(draft.ingredients[0]) == "900 G · 177 KCAL · 24 G PER 100 G")
+            FoodText.ingredientLabel(draft.foods[0]) == "900 G · 177 KCAL · 24 G PER 100 G")
         #expect(FoodText.targetsNow(nil) == "No targets yet")
         #expect(FoodText.targetsNow(Fixture.foodDay().target) == "Now 2,500 KCAL · 170 G · since 2 NOV")
     }
@@ -667,24 +673,27 @@ struct FoodAgainstARealBackendTests {
 
         // A batch typed the way the editor reads it.
         model.openMealEditor()
-        var draft = try #require(model.mealDraft)
-        draft.name = "Client check lunch"
-        draft.slot = .lunch
-        draft.portions = 5
-        draft.ingredients = try [
+        let foods = try [
             FoodTyping.ingredient(name: "Chicken thigh", grams: "900", kcal: "177", protein: "24").get(),
             FoodTyping.ingredient(name: "Rice, dry", grams: "300", kcal: "360", protein: "7").get(),
             FoodTyping.ingredient(name: "Olive oil", grams: "15", kcal: "884", protein: "0").get(),
             FoodTyping.ingredient(name: "Frozen vegetables", grams: "400", kcal: "0", protein: "2,0").get(),
         ]
-        let problem = await model.saveMeal(draft)
+        model.changeDraft {
+            $0.name = "Client check lunch"
+            $0.slot = .lunch
+            $0.portions = 5
+            $0.foods = foods
+        }
+        let draft = try #require(model.mealDraft)
+        let problem = await model.saveMeal()
         #expect(problem == nil)
-        let meal = try #require(model.home?.food?.meals.first { $0.id == draft.id })
+        let meal = try #require(model.home?.food?.meals.first { $0.id == draft.mealId })
         #expect(meal.name == "Client check lunch")
-        #expect(meal.ingredients == draft.ingredients)
+        #expect(meal.ingredients == foods)
         // The editor's preview and the backend's figure are the same.
-        #expect(meal.kcal == draft.portion.kcal)
-        #expect(meal.proteinG == draft.portion.proteinG)
+        #expect(meal.kcal == draft.portion().kcal)
+        #expect(meal.proteinG == draft.portion().proteinG)
         #expect((meal.kcal, meal.proteinG) == (561, 49.0))
 
         #expect(await model.setFoodTargets(FoodTargets(kcal: 2500, proteinG: 170)) == nil)

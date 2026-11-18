@@ -3,13 +3,16 @@ import SwiftUI
 /// Food: what is logged today against the calorie and protein targets,
 /// measured apart from estimated, each meal of the day as logged or still
 /// unknown, and the saved meals, each logged with one tap. The black bar
-/// logs the next open meal; anything else is a photo or a barcode.
+/// logs the next open meal; anything else is built from parts: scanned,
+/// photographed or typed.
 public struct FoodScreen: View {
     let food: FoodDay
     /// Meals tapped here that the backend does not have yet.
     var unsent: [MealTap] = []
-    /// Photo and barcode meals logged here that the backend does not have yet.
+    /// Meals built or parts added here that the backend does not have yet.
     var captures: [FoodCapture] = []
+    /// A meal left half built, to carry on with.
+    var building: Building?
     var problem: String?
     let onBack: () -> Void
     /// Logs this many portions of a saved meal.
@@ -19,12 +22,29 @@ public struct FoodScreen: View {
     /// Opens the editor on a saved meal, or on a new one.
     let onEditMeal: (SavedMeal?) -> Void
     let onTargets: () -> Void
+    /// Each starts a meal, or carries on with the one being built, with
+    /// that kind of part.
     var onPhoto: () -> Void = {}
     var onScan: () -> Void = {}
+    /// Opens the builder; true to open it at its typing form.
+    var onBuild: (Bool) -> Void = { _ in }
+    /// Opens a meal logged from parts.
+    var onMeal: (UUID) -> Void = { _ in }
     /// Opens a photo meal's estimate.
     var onEstimate: (UUID) -> Void = { _ in }
     /// Opens the label entry for a code lyfe does not know.
     var onLabel: (String) -> Void = { _ in }
+
+    /// What a meal left half built comes to so far.
+    public struct Building: Equatable, Sendable {
+        public var parts: Int
+        public var kcal: Int
+
+        public init(parts: Int, kcal: Int) {
+            self.parts = parts
+            self.kcal = kcal
+        }
+    }
 
     @State private var takingBack: FoodText.Row?
     @State private var note: String?
@@ -62,6 +82,14 @@ public struct FoodScreen: View {
                             }
                             .buttonStyle(.plain)
                             .accessibilityHint("Shows the estimate, to correct it")
+                        case .meal(let id):
+                            Button {
+                                onMeal(id)
+                            } label: {
+                                FoodRow(row: row)
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityHint("Shows its parts")
                         case .label(let code):
                             Button {
                                 onLabel(code)
@@ -116,22 +144,24 @@ public struct FoodScreen: View {
         return notices
     }
 
-    /// Anything that is not a saved meal: a barcode, or a photo and a line.
+    /// Anything that is not a saved meal is built from parts, starting
+    /// with any of the three; a meal left half built is carried on with.
     private var captureButtons: some View {
-        HStack(spacing: 0) {
-            Button(action: onScan) {
-                CaptureButton(mark: "▥", title: "Scan", detail: "Barcode")
+        VStack(spacing: 0) {
+            PosterRule()
+            if let building {
+                Button {
+                    onBuild(false)
+                } label: {
+                    StripRow(left: FoodText.buildingLine(building), right: "Carry on →")
+                }
+                .buttonStyle(.plain)
+                .background(Poster.yellow)
+                .accessibilityHint("Opens the meal you were building")
+                PosterRule(thickness: 1.5)
             }
-            .accessibilityLabel("Scan a barcode")
-            Rectangle().fill(Poster.ink).frame(width: Poster.rule)
-            Button(action: onPhoto) {
-                CaptureButton(mark: "◉", title: "Photo", detail: "And one line")
-            }
-            .accessibilityLabel("Log a meal with a photo")
+            AddPartButtons(onScan: onScan, onPhoto: onPhoto) { onBuild(true) }
         }
-        .buttonStyle(.plain)
-        .fixedSize(horizontal: false, vertical: true)
-        .overlay(alignment: .top) { PosterRule() }
     }
 
     /// The saved meals: a tap logs one portion, holding offers others.
@@ -371,21 +401,52 @@ struct CaptureButton: View {
     var mark: String
     var title: String
     var detail: String
+    /// Three across rather than two.
+    var compact = false
 
     var body: some View {
-        HStack(spacing: 10) {
-            Text(mark).font(.system(size: 22, weight: .heavy))
+        HStack(spacing: compact ? 7 : 10) {
+            Text(mark).font(.system(size: compact ? 19 : 22, weight: .heavy))
             VStack(alignment: .leading, spacing: 1) {
-                Text(title).posterHeading(20)
-                Text(detail).posterLabel().opacity(0.6)
+                Text(title).posterHeading(compact ? 17 : 20)
+                Text(detail).posterLabel().opacity(0.6).lineLimit(1).minimumScaleFactor(0.8)
             }
             Spacer(minLength: 0)
         }
-        .padding(.horizontal, Poster.margin)
+        .padding(.horizontal, compact ? 11 : Poster.margin)
         .padding(.vertical, 10)
         .frame(maxWidth: .infinity)
         .background(Poster.paper)
         .contentShape(Rectangle())
+    }
+}
+
+/// The three ways to add a part to a meal: scan its barcode, photograph
+/// it, or type it.
+struct AddPartButtons: View {
+    var onScan: () -> Void
+    var onPhoto: () -> Void
+    var onType: () -> Void
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Button(action: onScan) {
+                CaptureButton(mark: "▥", title: "Scan", detail: "Barcode", compact: true)
+            }
+            .accessibilityLabel("Scan a barcode")
+            Rectangle().fill(Poster.ink).frame(width: Poster.rule)
+            Button(action: onPhoto) {
+                CaptureButton(mark: "◉", title: "Photo", detail: "One line", compact: true)
+            }
+            .accessibilityLabel("Add a photo and one line")
+            Rectangle().fill(Poster.ink).frame(width: Poster.rule)
+            Button(action: onType) {
+                CaptureButton(mark: "+", title: "Type", detail: "By hand", compact: true)
+            }
+            .accessibilityLabel("Type a food by hand")
+        }
+        .buttonStyle(.plain)
+        .fixedSize(horizontal: false, vertical: true)
     }
 }
 
@@ -538,6 +599,7 @@ public enum FoodText {
                 switch value {
                 case "?": "unknown"
                 case "…": "being estimated"
+                case _ where value.hasSuffix(" G"): "\(value.dropLast(2)) grams"
                 default: "\(value) kilocalories"
                 }
             return "\(title), \(label), \(figure)"
@@ -552,6 +614,8 @@ public enum FoodText {
         case estimate(UUID)
         /// Opens the label entry for this code.
         case label(String)
+        /// Opens a meal logged from parts.
+        case meal(UUID)
     }
 
     /// The day by slot: what was logged, what was logged here and is still
@@ -565,7 +629,7 @@ public enum FoodText {
                     id: "tap-\(tap.id)", entry: tap.id, mark: .solid, title: tap.name,
                     label: "ON THIS PHONE · NOT COUNTED YET", value: kcal(tap.kcal), dim: true, tap: .takeBack)
             }
-            let captured = captures.filter { $0.slot == slot }.map(captureRow)
+            let captured = captures.filter { $0.slot == slot }.map { captureRow($0) }
             let waitingAll = waiting + captured
             if logged.isEmpty, waitingAll.isEmpty {
                 return [
@@ -607,12 +671,48 @@ public enum FoodText {
                 id: id, entry: entry.id, mark: .solid, title: entry.name,
                 label: "LABEL · \(grams(entry.barcode?.grams ?? 0)) G · \(grams(entry.proteinG)) G PROTEIN",
                 value: kcal(entry.kcal), tap: .takeBack)
-        case (.saved, _):
+        case (.typed, _):
+            let weight = entry.weighed.map { " · \(grams($0.grams)) G" } ?? ""
             return Row(
                 id: id, entry: entry.id, mark: .solid, title: entry.name,
-                label: entryLabel(servings: entry.servings, proteinG: entry.proteinG), value: kcal(entry.kcal),
-                tap: .takeBack)
+                label: "TYPED\(weight) · \(grams(entry.proteinG)) G PROTEIN", value: kcal(entry.kcal), tap: .takeBack)
+        case (.built, _):
+            return builtRow(entry)
+        case (.saved, _):
+            // A photo's estimate among the ingredients keeps it striped.
+            let estimated = entry.kcalEstimated ?? 0
+            return Row(
+                id: id, entry: entry.id, mark: estimated > 0 ? .striped : .solid, title: entry.name,
+                label: entryLabel(servings: entry.servings, proteinG: entry.proteinG, kcalEstimated: estimated),
+                value: kcal(entry.kcal), tap: .takeBack)
         }
+    }
+
+    /// "4 PARTS", "1 PART".
+    static func partsCount(_ count: Int) -> String {
+        count == 1 ? "1 PART" : "\(count) PARTS"
+    }
+
+    /// A meal built from parts, as one row: what its known parts add up
+    /// to, striped once a photo is among them. Tapping it shows the parts.
+    static func builtRow(_ entry: FoodDay.Entry) -> Row {
+        let parts = entry.parts ?? []
+        let unknown = parts.filter { !$0.isKnown }.count
+        var label = [partsCount(parts.count)]
+        if unknown > 0 {
+            label.append("\(unknown) STILL UNKNOWN")
+            label.append("\(grams(entry.proteinG)) G")
+        } else if let low = entry.kcalLow, let high = entry.kcalHigh {
+            label.append("\(kcal(low))–\(kcal(high))")
+            label.append("\(grams(entry.proteinG)) G")
+        } else {
+            label.append("\(grams(entry.proteinG)) G PROTEIN")
+        }
+        let nothingKnown = !parts.isEmpty && unknown == parts.count
+        return Row(
+            id: "entry-\(entry.id)", entry: entry.id, mark: entry.estimated == true ? .striped : .solid,
+            title: entry.name, label: label.joined(separator: " · "),
+            value: nothingKnown ? (entry.figures == .estimating ? "…" : "?") : kcal(entry.kcal), tap: .meal(entry.id))
     }
 
     /// "PHOTO · 380–780 · 33 G", or "TYPED" once the owner typed it.
@@ -626,9 +726,11 @@ public enum FoodText {
         return "PHOTO · \(kcal(low))–\(kcal(high)) · \(grams(entry.proteinG)) G"
     }
 
-    /// A photo or barcode meal still on this phone.
+    /// A meal, or a part joining one, still on this phone.
     static func captureRow(_ capture: FoodCapture) -> Row {
         let id = "capture-\(capture.id)"
+        // A part added to a meal already logged says where it is going.
+        let waiting = capture.partOf == nil ? "NOT COUNTED YET" : "JOINS ITS MEAL ONCE SENT"
         switch capture.kind {
         case .photo:
             return Row(
@@ -637,12 +739,26 @@ public enum FoodText {
         case .barcode(_, let weight, let product?):
             return Row(
                 id: id, entry: capture.id, mark: .solid, title: capture.name,
-                label: "ON THIS PHONE · NOT COUNTED YET", value: kcal(product.amount(grams: weight).kcal), dim: true,
+                label: "ON THIS PHONE · \(waiting)", value: kcal(product.amount(grams: weight).kcal), dim: true,
                 tap: .takeBack)
         case .barcode(_, let weight, nil):
             return Row(
                 id: id, entry: capture.id, mark: .outline, title: capture.name,
                 label: "ON THIS PHONE · \(grams(weight)) G · LOOKED UP ONCE SENT", value: "?", dim: true, tap: .takeBack)
+        case .typed(let food):
+            return Row(
+                id: id, entry: capture.id, mark: .solid, title: capture.name, label: "ON THIS PHONE · \(waiting)",
+                value: kcal(MealDraft.kcal(of: food)), dim: true, tap: .takeBack)
+        case .built(_, let parts):
+            // What this phone knows of it: a photo or an unknown code is
+            // counted once the backend has it.
+            let known = parts.compactMap { $0.ingredient(estimate: nil) }
+            let photo = parts.contains { if case .photo = $0.kind { true } else { false } }
+            return Row(
+                id: id, entry: capture.id, mark: photo ? .striped : .solid, title: capture.name,
+                label: "ON THIS PHONE · \(partsCount(parts.count)) · NOT COUNTED YET",
+                value: known.isEmpty ? "…" : kcal(known.reduce(0) { $0 + MealDraft.kcal(of: $1) }), dim: true,
+                tap: .takeBack)
         }
     }
 
@@ -665,32 +781,44 @@ public enum FoodText {
         return "\(kcal(estimated)) ESTIMATED · DAY \(kcal(low))–\(kcal(high))"
     }
 
-    /// Said above the day when a logged meal's figures are still to come.
+    /// Said above the day when something logged is still without its
+    /// figures: a meal of one thing, or a part of a built one.
     static func unknownNotice(_ food: FoodDay) -> String? {
-        let pending = food.entries.filter { !$0.isKnown }
+        let pending = food.entries.flatMap(\.counted).filter { !$0.isKnown }
         guard !pending.isEmpty else { return nil }
         let estimating = pending.filter { $0.figures == .estimating }.count
         let rest = pending.count - estimating
         var parts: [String] = []
-        if estimating == 1 { parts.append("1 photo meal is being estimated") }
-        if estimating > 1 { parts.append("\(estimating) photo meals are being estimated") }
-        if rest == 1 { parts.append("1 meal needs its figures typed") }
-        if rest > 1 { parts.append("\(rest) meals need their figures typed") }
+        if estimating == 1 { parts.append("1 photo is being estimated") }
+        if estimating > 1 { parts.append("\(estimating) photos are being estimated") }
+        if rest == 1 { parts.append("1 food needs its figures typed") }
+        if rest > 1 { parts.append("\(rest) foods need their figures typed") }
         return parts.joined(separator: "; ") + ". Not in the total until then."
     }
 
-    /// "WEIGHED · 43 G PROTEIN", with the portions when not one.
-    static func entryLabel(servings: Double, proteinG: Double) -> String {
+    /// "WEIGHED · 43 G PROTEIN", with the portions when not one. A meal
+    /// with a photo's estimate in it says how much of it is estimated.
+    static func entryLabel(servings: Double, proteinG: Double, kcalEstimated: Int = 0) -> String {
         let portion = abs(servings - 1) < 0.001 ? "" : " · \(portions(servings))"
+        if kcalEstimated > 0 {
+            return "SAVED\(portion) · \(kcal(kcalEstimated)) ESTIMATED · \(grams(proteinG)) G"
+        }
         return "WEIGHED\(portion) · \(grams(proteinG)) G PROTEIN"
     }
 
     /// A saved meal, as the row that logs it.
     static func mealRow(_ meal: SavedMeal) -> Row {
         let batch = meal.portions > 1 ? " · 1 OF \(meal.portions)" : ""
+        let estimated = (meal.kcalEstimated ?? 0) > 0 ? " · PART ESTIMATED" : ""
         return Row(
             id: "meal-\(meal.id)", entry: nil, mark: .outline, title: meal.name,
-            label: "\(slotName(meal.slot))\(batch) · \(grams(meal.proteinG)) G PROTEIN", value: kcal(meal.kcal))
+            label: "\(slotName(meal.slot))\(batch) · \(grams(meal.proteinG)) G PROTEIN\(estimated)",
+            value: kcal(meal.kcal))
+    }
+
+    /// The row on Food that leads back to a meal left half built.
+    static func buildingLine(_ building: FoodScreen.Building) -> String {
+        "MEAL IN PROGRESS · \(partsCount(building.parts)) · \(kcal(building.kcal)) KCAL"
     }
 
     /// The row that leads to the targets entry.
@@ -821,23 +949,106 @@ public enum FoodText {
         return parts.joined(separator: ". ")
     }
 
-    // MARK: The meal editor
+    // MARK: The meal builder
 
-    /// "80 G · 379 KCAL · 13.2 G PER 100 G": the weight, then the label's
-    /// calories and protein, in the order of the fields below it.
-    static func ingredientLabel(_ ingredient: Ingredient) -> String {
-        "\(plain(ingredient.grams)) G · \(plain(ingredient.kcalPer100g)) KCAL · \(plain(ingredient.proteinPer100g)) G PER 100 G"
+    /// What an ingredient is, under its name. Weighed and typed: "80 G ·
+    /// 379 KCAL · 13.2 G PER 100 G", the weight, then the label's calories
+    /// and protein, in the order of the fields below it. Scanned: its
+    /// weight. Typed whole, or a photo's estimate: said so.
+    static func ingredientLabel(_ food: Ingredient) -> String {
+        switch food.quantity {
+        case .weighed(let weight, let kcalPer100g, let proteinPer100g) where food.code == nil:
+            "\(plain(weight)) G · \(plain(kcalPer100g)) KCAL · \(plain(proteinPer100g)) G PER 100 G"
+        case .weighed(let weight, _, _):
+            "LABEL · \(plain(weight)) G · \(grams(food.proteinG)) G PROTEIN"
+        case .whole where food.estimated:
+            "PHOTO ESTIMATE · \(grams(food.proteinG)) G PROTEIN"
+        case .whole:
+            "TYPED WHOLE · \(grams(food.proteinG)) G PROTEIN"
+        }
     }
 
-    /// The editor's bar: what one portion comes to, or what is missing.
-    static func editorBar(_ draft: MealDraft, saving: Bool) -> (small: String, big: String) {
+    /// A part of the meal on the builder, as its row: solid when its
+    /// figures are measured, striped when they are a photo's, outlined
+    /// with a question mark while lyfe cannot say. `estimate` is the
+    /// backend's entry for a photo; `unsent` says it is still on this phone.
+    static func partRow(_ part: MealPart, estimate: FoodDay.Entry? = nil, unsent: Bool = false) -> Row {
+        let id = "part-\(part.id)"
+        switch part.kind {
+        case .food(let food):
+            return Row(
+                id: id, entry: nil, mark: food.estimated ? .striped : .solid, title: food.name,
+                label: ingredientLabel(food), value: kcal(MealDraft.kcal(of: food)))
+        case .scan(_, let weight):
+            return Row(
+                id: id, entry: nil, mark: .outline, title: part.name,
+                label: "\(plain(weight)) G · LOOKED UP ONCE SENT", value: "?")
+        case .photo:
+            if let estimate {
+                var row = entryRow(estimate)
+                row.id = id
+                return row
+            }
+            return Row(
+                id: id, entry: nil, mark: .striped, title: part.name,
+                label: unsent ? "PHOTO · ON THIS PHONE · ESTIMATED ONCE SENT" : "PHOTO · SENT TO THE SPARK", value: "…")
+        }
+    }
+
+    /// Under the builder's running figure: the protein, how much of it is
+    /// estimated, and what is still to come.
+    static func totalLine(_ total: MealDraft.Total, parts: Int) -> String {
+        var line = [partsCount(parts), "\(grams(total.proteinG)) G PROTEIN"]
+        if total.kcalEstimated > 0 { line.append("\(kcal(total.kcalEstimated)) ESTIMATED") }
+        if total.unknown > 0 { line.append("\(total.unknown) STILL UNKNOWN") }
+        return line.joined(separator: " · ")
+    }
+
+    /// The builder's bar for a meal to be logged: what it comes to so far.
+    static func logBar(_ draft: MealDraft, total: MealDraft.Total, logging: Bool) -> (small: String, big: String) {
+        let big = logging ? "LOGGING" : "LOG IT"
+        if draft.parts.isEmpty {
+            return ("SCAN, PHOTOGRAPH OR TYPE WHAT YOU ATE", big)
+        }
+        if draft.isSaved {
+            return ("SAVED · LOGS ONE PORTION AS \(slotName(draft.slot))", big)
+        }
+        let waiting = total.unknown > 0 ? " · \(total.unknown) TO COME" : ""
+        return ("\(slotName(draft.slot)) · \(kcal(total.kcal)) KCAL · \(grams(total.proteinG)) G\(waiting)", big)
+    }
+
+    /// The builder's bar for a saved meal: what one portion comes to, or
+    /// what is missing.
+    static func editorBar(_ draft: MealDraft, estimates: [UUID: FoodDay.Entry] = [:], saving: Bool) -> (
+        small: String, big: String
+    ) {
         let big = saving ? "SAVING" : "SAVE MEAL"
-        if let missing = draft.missing {
+        if let missing = draft.missing(estimates: estimates) {
             return (missing.uppercased(), big)
         }
-        let portion = draft.portion
+        return (portionLine(draft, estimates: estimates), big)
+    }
+
+    /// "EACH OF 5 PORTIONS · 561 KCAL · 49 G PROTEIN"
+    static func portionLine(_ draft: MealDraft, estimates: [UUID: FoodDay.Entry] = [:]) -> String {
+        let portion = draft.portion(estimates: estimates)
         let each = draft.portions > 1 ? "EACH OF \(draft.portions) PORTIONS" : "THE PORTION"
-        return ("\(each) · \(kcal(portion.kcal)) KCAL · \(grams(portion.proteinG)) G PROTEIN", big)
+        return "\(each) · \(kcal(portion.kcal)) KCAL · \(grams(portion.proteinG)) G PROTEIN"
+    }
+
+    // MARK: A logged meal
+
+    /// Under a logged meal's figure: its parts, protein, and what of it is
+    /// estimated or still unknown.
+    static func mealLine(_ meal: FoodDay.Entry) -> String {
+        let parts = meal.parts ?? []
+        var line = [partsCount(parts.count), "\(grams(meal.proteinG)) G PROTEIN"]
+        if let low = meal.kcalLow, let high = meal.kcalHigh {
+            line.append("\(kcal(meal.kcalEstimated ?? 0)) ESTIMATED · \(kcal(low))–\(kcal(high))")
+        }
+        let unknown = parts.filter { !$0.isKnown }.count
+        if unknown > 0 { line.append("\(unknown) STILL UNKNOWN") }
+        return line.joined(separator: " · ")
     }
 
     // MARK: The targets entry

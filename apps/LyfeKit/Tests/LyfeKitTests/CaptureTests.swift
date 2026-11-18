@@ -250,8 +250,6 @@ enum CaptureFixture {
         let world = World.signedIn()
         world.backend.on("POST /v1/food/photo-entries", CaptureFixture.home())
         let model = world.launch()
-        model.openPhotoMeal()
-        #expect(model.foodFlow == .photo)
 
         let jpeg = Data([0xFF, 0xD8, 0xFF, 0xE0])
         #expect(await model.logPhotoMeal(note: " pho ", photo: jpeg, slot: .lunch) == .sent)
@@ -283,7 +281,6 @@ enum CaptureFixture {
         let world = World.signedIn()
         world.backend.goDown()
         let model = world.launch()
-        model.openPhotoMeal()
 
         let jpeg = Data([0xFF, 0xD8, 0xFF, 0xE0])
         #expect(await model.logPhotoMeal(note: "pho", photo: jpeg, slot: .lunch) == .saved)
@@ -368,7 +365,6 @@ enum CaptureFixture {
         let world = World.signedIn()
         world.backend.on("POST /v1/food/barcode-entries", CaptureFixture.home())
         let model = world.launch()
-        model.openScan()
         let bar = CaptureFixture.day().products![0]
         #expect(await model.logBarcode(code: "96385074", grams: 60, slot: .snack, product: bar) == .sent)
         let body = try #require(sent(world, "POST /v1/food/barcode-entries").first)
@@ -469,7 +465,7 @@ enum CaptureFixture {
         #expect(FoodText.estimateLine(food) == "578 ESTIMATED · DAY 1,132–1,532")
         #expect(FoodText.split(food, kcal: true) == (752, 578))
         #expect(FoodText.split(food, kcal: false) == (62.9, 33.0))
-        #expect(FoodText.unknownNotice(food) == "1 photo meal is being estimated. Not in the total until then.")
+        #expect(FoodText.unknownNotice(food) == "1 photo is being estimated. Not in the total until then.")
         #expect(FoodText.unknownNotice(CaptureFixture.day(lunch: "known")) == nil)
         #expect(FoodText.estimateLine(Fixture.foodDay(logged: ["breakfast"])) == nil)
     }

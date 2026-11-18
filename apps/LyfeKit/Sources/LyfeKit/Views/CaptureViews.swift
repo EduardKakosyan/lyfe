@@ -3,12 +3,14 @@ import SwiftUI
 
 // MARK: Photo meal
 
-/// A meal that is not a saved one, logged with a photo and one line. The
-/// model on the Spark estimates it afterwards; logging never waits for it,
-/// and works without a connection.
+/// A photo and one line: a meal of its own, or one part of a meal being
+/// built. The model on the Spark estimates it afterwards; nothing waits
+/// for it, and it works without a connection.
 public struct PhotoMealView: View {
     let onLog: (String, Data?, MealSlot) async -> Void
     let onClose: () -> Void
+    /// True when it is added to a meal, which has its own part of the day.
+    private let asPart: Bool
 
     @State private var photo: Data?
     @State private var note = ""
@@ -23,8 +25,9 @@ public struct PhotoMealView: View {
 
     public init(
         start: MealSlot = .likely(at: Date()), photo: Data? = nil, note: String = "", opensCamera: Bool = true,
-        onLog: @escaping (String, Data?, MealSlot) async -> Void, onClose: @escaping () -> Void
+        asPart: Bool = false, onLog: @escaping (String, Data?, MealSlot) async -> Void, onClose: @escaping () -> Void
     ) {
+        self.asPart = asPart
         self.opensCamera = opensCamera
         _slot = State(initialValue: start)
         _photo = State(initialValue: photo)
@@ -37,7 +40,7 @@ public struct PhotoMealView: View {
         VStack(spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
-                    TopLine(left: "✕ Close", right: "Photo meal", onLeft: onClose)
+                    TopLine(left: asPart ? "← Meal" : "✕ Close", right: asPart ? "Photo · a part" : "Photo meal", onLeft: onClose)
                     shot
                     VStack(alignment: .leading, spacing: 10) {
                         Text("What it is · one line").posterLabel()
@@ -59,8 +62,10 @@ public struct PhotoMealView: View {
                         }
                         .autocorrectionDisabled()
                         .accessibilityLabel("What the meal is")
-                        SlotPicker(slot: $slot)
-                        Text(CaptureText.photoHelp).posterLabel().opacity(0.55)
+                        if !asPart {
+                            SlotPicker(slot: $slot)
+                        }
+                        Text(asPart ? CaptureText.photoPartHelp : CaptureText.photoHelp).posterLabel().opacity(0.55)
                         if let problem {
                             Text(problem).posterLabel()
                         }
@@ -74,8 +79,9 @@ public struct PhotoMealView: View {
                 Task { await log() }
             } label: {
                 BreathBar(
-                    small: "Counts for today's streak · estimated on the Spark", big: logging ? "LOGGING" : "LOG IT",
-                    mark: "→", onDark: false)
+                    small: asPart ? "Estimated on the Spark while you add the rest" : "Counts for today's streak · estimated on the Spark",
+                    big: asPart ? (logging ? "ADDING" : "ADD IT") : (logging ? "LOGGING" : "LOG IT"), mark: "→",
+                    onDark: false)
             }
             .buttonStyle(.plain)
             .allowsHitTesting(!logging)
@@ -201,6 +207,9 @@ public struct EstimateView: View {
     let onReload: () async -> Void
     let onTakeBack: () async -> String?
     let onClose: () -> Void
+    /// True for a part of a meal, which it is taken out of rather than
+    /// off the day.
+    private let inMeal: Bool
 
     @State private var photo: Data?
     @State private var changing: Int?
@@ -213,10 +222,11 @@ public struct EstimateView: View {
     @State private var confirmingTakeBack = false
 
     public init(
-        entry: FoodDay.Entry, loadPhoto: @escaping () async -> Data?,
+        entry: FoodDay.Entry, inMeal: Bool = false, loadPhoto: @escaping () async -> Data?,
         onCorrect: @escaping (LyfeAPI.EstimateChange) async -> String?, onReload: @escaping () async -> Void,
         onTakeBack: @escaping () async -> String?, onClose: @escaping () -> Void
     ) {
+        self.inMeal = inMeal
         self.entry = entry
         self.loadPhoto = loadPhoto
         self.onCorrect = onCorrect
@@ -231,7 +241,9 @@ public struct EstimateView: View {
         VStack(spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
-                    TopLine(left: "← Food", right: "Photo meal · \(FoodText.slotName(entry.slot))", onLeft: onClose)
+                    TopLine(
+                        left: inMeal ? "← Meal" : "← Food",
+                        right: inMeal ? "Photo · a part" : "Photo meal · \(FoodText.slotName(entry.slot))", onLeft: onClose)
                     shot
                     estimate
                     PosterRule()
@@ -254,7 +266,7 @@ public struct EstimateView: View {
                     Button {
                         confirmingTakeBack = true
                     } label: {
-                        Text("Take it off today").posterLabel().opacity(0.55)
+                        Text(inMeal ? "Take it out of the meal" : "Take it off today").posterLabel().opacity(0.55)
                     }
                     .buttonStyle(.plain)
                     .frame(maxWidth: .infinity)
@@ -263,7 +275,9 @@ public struct EstimateView: View {
             }
             .scrollDismissesKeyboard(.interactively)
             Button(action: onClose) {
-                BreathBar(small: "Counts for today's streak", big: "DONE", mark: "→", onDark: false)
+                BreathBar(
+                    small: inMeal ? "Counted with its meal" : "Counts for today's streak", big: "DONE", mark: "→",
+                    onDark: false)
             }
             .buttonStyle(.plain)
         }
@@ -278,8 +292,11 @@ public struct EstimateView: View {
                 await onReload()
             }
         }
-        .confirmationDialog("Take \(entry.name) off today?", isPresented: $confirmingTakeBack, titleVisibility: .visible) {
-            Button("Take it off", role: .destructive) {
+        .confirmationDialog(
+            inMeal ? "Take \(entry.name) out of the meal?" : "Take \(entry.name) off today?",
+            isPresented: $confirmingTakeBack, titleVisibility: .visible
+        ) {
+            Button(inMeal ? "Take it out" : "Take it off", role: .destructive) {
                 Task {
                     note = await onTakeBack()
                     if note == nil { onClose() }
@@ -546,12 +563,15 @@ struct WaitingPhotoView: View {
 
 /// Packaged food: scan its barcode, say how much was eaten. The label's
 /// figures come from the food database, or are typed once from the
-/// packet when the database does not have it.
+/// packet when the database does not have it. A meal of its own, or one
+/// part of a meal being built.
 public struct ScanView: View {
     let lookUp: (String) async -> AppModel.ProductLookup
     let onSetLabel: (Product) async -> String?
     let onLog: (String, Double, MealSlot, Product?) async -> Void
     let onClose: () -> Void
+    /// True when it is added to a meal, which has its own part of the day.
+    private let asPart: Bool
 
     @State private var code: String?
     @State private var typedCode = ""
@@ -564,9 +584,11 @@ public struct ScanView: View {
 
     public init(
         start: MealSlot = .likely(at: Date()), code: String? = nil, lookup: AppModel.ProductLookup? = nil,
-        lookUp: @escaping (String) async -> AppModel.ProductLookup, onSetLabel: @escaping (Product) async -> String?,
+        asPart: Bool = false, lookUp: @escaping (String) async -> AppModel.ProductLookup,
+        onSetLabel: @escaping (Product) async -> String?,
         onLog: @escaping (String, Double, MealSlot, Product?) async -> Void, onClose: @escaping () -> Void
     ) {
+        self.asPart = asPart
         _slot = State(initialValue: start)
         _code = State(initialValue: code)
         _lookup = State(initialValue: lookup)
@@ -583,7 +605,9 @@ public struct ScanView: View {
         VStack(spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
-                    TopLine(left: "✕ Close", right: code.map { "Barcode \($0)" } ?? "Scan a barcode", onLeft: onClose)
+                    TopLine(
+                        left: asPart ? "← Meal" : "✕ Close", right: code.map { "Barcode \($0)" } ?? "Scan a barcode",
+                        onLeft: onClose)
                     if let code {
                         product(code)
                     } else {
@@ -597,7 +621,7 @@ public struct ScanView: View {
             }
             .scrollDismissesKeyboard(.interactively)
             if code != nil {
-                let bar = CaptureText.scanBar(lookup: lookup, grams: FoodTyping.number(grams), busy: busy)
+                let bar = CaptureText.scanBar(lookup: lookup, grams: FoodTyping.number(grams), busy: busy, adding: asPart)
                 Button {
                     Task { await log() }
                 } label: {
@@ -716,7 +740,8 @@ public struct ScanView: View {
                                 .font(.system(size: 11, weight: .heavy))
                                 .tracking(0.6)
                                 .lineLimit(1)
-                                .minimumScaleFactor(0.7)
+                                .minimumScaleFactor(0.6)
+                                .padding(.horizontal, 5)
                                 .frame(maxWidth: .infinity)
                                 .padding(.vertical, 8)
                                 .overlay(Rectangle().strokeBorder(Poster.ink, lineWidth: 2.5))
@@ -726,7 +751,9 @@ public struct ScanView: View {
                     }
                 }
             }
-            SlotPicker(slot: $slot)
+            if !asPart {
+                SlotPicker(slot: $slot)
+            }
         }
         .padding(.horizontal, Poster.margin)
         .padding(.vertical, 12)
@@ -921,6 +948,8 @@ struct LabeledField: View {
     @Binding var text: String
     var prompt: String
     var numeric = false
+    /// What the return key does, when it leads on to another field.
+    var onSubmit: (() -> Void)?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -928,6 +957,8 @@ struct LabeledField: View {
             TextField("", text: $text, prompt: Text(prompt).foregroundStyle(Poster.ink.opacity(0.3)))
                 .font(.system(size: 17, weight: .heavy))
                 .monospacedDigit()
+                .submitLabel(onSubmit == nil ? .done : .next)
+                .onSubmit { onSubmit?() }
                 #if os(iOS)
                     .keyboardType(numeric ? .decimalPad : .default)
                     .textInputAutocapitalization(.words)
@@ -949,6 +980,9 @@ struct LabeledField: View {
 public enum CaptureText {
     static let photoHelp =
         "The model on the Spark estimates it, give or take a third. Without a connection it is kept here and estimated once sent."
+
+    static let photoPartHelp =
+        "The model on the Spark estimates it, give or take a third, while you add the rest. It shows in the meal when it answers."
 
     static let waitingHelp =
         "Logged on this phone. It is sent, and estimated, once the server can be reached. It already counts for today."
@@ -1041,15 +1075,17 @@ public enum CaptureText {
     }
 
     /// The scan screen's bar: what the grams come to, once known.
-    static func scanBar(lookup: AppModel.ProductLookup?, grams: Double?, busy: Bool) -> (small: String, big: String) {
-        let big = busy ? "LOGGING" : "LOG IT"
+    static func scanBar(lookup: AppModel.ProductLookup?, grams: Double?, busy: Bool, adding: Bool = false) -> (
+        small: String, big: String
+    ) {
+        let big = adding ? (busy ? "ADDING" : "ADD IT") : (busy ? "LOGGING" : "LOG IT")
         guard let grams, grams > 0 else { return ("TYPE THE GRAMS EATEN", big) }
         switch lookup {
         case .found(let product):
             let amount = product.amount(grams: grams)
             return ("MEASURED · \(FoodText.kcal(amount.kcal)) KCAL · \(FoodText.grams(amount.proteinG)) G PROTEIN", big)
         case .notFound:
-            return ("SAVES THE LABEL, THEN LOGS \(FoodText.plain(grams)) G", big)
+            return ("SAVES THE LABEL, THEN \(adding ? "ADDS" : "LOGS") \(FoodText.plain(grams)) G", big)
         case .offline:
             return ("\(FoodText.plain(grams)) G · COUNTED ONCE SENT", big)
         case nil:

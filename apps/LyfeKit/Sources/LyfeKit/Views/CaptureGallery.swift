@@ -10,15 +10,19 @@
         public static func plate() -> Data? { CaptureGallery.plate() }
     }
 
-    /// The photo and barcode screens with made-up meals: a debug build shows
-    /// one when launched with LYFE_DEBUG_FOOD set to `mixed` (the day with a
-    /// saved, photo and barcode meal), `photo`, `estimate`, `estimating`,
-    /// `failed`, `scan`, `product`, `notfound` or `label`.
+    /// The builder, photo and barcode screens with made-up meals: a debug
+    /// build shows one when launched with LYFE_DEBUG_FOOD set to `mixed`
+    /// (the day with a saved, photo, barcode and built meal), `builder`
+    /// (a meal being built from four parts), `building` (one with a photo
+    /// still being estimated), `logged` (a built meal after logging),
+    /// `photo`, `estimate`, `estimating`, `failed`, `scan`, `product`,
+    /// `notfound` or `label`.
     struct CaptureGallery: View {
         var screen: String
 
         static let screens: Set<String> = [
-            "mixed", "photo", "estimate", "estimating", "failed", "scan", "product", "notfound", "label",
+            "mixed", "builder", "building", "logged", "photo", "estimate", "estimating", "failed", "scan", "product",
+            "notfound", "label",
         ]
 
         static let bar = Product(
@@ -27,6 +31,12 @@
         var body: some View {
             Group {
                 switch screen {
+                case "builder":
+                    Builder(draft: Self.draft(), estimates: [Self.eggsID: Self.eggs(figures: .known)])
+                case "building":
+                    Builder(draft: Self.draft(), estimates: [Self.eggsID: Self.eggs(figures: .estimating)])
+                case "logged":
+                    LoggedMealView(meal: Self.builtBreakfast(), onTakeBack: { _ in nil }, onClose: {})
                 case "photo":
                     PhotoMealView(
                         start: .dinner, photo: Self.plate(), note: "stir fry, rice, some oil", opensCamera: false,
@@ -56,11 +66,75 @@
                             FoodCapture(
                                 eatenAt: Date(), slot: .snack,
                                 kind: .barcode(code: "0628915423456", grams: 175, product: nil))
-                        ], onBack: {}, onLog: { _, _ in }, onTakeBack: { _ in nil }, onEditMeal: { _ in },
-                        onTargets: {})
+                        ], building: .init(parts: 2, kcal: 313), onBack: {}, onLog: { _, _ in },
+                        onTakeBack: { _ in nil }, onEditMeal: { _ in }, onTargets: {})
                 }
             }
             .preferredColorScheme(.light)
+        }
+
+        /// The builder holding a draft that its buttons really change.
+        private struct Builder: View {
+            @State var draft: MealDraft
+            var estimates: [UUID: FoodDay.Entry]
+
+            var body: some View {
+                MealBuilderView(
+                    draft: draft, estimates: estimates, onChange: { $0(&draft) }, onSave: { nil }, onClose: {})
+            }
+        }
+
+        static let eggsID = UUID(uuidString: "00000000-0000-4000-9000-000000000034")!
+
+        /// A breakfast being built: yogurt and granola scanned, a banana
+        /// typed, and eggs on toast from a photo.
+        static func draft() -> MealDraft {
+            var draft = MealDraft(slot: .breakfast, purpose: .log)
+            draft.parts = [
+                MealPart(.food(Ingredient(name: "Greek yogurt", grams: 175, kcalPer100g: 63, proteinPer100g: 11, code: "064200115896"))),
+                MealPart(.food(Ingredient(name: "Granola", grams: 45, kcalPer100g: 451, proteinPer100g: 10.5, code: "0055577105019"))),
+                MealPart(.food(Ingredient(name: "Banana", grams: 120, kcalPer100g: 89, proteinPer100g: 1.1))),
+                MealPart(id: eggsID, .photo(note: "eggs on toast", hasPhoto: true)),
+            ]
+            return draft
+        }
+
+        /// The photo of eggs on toast, as the backend has it.
+        static func eggs(figures: FoodDay.Figures) -> FoodDay.Entry {
+            let known = figures == .known
+            return FoodDay.Entry(
+                id: eggsID, slot: .breakfast, name: "eggs on toast", mealId: nil, servings: 1, kcal: known ? 312 : 0,
+                proteinG: known ? 23 : 0, source: .photo, figures: figures, estimated: true, kcalLow: known ? 200 : nil,
+                kcalHigh: known ? 420 : nil,
+                photo: .init(
+                    note: "eggs on toast", hasPhoto: true,
+                    items: known
+                        ? [
+                            .init(name: "Fried eggs", grams: 100, gramsSeen: 100, kcal: 155, proteinG: 13),
+                            .init(name: "Toast", grams: 60, gramsSeen: 60, kcal: 157, proteinG: 10),
+                        ] : [], oilAsked: false, oil: nil, oilCounted: .nothing, oilKcal: 0, typed: false, problem: nil),
+                kcalEstimated: known ? 312 : nil)
+        }
+
+        /// The same breakfast once logged, as the backend sends it.
+        static func builtBreakfast() -> FoodDay.Entry {
+            func part(_ n: Int, _ name: String, _ source: FoodDay.FoodSource, _ kcal: Int, _ protein: Double, grams: Double, per100: (Double, Double), code: String? = nil) -> FoodDay.Entry {
+                FoodDay.Entry(
+                    id: UUID(uuidString: "00000000-0000-4000-9000-00000000003\(n)")!, slot: .breakfast, name: name,
+                    mealId: nil, servings: 1, kcal: kcal, proteinG: protein, source: source, figures: .known,
+                    estimated: false, barcode: code.map { .init(code: $0, grams: grams) },
+                    weighed: .init(grams: grams, kcalPer100g: per100.0, proteinPer100g: per100.1))
+            }
+            return FoodDay.Entry(
+                id: UUID(uuidString: "00000000-0000-4000-9000-000000000030")!, slot: .breakfast, name: "Breakfast",
+                mealId: nil, servings: 1, kcal: 732, proteinG: 48.3, source: .built, figures: .known, estimated: true,
+                kcalLow: 620, kcalHigh: 840, kcalEstimated: 312,
+                parts: [
+                    part(1, "Greek yogurt", .barcode, 110, 19.3, grams: 175, per100: (63, 11), code: "064200115896"),
+                    part(2, "Granola", .barcode, 203, 4.7, grams: 45, per100: (451, 10.5), code: "0055577105019"),
+                    part(3, "Banana", .typed, 107, 1.3, grams: 120, per100: (89, 1.1)),
+                    eggs(figures: .known),
+                ])
         }
 
         private func estimate(_ entry: FoodDay.Entry) -> some View {
@@ -94,11 +168,8 @@
         }
 
         static func day() -> FoodDay {
-            let breakfast = FoodGallery.breakfast
             let entries = [
-                FoodDay.Entry(
-                    id: UUID(), slot: .breakfast, name: breakfast.name, mealId: breakfast.id, servings: 1,
-                    kcal: breakfast.kcal, proteinG: breakfast.proteinG, source: .saved, figures: .known, estimated: false),
+                builtBreakfast(),
                 lunch(figures: .estimating),
                 dinner(),
                 FoodDay.Entry(
@@ -106,14 +177,14 @@
                     source: .barcode, figures: .known, estimated: false, barcode: .init(code: "96385074", grams: 60)),
             ]
             return FoodDay(
-                day: FoodGallery.today, target: FoodGallery.target, kcal: 1330, proteinG: 95.9, kcalLeft: 1170,
-                proteinLeftG: 74.1, openSlots: [], entries: entries,
+                day: FoodGallery.today, target: FoodGallery.target, kcal: 1520, proteinG: 101.1, kcalLeft: 980,
+                proteinLeftG: 68.9, openSlots: [], entries: entries,
                 meals: [FoodGallery.breakfast, FoodGallery.lunch, FoodGallery.dinner],
                 streak: .init(
                     days: 13, state: .kept, previousBest: 9, loggedToday: true,
                     lastDays: (11...17).map { .init(date: CalendarDay(year: 2026, month: 11, day: $0), state: .kept) }),
-                kcalMeasured: 752, proteinMeasuredG: 62.9, kcalEstimated: 578, proteinEstimatedG: 33, kcalLow: 1132,
-                kcalHigh: 1532, unknown: 1, estimateRangePct: 35, products: [bar])
+                kcalMeasured: 630, proteinMeasuredG: 45.1, kcalEstimated: 890, proteinEstimatedG: 56, kcalLow: 1210,
+                kcalHigh: 1830, unknown: 1, estimateRangePct: 35, products: [bar])
         }
 
         /// A made-up plate seen from above, as the drawn screen has it.

@@ -124,11 +124,12 @@ public struct LyfeAPI: Sendable {
             var slot: MealSlot
             var note: String
             var photoJpeg: String?
+            var partOf: UUID?
         }
         let body = try JSONEncoder.lyfe.encode(
             Body(
                 id: capture.id, eatenAt: capture.eatenAt, slot: capture.slot, note: note,
-                photoJpeg: jpeg?.base64EncodedString()))
+                photoJpeg: jpeg?.base64EncodedString(), partOf: capture.partOf))
         // A photo takes longer to send than a tap.
         return try await call("POST", "v1/food/photo-entries", token: token, body: body, timeout: 60)
     }
@@ -144,10 +145,107 @@ public struct LyfeAPI: Sendable {
             var slot: MealSlot
             var code: String
             var grams: Double
+            var partOf: UUID?
         }
         let body = try JSONEncoder.lyfe.encode(
-            Body(id: capture.id, eatenAt: capture.eatenAt, slot: capture.slot, code: code, grams: grams))
+            Body(
+                id: capture.id, eatenAt: capture.eatenAt, slot: capture.slot, code: code, grams: grams,
+                partOf: capture.partOf))
         return try await call("POST", "v1/food/barcode-entries", token: token, body: body, timeout: 15)
+    }
+
+    /// A food as the backend takes it: weighed, with its grams and the
+    /// label's two figures, or whole, with what it comes to.
+    private struct FoodBody: Encodable {
+        var id: UUID?
+        var eatenAt: Date?
+        var slot: MealSlot?
+        var partOf: UUID?
+        var name: String?
+        var code: String?
+        var grams: Double?
+        var kcalPer100g: Double?
+        var proteinPer100g: Double?
+        var kcal: Double?
+        var proteinG: Double?
+        var estimated: Bool?
+
+        // Spelled out: the encoder would not put the underscore before
+        // the digits.
+        enum CodingKeys: String, CodingKey {
+            case id, eatenAt, slot, partOf, name, code, grams, kcal, proteinG, estimated
+            case kcalPer100g = "kcal_per_100g"
+            case proteinPer100g = "protein_per_100g"
+        }
+
+        init() {}
+
+        init(_ food: Ingredient) {
+            name = food.name
+            switch food.quantity {
+            case .weighed(let grams, let kcalPer100g, let proteinPer100g):
+                self.grams = grams
+                self.kcalPer100g = kcalPer100g
+                self.proteinPer100g = proteinPer100g
+            case .whole(let kcal, let proteinG):
+                self.kcal = kcal
+                self.proteinG = proteinG
+            }
+        }
+
+        /// A part of a built meal: a scanned code and its grams, a typed
+        /// food, or just the id of a photo sent ahead.
+        static func part(_ part: MealPart) -> FoodBody {
+            var body = FoodBody()
+            switch part.kind {
+            case .food(let food):
+                if let code = food.code, let grams = food.grams {
+                    // The backend reads the label itself, as for any scan.
+                    body.code = code
+                    body.grams = grams
+                } else {
+                    body = FoodBody(food)
+                }
+            case .scan(let code, let grams):
+                body.code = code
+                body.grams = grams
+            case .photo:
+                break
+            }
+            body.id = part.id
+            return body
+        }
+    }
+
+    /// Hands the backend a food typed by hand. It answers with Home as it
+    /// now stands. Sending the same food again changes nothing.
+    public func recordTypedEntry(token: String, capture: FoodCapture) async throws -> HomeSnapshot {
+        guard case .typed(let food) = capture.kind else { throw LyfeAPIError.unreadableResponse }
+        var value = FoodBody(food)
+        value.id = capture.id
+        value.eatenAt = capture.eatenAt
+        value.slot = capture.slot
+        value.partOf = capture.partOf
+        let body = try JSONEncoder.lyfe.encode(value)
+        return try await call("POST", "v1/food/typed-entries", token: token, body: body, timeout: 15)
+    }
+
+    /// Hands the backend a meal built from parts. It answers with Home as
+    /// it now stands. Sending the same meal again changes nothing.
+    public func recordBuiltMeal(token: String, capture: FoodCapture) async throws -> HomeSnapshot {
+        guard case .built(let name, let parts) = capture.kind else { throw LyfeAPIError.unreadableResponse }
+        struct Body: Encodable {
+            var id: UUID
+            var eatenAt: Date
+            var slot: MealSlot
+            var name: String
+            var parts: [FoodBody]
+        }
+        let body = try JSONEncoder.lyfe.encode(
+            Body(
+                id: capture.id, eatenAt: capture.eatenAt, slot: capture.slot,
+                name: name.trimmingCharacters(in: .whitespacesAndNewlines), parts: parts.map(FoodBody.part)))
+        return try await call("POST", "v1/food/built-entries", token: token, body: body, timeout: 20)
     }
 
     /// A change to a photo meal's estimate.
@@ -220,36 +318,26 @@ public struct LyfeAPI: Sendable {
 
     /// Stores a saved meal under its id, replacing the recipe when the
     /// meal is already stored.
-    public func saveMeal(token: String, draft: MealDraft) async throws -> HomeSnapshot {
-        struct Item: Encodable {
-            var name: String
-            var grams: Double
-            var kcalPer100g: Double
-            var proteinPer100g: Double
-
-            // Spelled out: the encoder would not put the underscore
-            // before the digits.
-            enum CodingKeys: String, CodingKey {
-                case name, grams
-                case kcalPer100g = "kcal_per_100g"
-                case proteinPer100g = "protein_per_100g"
-            }
-        }
+    public func saveMeal(
+        token: String, id: UUID, name: String, slot: MealSlot, portions: Int, ingredients: [Ingredient]
+    ) async throws -> HomeSnapshot {
         struct Body: Encodable {
             var name: String
             var slot: MealSlot
             var portions: Int
-            var ingredients: [Item]
+            var ingredients: [FoodBody]
         }
-        let items = draft.ingredients.map {
-            Item(name: $0.name, grams: $0.grams, kcalPer100g: $0.kcalPer100g, proteinPer100g: $0.proteinPer100g)
+        let items = ingredients.map { food in
+            var item = FoodBody(food)
+            item.code = food.code
+            item.estimated = food.estimated ? true : nil
+            return item
         }
         let body = try JSONEncoder.lyfe.encode(
             Body(
-                name: draft.name.trimmingCharacters(in: .whitespacesAndNewlines), slot: draft.slot,
-                portions: draft.portions, ingredients: items))
-        return try await call(
-            "PUT", "v1/food/meals/\(draft.id.uuidString.lowercased())", token: token, body: body, timeout: 15)
+                name: name.trimmingCharacters(in: .whitespacesAndNewlines), slot: slot, portions: portions,
+                ingredients: items))
+        return try await call("PUT", "v1/food/meals/\(id.uuidString.lowercased())", token: token, body: body, timeout: 15)
     }
 
     /// Takes a saved meal out of the list. What was logged from it stays.

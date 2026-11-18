@@ -72,6 +72,8 @@ pub fn router(state: AppState) -> Router {
             post(record_photo_entry).layer(DefaultBodyLimit::max(PHOTO_BODY_LIMIT)),
         )
         .route("/v1/food/barcode-entries", post(record_barcode_entry))
+        .route("/v1/food/typed-entries", post(record_typed_entry))
+        .route("/v1/food/built-entries", post(record_built_meal))
         .route("/v1/food/entries/{id}/estimate", put(correct_estimate))
         .route("/v1/food/entries/{id}/photo", get(food_photo))
         .route("/v1/food/products/{code}", get(find_product).put(set_product))
@@ -384,6 +386,7 @@ async fn food_day(state: &AppState, now: DateTime<Utc>, today: NaiveDate) -> Res
         &db::food_targets(&state.pool).await?,
         state.estimate_range_pct,
     );
+    day.drafts = food::draft_views(&db::draft_parts(&state.pool, state.timezone).await?, state.estimate_range_pct);
     day.products = db::recent_products(&state.pool, RECENT_PRODUCTS).await?;
     Ok(day)
 }
@@ -557,6 +560,7 @@ async fn record_food_entry(
         name: meal.name.clone(),
         servings,
         amount: meal.amount(servings),
+        estimated: meal.estimated(servings),
     };
     if db::insert_food_entry(&state.pool, &entry, device.session_id).await? {
         // What was eaten is not logged; it is the owner's.
@@ -565,8 +569,9 @@ async fn record_food_entry(
     Ok(Json(home_now(&state).await?))
 }
 
-/// Takes a logged meal back, for a tap that was a slip. Taking back an
-/// entry that is already gone changes nothing.
+/// Takes a logged meal back, for a tap that was a slip, or takes one part
+/// out of a built meal. A built meal goes with its parts, and with its last
+/// part. Taking back an entry that is already gone changes nothing.
 async fn remove_food_entry(
     State(state): State<AppState>,
     _device: Device,
@@ -591,11 +596,46 @@ struct PhotoEntryRequest {
     note: String,
     /// The photo, a JPEG, in base64. A meal can be described without one.
     photo_jpeg: Option<String>,
+    /// The built meal this is a part of. It may not have arrived yet: a
+    /// photo is sent while its meal is still being put together.
+    part_of: Option<Uuid>,
+}
+
+/// Where an arriving part goes: at its meal's time and slot once that meal
+/// is logged, or as sent while it is not.
+struct Place {
+    eaten_at: DateTime<Utc>,
+    slot: Slot,
+    position: i32,
+}
+
+/// Places a part. `ahead` says whether it may arrive before its meal, as
+/// only a photo does.
+async fn place(
+    state: &AppState,
+    part_of: Option<Uuid>,
+    eaten_at: DateTime<Utc>,
+    slot: Slot,
+    ahead: bool,
+) -> Result<Place, ApiError> {
+    let as_sent = Place { eaten_at, slot, position: 0 };
+    let Some(meal) = part_of else {
+        return Ok(as_sent);
+    };
+    match db::meal_of_part(&state.pool, meal).await? {
+        db::MealOfPart::Logged { eaten_at, slot, next_position } => Ok(Place { eaten_at, slot, position: next_position }),
+        db::MealOfPart::NotArrived if ahead => Ok(as_sent),
+        db::MealOfPart::NotArrived | db::MealOfPart::Unusable => {
+            Err(ApiError::BadRequest("no logged meal has this part_of id"))
+        }
+    }
 }
 
 /// Logs a meal from a photo and one line, and answers with Home as it now
 /// stands. The meal counts for the day at once; its figures follow when
-/// the model on the Spark has estimated it.
+/// the model on the Spark has estimated it. Sent as a part of a meal that
+/// has not arrived, it is estimated all the same and counts once the meal
+/// does.
 async fn record_photo_entry(
     State(state): State<AppState>,
     device: Device,
@@ -623,11 +663,26 @@ async fn record_photo_entry(
     if request.eaten_at > (state.now)() + chrono::Duration::days(1) {
         return Err(ApiError::BadRequest("eaten_at is in the future"));
     }
-    let entry = db::NewPhotoEntry { id: request.id, eaten_at: request.eaten_at, slot, note, jpeg };
+    let place = place(&state, request.part_of, request.eaten_at, slot, true).await?;
+    let entry = db::NewPhotoEntry {
+        id: request.id,
+        eaten_at: place.eaten_at,
+        slot: place.slot,
+        note,
+        jpeg,
+        part_of: request.part_of,
+        position: place.position,
+    };
     if db::insert_photo_entry(&state.pool, &entry, device.session_id).await? {
         // What was eaten is not logged; it is the owner's.
-        tracing::info!(id = %entry.id, photo = entry.jpeg.is_some(), "photo meal recorded");
+        tracing::info!(id = %entry.id, photo = entry.jpeg.is_some(), part = entry.part_of.is_some(), "photo meal recorded");
         state.estimator_wake.notify_one();
+        if entry.part_of.is_some() {
+            let dropped = db::drop_stale_drafts(&state.pool).await?;
+            if dropped > 0 {
+                tracing::info!(dropped, "photos for meals never logged were dropped");
+            }
+        }
     }
     Ok(Json(home_now(&state).await?))
 }
@@ -642,6 +697,8 @@ struct BarcodeEntryRequest {
     code: String,
     /// What was eaten, in grams.
     grams: f64,
+    /// The logged built meal this joins as a part.
+    part_of: Option<Uuid>,
 }
 
 /// Logs packaged food by its barcode and the grams eaten, and answers with
@@ -661,11 +718,177 @@ async fn record_barcode_entry(
     if request.eaten_at > (state.now)() + chrono::Duration::days(1) {
         return Err(ApiError::BadRequest("eaten_at is in the future"));
     }
+    let place = place(&state, request.part_of, request.eaten_at, slot, false).await?;
     let product = db::product(&state.pool, &code).await?;
     let known = product.is_some();
-    let entry = db::NewBarcodeEntry { id: request.id, eaten_at: request.eaten_at, slot, code, grams: request.grams, product };
+    let entry = db::NewBarcodeEntry {
+        id: request.id,
+        eaten_at: place.eaten_at,
+        slot: place.slot,
+        code,
+        grams: request.grams,
+        product,
+        part_of: request.part_of,
+        position: place.position,
+    };
     if db::insert_barcode_entry(&state.pool, &entry, device.session_id).await? {
         tracing::info!(id = %entry.id, known, "barcode meal recorded");
+    }
+    Ok(Json(home_now(&state).await?))
+}
+
+/// A food as typed: weighed, with `grams` and the label's two figures per
+/// 100 g, or whole, with `kcal` and `protein_g`.
+#[derive(Deserialize)]
+struct TypedFood {
+    name: String,
+    grams: Option<f64>,
+    kcal_per_100g: Option<f64>,
+    protein_per_100g: Option<f64>,
+    kcal: Option<f64>,
+    protein_g: Option<f64>,
+    /// For a saved meal's ingredient: what a photo was estimated at.
+    #[serde(default)]
+    estimated: bool,
+    /// For a saved meal's ingredient: the barcode it was scanned from.
+    code: Option<String>,
+}
+
+impl TypedFood {
+    /// The food, checked, or what is wrong with it.
+    fn read(self) -> Result<food::Ingredient, &'static str> {
+        let quantity = match (self.grams, self.kcal_per_100g, self.protein_per_100g, self.kcal, self.protein_g) {
+            (Some(grams), Some(kcal_per_100g), Some(protein_per_100g), None, None) => {
+                food::Quantity::Weighed { grams, kcal_per_100g, protein_per_100g }
+            }
+            (None, None, None, Some(kcal), Some(protein_g)) => food::Quantity::Whole { kcal, protein_g },
+            _ => return Err("give grams, kcal_per_100g and protein_per_100g, or kcal and protein_g"),
+        };
+        food::Ingredient { name: self.name, quantity, estimated: self.estimated, code: self.code }.checked()
+    }
+}
+
+#[derive(Deserialize)]
+struct TypedEntryRequest {
+    /// Made on the phone when the food is typed. Sending the same entry
+    /// again changes nothing.
+    id: Uuid,
+    eaten_at: DateTime<Utc>,
+    slot: String,
+    #[serde(flatten)]
+    food: TypedFood,
+    /// The logged built meal this joins as a part.
+    part_of: Option<Uuid>,
+}
+
+/// Logs a food the owner typed, weighed with its label's figures or just
+/// what it came to, and answers with Home as it now stands. Typed figures
+/// are measured.
+async fn record_typed_entry(
+    State(state): State<AppState>,
+    device: Device,
+    Json(request): Json<TypedEntryRequest>,
+) -> Result<Json<HomeResponse>, ApiError> {
+    let slot = Slot::parse(&request.slot).ok_or(ApiError::BadRequest("slot must be breakfast, lunch, dinner or snack"))?;
+    let food = request.food.read().map_err(ApiError::BadRequest)?;
+    if request.eaten_at > (state.now)() + chrono::Duration::days(1) {
+        return Err(ApiError::BadRequest("eaten_at is in the future"));
+    }
+    let place = place(&state, request.part_of, request.eaten_at, slot, false).await?;
+    let entry = db::NewTypedEntry {
+        id: request.id,
+        eaten_at: place.eaten_at,
+        slot: place.slot,
+        food,
+        part_of: request.part_of,
+        position: place.position,
+    };
+    if db::insert_typed_entry(&state.pool, &entry, device.session_id).await? {
+        tracing::info!(id = %entry.id, "typed food recorded");
+    }
+    Ok(Json(home_now(&state).await?))
+}
+
+#[derive(Deserialize)]
+struct BuiltMealRequest {
+    /// Made on the phone when the meal is started. Sending the same meal
+    /// again changes nothing.
+    id: Uuid,
+    eaten_at: DateTime<Utc>,
+    slot: String,
+    /// What the meal is called; the part of the day when left out.
+    #[serde(default)]
+    name: String,
+    /// In the order added.
+    parts: Vec<PartRequest>,
+}
+
+/// One part of a built meal. With a `code` it was scanned and needs its
+/// `grams`; with a `name` it was typed, weighed or whole; with neither it
+/// is a photo sent ahead under this id as a part of this meal.
+#[derive(Deserialize)]
+struct PartRequest {
+    id: Uuid,
+    code: Option<String>,
+    name: Option<String>,
+    grams: Option<f64>,
+    kcal_per_100g: Option<f64>,
+    protein_per_100g: Option<f64>,
+    kcal: Option<f64>,
+    protein_g: Option<f64>,
+}
+
+/// Logs a meal built from parts, scanned, typed and photographed, as one
+/// meal, and answers with Home as it now stands. Each part keeps its own
+/// figures: a label's are measured, a photo's estimated, and one not known
+/// yet is left out of the total until it is.
+async fn record_built_meal(
+    State(state): State<AppState>,
+    device: Device,
+    Json(request): Json<BuiltMealRequest>,
+) -> Result<Json<HomeResponse>, ApiError> {
+    let slot = Slot::parse(&request.slot).ok_or(ApiError::BadRequest("slot must be breakfast, lunch, dinner or snack"))?;
+    let name = match request.name.trim() {
+        "" => slot.title().to_string(),
+        name if name.chars().count() <= food::MAX_NAME_CHARS => name.to_string(),
+        _ => return Err(ApiError::BadRequest("the meal's name must be at most 60 characters")),
+    };
+    if request.parts.is_empty() || request.parts.len() > food::MAX_INGREDIENTS {
+        return Err(ApiError::BadRequest("a meal has 1 to 40 parts"));
+    }
+    if request.eaten_at > (state.now)() + chrono::Duration::days(1) {
+        return Err(ApiError::BadRequest("eaten_at is in the future"));
+    }
+    let mut parts = Vec::with_capacity(request.parts.len());
+    for part in request.parts {
+        parts.push(match (part.code, part.name) {
+            (Some(code), _) => {
+                let code = product::normalize_code(&code).ok_or(ApiError::BadRequest("a barcode is 8 to 14 digits"))?;
+                let grams = part.grams.filter(|grams| product::grams_make_sense(*grams));
+                let grams = grams.ok_or(ApiError::BadRequest("a scanned part's grams must be above 0 and at most 3000"))?;
+                let product = db::product(&state.pool, &code).await?;
+                db::NewPart::Barcode { id: part.id, code, grams, product }
+            }
+            (None, Some(name)) => {
+                let food = TypedFood {
+                    name,
+                    grams: part.grams,
+                    kcal_per_100g: part.kcal_per_100g,
+                    protein_per_100g: part.protein_per_100g,
+                    kcal: part.kcal,
+                    protein_g: part.protein_g,
+                    estimated: false,
+                    code: None,
+                };
+                db::NewPart::Typed { id: part.id, food: food.read().map_err(ApiError::BadRequest)? }
+            }
+            (None, None) => db::NewPart::Photo { id: part.id },
+        });
+    }
+    let meal = db::NewBuiltMeal { id: request.id, eaten_at: request.eaten_at, slot, name, parts };
+    if db::insert_built_meal(&state.pool, &meal, device.session_id).await? {
+        // What was eaten is not logged; it is the owner's.
+        tracing::info!(id = %meal.id, parts = meal.parts.len(), "built meal recorded");
     }
     Ok(Json(home_now(&state).await?))
 }
@@ -770,17 +993,7 @@ struct MealRequest {
     slot: String,
     /// Portions the weighed recipe makes.
     portions: u32,
-    ingredients: Vec<IngredientRequest>,
-}
-
-#[derive(Deserialize)]
-struct IngredientRequest {
-    name: String,
-    /// As weighed.
-    grams: f64,
-    /// From the label.
-    kcal_per_100g: f64,
-    protein_per_100g: f64,
+    ingredients: Vec<TypedFood>,
 }
 
 /// Stores a saved meal under the id the phone made for it, replacing the
@@ -796,13 +1009,9 @@ async fn save_meal(
     let ingredients = request
         .ingredients
         .into_iter()
-        .map(|i| food::Ingredient {
-            name: i.name,
-            grams: i.grams,
-            kcal_per_100g: i.kcal_per_100g,
-            protein_per_100g: i.protein_per_100g,
-        })
-        .collect();
+        .map(TypedFood::read)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(ApiError::BadRequest)?;
     let meal = food::SavedMeal::new(id, &request.name, slot, request.portions, ingredients).map_err(ApiError::BadRequest)?;
     db::upsert_saved_meal(&state.pool, &meal).await?;
     tracing::info!(%id, ingredients = meal.ingredients.len(), "saved meal stored");
