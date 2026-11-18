@@ -1,0 +1,20 @@
+# lyfe's own PostgreSQL, run by the lyfe account. It listens on a Unix
+# socket inside lyfe's private runtime folder and on no network port, so
+# no other account on the machine can connect to it.
+[Unit]
+Description=lyfe PostgreSQL
+
+[Service]
+Type=notify
+RuntimeDirectory=lyfe-postgres
+RuntimeDirectoryMode=0700
+ExecStart=@PG_BIN@/postgres -D %h/pgdata -c listen_addresses= -c unix_socket_directories=%t/lyfe-postgres -c unix_socket_permissions=0700
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=mixed
+KillSignal=SIGINT
+TimeoutSec=120
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

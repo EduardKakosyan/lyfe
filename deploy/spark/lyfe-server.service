@@ -1,0 +1,16 @@
+# The lyfe backend: API and Garmin poller. Listens on loopback only;
+# `tailscale serve` publishes it to the tailnet over HTTPS.
+[Unit]
+Description=lyfe backend
+After=lyfe-postgres.service
+Requires=lyfe-postgres.service
+
+[Service]
+EnvironmentFile=%h/.config/lyfe/lyfe.env
+ExecStart=%h/bin/lyfe-server serve
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,19 @@
+
+# Riptide artifacts (cloud-synced)
+.humanlayer/tasks/
+
+# Riptide artifacts (cloud-synced)
+.humanlayer/tasks/
+
+# Build output
+backend/target/
+backend/target-linux/
+apps/LyfeKit/.build/
+apps/Lyfe/build/
+# Generated from apps/Lyfe/project.yml by xcodegen
+apps/Lyfe/Lyfe.xcodeproj/
+.DS_Store
+
+# Per-machine settings for the deploy scripts
+deploy/spark/local.env
+apps/Lyfe/Local.xcconfig
