@@ -14,11 +14,14 @@ use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::PgPool;
+use uuid::Uuid;
 
 use crate::auth::{self, SignInThrottle};
 use crate::db;
 use crate::garmin::sync::{Syncer, SOURCE as GARMIN};
+use crate::routines::breath::{self, BreathRules};
 use crate::routines::gym::{self, GymRules, GymSession, GymStreak, Week};
+use crate::routines::weekly::WeekStreak;
 
 /// How recent a Garmin poll must be for an app refresh to skip polling again.
 const REFRESH_MIN_AGE: Duration = Duration::from_secs(30);
@@ -32,6 +35,7 @@ pub struct AppState {
     pub throttle: Arc<SignInThrottle>,
     pub timezone: chrono_tz::Tz,
     pub gym_rules: Arc<GymRules>,
+    pub breath_rules: Arc<BreathRules>,
     /// Whether this server can send notifications (it has Apple's key).
     pub push_ready: bool,
     pub now: Clock,
@@ -45,6 +49,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/sync", post(sync_now))
         .route("/v1/push-token", post(set_push_token))
         .route("/v1/home", get(home))
+        .route("/v1/breath/sessions", post(record_breath_session))
         .with_state(state)
 }
 
@@ -216,8 +221,28 @@ struct HomeResponse {
     today: NaiveDate,
     week: Week,
     gym: GymWeek,
+    breath: BreathWeek,
     sources: Sources,
     notifications: Notifications,
+}
+
+#[derive(Serialize)]
+struct BreathWeek {
+    /// Sessions a week needs to count.
+    target: u32,
+    /// Days this week with a session that counts.
+    done: u32,
+    /// Sessions still needed this week.
+    remaining: u32,
+    /// Whether today already has a session that counts.
+    done_today: bool,
+    /// Every session started this week, counted or not, oldest first.
+    sessions: Vec<breath::SessionSummary>,
+    streak: WeekStreak,
+    /// The table for the next session.
+    table: breath::Table,
+    /// The longest hold ever recorded.
+    best_ms: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -285,6 +310,11 @@ async fn garmin_status(state: &AppState) -> Result<SourceStatus, ApiError> {
 }
 
 async fn home(State(state): State<AppState>, _device: Device) -> Result<Json<HomeResponse>, ApiError> {
+    Ok(Json(home_now(&state).await?))
+}
+
+/// Everything the Home screen shows, as of now.
+async fn home_now(state: &AppState) -> Result<HomeResponse, ApiError> {
     let now = (state.now)();
     let today = now.with_timezone(&state.timezone).date_naive();
     let week = Week::containing(today);
@@ -292,7 +322,7 @@ async fn home(State(state): State<AppState>, _device: Device) -> Result<Json<Hom
     let sessions = gym::sessions_in_week(&state.gym_rules, week, &activities);
     let streak = gym::streak(&state.gym_rules, today, &activities);
     let done = sessions.len() as u32;
-    Ok(Json(HomeResponse {
+    Ok(HomeResponse {
         generated_at: now,
         today,
         week,
@@ -304,9 +334,102 @@ async fn home(State(state): State<AppState>, _device: Device) -> Result<Json<Hom
             sessions,
             streak,
         },
-        sources: Sources { garmin: garmin_status(&state).await? },
+        breath: breath_week(state, today).await?,
+        sources: Sources { garmin: garmin_status(state).await? },
         notifications: Notifications { server_ready: state.push_ready },
-    }))
+    })
+}
+
+async fn breath_week(state: &AppState, today: NaiveDate) -> Result<BreathWeek, ApiError> {
+    let week = Week::containing(today);
+    let sessions = db::breath_sessions(&state.pool, state.timezone).await?;
+    let mut counted_days: Vec<NaiveDate> = breath::session_days(&sessions)
+        .into_iter()
+        .filter(|day| week.contains(*day))
+        .collect();
+    counted_days.sort();
+    counted_days.dedup();
+    let done = counted_days.len() as u32;
+    Ok(BreathWeek {
+        target: breath::WEEKLY_TARGET,
+        done,
+        remaining: breath::WEEKLY_TARGET.saturating_sub(done),
+        done_today: counted_days.contains(&today),
+        sessions: breath::sessions_in_week(week, &sessions)
+            .into_iter()
+            .map(breath::Session::summary)
+            .collect(),
+        streak: breath::streak(today, &sessions),
+        table: breath::next_table(&state.breath_rules, &sessions),
+        best_ms: breath::best_ever_ms(&sessions),
+    })
+}
+
+// --- Breath sessions -----------------------------------------------------
+
+#[derive(Deserialize)]
+struct BreathSessionRequest {
+    /// Made on the phone when the session starts. Sending the same session
+    /// again changes nothing.
+    id: Uuid,
+    started_at: DateTime<Utc>,
+    ended_at: DateTime<Utc>,
+    /// The table the session was run with.
+    round_s: u32,
+    rounds: u32,
+    /// Rounds without a tap are left out.
+    holds: Vec<HoldRequest>,
+}
+
+#[derive(Deserialize)]
+struct HoldRequest {
+    /// Counted from 1.
+    round: u32,
+    hold_ms: u32,
+}
+
+/// Stores a session captured on the phone and answers with Home as it now
+/// stands: the week, the streak and the next table.
+async fn record_breath_session(
+    State(state): State<AppState>,
+    device: Device,
+    Json(request): Json<BreathSessionRequest>,
+) -> Result<Json<HomeResponse>, ApiError> {
+    if !(1..=50).contains(&request.rounds) || !(1..=3600).contains(&request.round_s) {
+        return Err(ApiError::BadRequest("rounds must be 1 to 50 and round_s 1 to 3600"));
+    }
+    if request.ended_at < request.started_at {
+        return Err(ApiError::BadRequest("ended_at is before started_at"));
+    }
+    if request.started_at > (state.now)() + chrono::Duration::days(1) {
+        return Err(ApiError::BadRequest("started_at is in the future"));
+    }
+    let mut holds: Vec<(i32, i32)> = Vec::with_capacity(request.holds.len());
+    for hold in &request.holds {
+        if !(1..=request.rounds).contains(&hold.round) {
+            return Err(ApiError::BadRequest("a hold names a round the table does not have"));
+        }
+        if hold.hold_ms > request.round_s * 1000 {
+            return Err(ApiError::BadRequest("a hold is longer than its round"));
+        }
+        holds.push((hold.round as i32, hold.hold_ms as i32));
+    }
+    holds.sort();
+    if holds.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err(ApiError::BadRequest("a round has two holds"));
+    }
+    let session = db::StoredBreathSession {
+        id: request.id,
+        started_at: request.started_at,
+        ended_at: request.ended_at,
+        round_s: request.round_s as i32,
+        rounds: request.rounds as i32,
+        holds,
+    };
+    if db::insert_breath_session(&state.pool, &session, device.session_id).await? {
+        tracing::info!(id = %session.id, holds = session.holds.len(), "breath session recorded");
+    }
+    Ok(Json(home_now(&state).await?))
 }
 
 /// Asks Garmin for new activities now, unless that was just done. The app

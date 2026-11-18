@@ -7,6 +7,8 @@ public struct HomeSnapshot: Codable, Equatable, Sendable {
     public var today: CalendarDay
     public var week: Week
     public var gym: GymWeek
+    /// Missing in answers cached before breath sessions existed.
+    public var breath: BreathWeek?
     public var sources: Sources
     /// Missing in answers cached before notifications existed.
     public var notifications: Notifications?
@@ -36,8 +38,43 @@ public struct HomeSnapshot: Codable, Equatable, Sendable {
         public var streak: GymStreak?
     }
 
-    /// The gym streak as the backend counts it.
-    public struct GymStreak: Codable, Equatable, Sendable {
+    public typealias GymStreak = WeekStreak
+
+    /// Breath training this week, the streak, and the table for the next
+    /// session, as the backend decided them.
+    public struct BreathWeek: Codable, Equatable, Sendable {
+        /// Sessions a week needs to count.
+        public var target: Int
+        /// Days this week with a session that counts.
+        public var done: Int
+        public var remaining: Int
+        /// Whether today already has a session that counts.
+        public var doneToday: Bool
+        /// Every session started this week, counted or not, oldest first.
+        public var sessions: [BreathSession]
+        public var streak: WeekStreak
+        public var table: BreathTable
+        /// The longest hold ever recorded.
+        public var bestMs: Int?
+    }
+
+    /// A recorded breath session.
+    public struct BreathSession: Codable, Equatable, Sendable, Identifiable {
+        public var id: UUID
+        public var date: CalendarDay
+        public var roundS: Int
+        public var rounds: Int
+        /// One entry per round; nil where no hold was recorded.
+        public var holdsMs: [Int?]
+        public var bestMs: Int?
+        public var meanMs: Int?
+        public var tightestRecoveryMs: Int?
+        /// Whether it counts toward the week.
+        public var counts: Bool
+    }
+
+    /// A weekly routine's streak as the backend counts it.
+    public struct WeekStreak: Codable, Equatable, Sendable {
         /// Weeks in a row with the target met, counting this week once it is.
         public var weeks: Int
         public var state: State
@@ -89,6 +126,32 @@ public struct HomeSnapshot: Codable, Equatable, Sendable {
         public var durationMin: Int
 
         public var id: Int64 { activityId }
+    }
+}
+
+/// The table lyfe set for a breath session: fixed rounds, each opened by a
+/// hold taken as far as it goes.
+public struct BreathTable: Codable, Equatable, Sendable {
+    public var roundS: Int
+    public var rounds: Int
+    /// The last session's round length, when this table moved on from it.
+    public var changedFromS: Int?
+    /// The rounds get longer once a session's tightest recovery is under this.
+    public var advanceUnderS: Int
+    /// How much longer.
+    public var stepS: Int
+    /// The last session's hold in each round, to beat; nil where it had none.
+    public var lastHoldsMs: [Int?]
+
+    public init(
+        roundS: Int, rounds: Int, changedFromS: Int? = nil, advanceUnderS: Int, stepS: Int, lastHoldsMs: [Int?]
+    ) {
+        self.roundS = roundS
+        self.rounds = rounds
+        self.changedFromS = changedFromS
+        self.advanceUnderS = advanceUnderS
+        self.stepS = stepS
+        self.lastHoldsMs = lastHoldsMs
     }
 }
 

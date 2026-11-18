@@ -80,6 +80,7 @@ async fn harness_at(pool: PgPool, now: &str, with_key: bool) -> Harness {
             counted_types: lyfe_server::config::parse_types(GymRules::DEFAULT_TYPES),
             min_duration_s: 15.0 * 60.0,
         }),
+        breath_rules: Arc::new(lyfe_server::routines::breath::BreathRules::default()),
         push_ready: false,
         now: Arc::new(move || now),
     };
@@ -971,4 +972,327 @@ async fn a_prompt_apple_could_not_take_is_tried_again(pool: PgPool) {
     apple.reset().await;
     apple_answers(&apple, "dev", 200, None).await;
     assert!(matches!(notifier.tick(at("2026-11-21T12:05:00Z")).await.unwrap(), Outcome::Sent { .. }));
+}
+
+// --- Breath sessions -----------------------------------------------------
+
+/// A session of six rounds as the phone sends it, with one hold per entry
+/// in seconds from round 1 on.
+fn breath_session(n: u32, started_at: &str, round_s: u32, holds_s: &[u32]) -> Value {
+    let ended_at = at(started_at) + chrono::Duration::seconds(i64::from(round_s) * 6);
+    let holds: Vec<Value> = holds_s
+        .iter()
+        .enumerate()
+        .map(|(index, s)| json!({"round": index + 1, "hold_ms": s * 1000}))
+        .collect();
+    json!({
+        "id": format!("00000000-0000-4000-8000-{n:012}"),
+        "started_at": started_at,
+        "ended_at": ended_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "round_s": round_s,
+        "rounds": 6,
+        "holds": holds,
+    })
+}
+
+const GOOD_HOLDS: &[u32] = &[125, 132, 120, 118, 121, 119];
+
+impl Harness {
+    async fn record_breath(&self, token: &str, session: Value) -> Value {
+        let (status, body) = self.post("/v1/breath/sessions", Some(token), Some(session)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body
+    }
+
+    /// Three full sessions (Monday, Wednesday, Friday evening) in each week
+    /// starting on the given Mondays.
+    async fn breath_weeks(&self, token: &str, mondays: &[&str]) {
+        for (week, monday) in mondays.iter().enumerate() {
+            for (index, day) in [0, 2, 4].into_iter().enumerate() {
+                let date: chrono::NaiveDate = monday.parse().unwrap();
+                let started_at = format!("{}T23:00:00Z", date + chrono::Duration::days(day));
+                let n = 1000 + (week * 10 + index) as u32;
+                self.record_breath(token, breath_session(n, &started_at, 240, GOOD_HOLDS)).await;
+            }
+        }
+    }
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_breath_session_fills_a_square_and_sets_the_next_table(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+
+    // Before any session: the first table, from the settings.
+    let (_, before) = h.get("/v1/home", Some(&token)).await;
+    let breath = &before["breath"];
+    assert_eq!((&breath["target"], &breath["done"], &breath["remaining"]), (&json!(3), &json!(0), &json!(3)));
+    assert_eq!(breath["done_today"], false);
+    assert_eq!(breath["streak"]["state"], "not_started");
+    assert_eq!(breath["table"]["round_s"], 240);
+    assert_eq!(breath["table"]["rounds"], 6);
+    assert_eq!(breath["table"]["changed_from_s"], Value::Null);
+    assert_eq!(breath["table"]["last_holds_ms"], json!([null, null, null, null, null, null]));
+    assert_eq!(breath["best_ms"], Value::Null);
+
+    // A session this morning (10:30 in San Juan). The answer is Home.
+    let after = h
+        .record_breath(&token, breath_session(1, "2026-11-17T14:30:00Z", 240, GOOD_HOLDS))
+        .await;
+    assert_eq!(after["today"], "2026-11-17");
+    let breath = &after["breath"];
+    assert_eq!((&breath["done"], &breath["remaining"]), (&json!(1), &json!(2)));
+    assert_eq!(breath["done_today"], true);
+    assert_eq!(breath["best_ms"], 132_000);
+    let session = &breath["sessions"][0];
+    assert_eq!(session["date"], "2026-11-17");
+    assert_eq!(session["counts"], true);
+    assert_eq!(session["holds_ms"], json!([125000, 132000, 120000, 118000, 121000, 119000]));
+    assert_eq!(session["best_ms"], 132_000);
+    assert_eq!(session["mean_ms"], 122_500);
+    assert_eq!(session["tightest_recovery_ms"], 108_000);
+    // Recovery had room, so the same rounds again, with these holds to beat.
+    assert_eq!(breath["table"]["round_s"], 240);
+    assert_eq!(breath["table"]["changed_from_s"], Value::Null);
+    assert_eq!(breath["table"]["advance_under_s"], 45);
+    assert_eq!(breath["table"]["step_s"], 15);
+    assert_eq!(breath["table"]["last_holds_ms"][1], 132_000);
+    // The gym is untouched by it.
+    assert_eq!(after["gym"]["done"], 0);
+
+    let (_, home) = h.get("/v1/home", Some(&token)).await;
+    assert_eq!(home["breath"], after["breath"]);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_session_sent_twice_is_counted_once(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    let session = breath_session(1, "2026-11-17T14:30:00Z", 240, GOOD_HOLDS);
+
+    let first = h.record_breath(&token, session.clone()).await;
+    // The phone did not hear the answer and sends it again.
+    let second = h.record_breath(&token, session).await;
+    assert_eq!(second["breath"], first["breath"]);
+    assert_eq!(second["breath"]["done"], 1);
+    assert_eq!(second["breath"]["sessions"].as_array().unwrap().len(), 1);
+
+    // Even a different body under the same id changes nothing.
+    let altered = breath_session(1, "2026-11-17T14:30:00Z", 240, &[10, 10, 10]);
+    let third = h.record_breath(&token, altered).await;
+    assert_eq!(third["breath"], first["breath"]);
+    let holds: i64 = sqlx::query_scalar("select count(*) from breath_holds")
+        .fetch_one(&h.state.pool)
+        .await
+        .unwrap();
+    assert_eq!(holds, 6);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_breath_session_belongs_to_the_owners_day(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+
+    // 23:30 on Monday in San Juan is already Tuesday in UTC.
+    let home = h
+        .record_breath(&token, breath_session(1, "2026-11-17T03:30:00Z", 240, GOOD_HOLDS))
+        .await;
+    assert_eq!(home["breath"]["sessions"][0]["date"], "2026-11-16");
+    assert_eq!(home["breath"]["done"], 1);
+    assert_eq!(home["breath"]["done_today"], false);
+
+    // 23:00 on Sunday in San Juan belongs to last week.
+    let home = h
+        .record_breath(&token, breath_session(2, "2026-11-16T03:00:00Z", 240, GOOD_HOLDS))
+        .await;
+    assert_eq!(home["breath"]["done"], 1);
+    assert_eq!(home["breath"]["sessions"].as_array().unwrap().len(), 1);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_session_cut_short_counts_and_an_abandoned_one_does_not(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+
+    // One hold, then the session was given up: stored, but not a session.
+    let home = h
+        .record_breath(&token, breath_session(1, "2026-11-16T23:00:00Z", 240, &[150]))
+        .await;
+    assert_eq!(home["breath"]["done"], 0);
+    assert_eq!(home["breath"]["sessions"][0]["counts"], false);
+    // Its hold is still the best so far, and it does not move the table.
+    assert_eq!(home["breath"]["best_ms"], 150_000);
+    assert_eq!(home["breath"]["table"]["last_holds_ms"][0], Value::Null);
+
+    // Three of six rounds: counts, with rounds four to six left empty.
+    let home = h
+        .record_breath(&token, breath_session(2, "2026-11-17T14:30:00Z", 240, &[100, 110, 105]))
+        .await;
+    assert_eq!(home["breath"]["done"], 1);
+    assert_eq!(home["breath"]["sessions"][1]["counts"], true);
+    assert_eq!(home["breath"]["sessions"][1]["holds_ms"], json!([100000, 110000, 105000, null, null, null]));
+    assert_eq!(home["breath"]["table"]["last_holds_ms"], json!([100000, 110000, 105000, null, null, null]));
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn two_sessions_on_one_day_fill_one_square(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    h.record_breath(&token, breath_session(1, "2026-11-17T11:00:00Z", 240, GOOD_HOLDS)).await;
+    let home = h
+        .record_breath(&token, breath_session(2, "2026-11-17T14:30:00Z", 240, GOOD_HOLDS))
+        .await;
+    assert_eq!(home["breath"]["done"], 1);
+    assert_eq!(home["breath"]["sessions"].as_array().unwrap().len(), 2);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn tight_recovery_makes_the_next_rounds_longer(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+
+    // A 3:20 hold leaves 0:40 of a 4:00 round: under the 0:45 threshold.
+    let home = h
+        .record_breath(&token, breath_session(1, "2026-11-16T23:00:00Z", 240, &[180, 200, 175, 170, 165, 160]))
+        .await;
+    assert_eq!(home["breath"]["table"]["round_s"], 255);
+    assert_eq!(home["breath"]["table"]["changed_from_s"], 240);
+
+    // The next session runs 4:15 rounds with room to spare: 4:15 again.
+    let home = h
+        .record_breath(&token, breath_session(2, "2026-11-17T14:30:00Z", 255, &[185, 201, 176, 170, 166, 161]))
+        .await;
+    assert_eq!(home["breath"]["table"]["round_s"], 255);
+    assert_eq!(home["breath"]["table"]["changed_from_s"], Value::Null);
+    assert_eq!(home["breath"]["table"]["last_holds_ms"][1], 201_000);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn breath_weeks_build_a_streak_with_the_same_recovery_rule(pool: PgPool) {
+    let h = harness(pool.clone()).await;
+    let token = h.signed_in().await;
+
+    // Weeks 44 and 45 kept; week 46 had two sessions; Monday of week 47 done.
+    h.breath_weeks(&token, &["2026-10-26", "2026-11-02"]).await;
+    h.record_breath(&token, breath_session(1, "2026-11-09T23:00:00Z", 240, GOOD_HOLDS)).await;
+    h.record_breath(&token, breath_session(2, "2026-11-11T23:00:00Z", 240, GOOD_HOLDS)).await;
+    let home = h
+        .record_breath(&token, breath_session(3, "2026-11-16T23:00:00Z", 240, GOOD_HOLDS))
+        .await;
+    let streak = &home["breath"]["streak"];
+    assert_eq!((&streak["weeks"], &streak["state"]), (&json!(2), &json!("recovering")));
+    assert_eq!((&streak["remaining"], &streak["open_days"], &streak["reachable"]), (&json!(2), &json!(6), &json!(true)));
+    let marks: Vec<&str> = streak["recent"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["mark"].as_str().unwrap())
+        .collect();
+    assert_eq!(marks, vec!["kept", "kept", "awaiting_recovery"]);
+    assert_eq!(streak["recent"][2]["done"], 2);
+
+    // By Thursday evening the week has its three sessions: recovered.
+    let thursday = harness_at(pool, "2026-11-19T23:30:00Z", true).await;
+    thursday.record_breath(&token, breath_session(4, "2026-11-18T23:00:00Z", 240, GOOD_HOLDS)).await;
+    let home = thursday
+        .record_breath(&token, breath_session(5, "2026-11-19T23:00:00Z", 240, GOOD_HOLDS))
+        .await;
+    let streak = &home["breath"]["streak"];
+    assert_eq!((&streak["weeks"], &streak["state"], &streak["remaining"]), (&json!(3), &json!("kept"), &json!(0)));
+    assert_eq!(streak["recent"][2]["mark"], "recovered");
+    assert_eq!(home["breath"]["done_today"], true);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_breath_session_that_makes_no_sense_is_refused(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    let good = breath_session(1, "2026-11-17T14:30:00Z", 240, GOOD_HOLDS);
+
+    let (status, _) = h.post("/v1/breath/sessions", None, Some(good.clone())).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let mut round_seven = good.clone();
+    round_seven["holds"][0]["round"] = json!(7);
+    let mut twice = good.clone();
+    twice["holds"][1]["round"] = json!(1);
+    let mut too_long = good.clone();
+    too_long["holds"][0]["hold_ms"] = json!(240_001);
+    let mut backwards = good.clone();
+    backwards["ended_at"] = json!("2026-11-17T14:00:00Z");
+    let mut next_week = good.clone();
+    next_week["started_at"] = json!("2026-11-24T14:30:00Z");
+    next_week["ended_at"] = json!("2026-11-24T15:00:00Z");
+    let mut no_rounds = good.clone();
+    no_rounds["rounds"] = json!(0);
+    for bad in [round_seven, twice, too_long, backwards, next_week, no_rounds] {
+        let (status, body) = h.post("/v1/breath/sessions", Some(&token), Some(bad.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad} {body}");
+    }
+    let (status, _) = h
+        .post("/v1/breath/sessions", Some(&token), Some(json!({"id": "not-an-id"})))
+        .await;
+    assert!(status.is_client_error());
+
+    let (_, home) = h.get("/v1/home", Some(&token)).await;
+    assert_eq!(home["breath"]["sessions"], json!([]));
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_breath_streak_prompts_on_the_day_every_day_left_is_needed(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    register_device(&h, &token).await;
+    // Weeks 45 and 46 kept, and Monday of week 47 done: two more needed.
+    h.breath_weeks(&token, &["2026-11-02", "2026-11-09"]).await;
+    h.record_breath(&token, breath_session(1, "2026-11-16T23:00:00Z", 240, GOOD_HOLDS)).await;
+    let apple = MockServer::start().await;
+    apple_answers(&apple, "dev", 200, None).await;
+    let notifier = notifier(&h, &apple);
+
+    // Friday 08:00 in San Juan: three days left for two sessions.
+    assert_eq!(notifier.tick(at("2026-11-20T12:00:00Z")).await.unwrap(), Outcome::NothingDue);
+    // Saturday 08:00: today and Sunday are both needed.
+    assert_eq!(
+        notifier.tick(at("2026-11-21T12:00:00Z")).await.unwrap(),
+        Outcome::Sent {
+            title: "Breath: 2 more by Sunday".into(),
+            body: "Do a session today to keep your 2-week streak. It takes every day left this week.".into(),
+            devices: 1,
+        }
+    );
+    assert_eq!(notifier.tick(at("2026-11-21T12:05:00Z")).await.unwrap(), Outcome::AlreadySent);
+    let requests = apple.received_requests().await.unwrap();
+    assert_eq!(requests[0].headers.get("apns-collapse-id").unwrap(), "breath_train_today");
+
+    // A session that morning, and Sunday has nothing to say before its own.
+    let saturday = harness_at(h.state.pool.clone(), "2026-11-21T13:00:00Z", true).await;
+    saturday.record_breath(&token, breath_session(2, "2026-11-21T12:30:00Z", 240, GOOD_HOLDS)).await;
+    assert_eq!(notifier.tick(at("2026-11-21T13:05:00Z")).await.unwrap(), Outcome::NothingDue);
+    assert!(matches!(
+        notifier.tick(at("2026-11-22T12:00:00Z")).await.unwrap(),
+        Outcome::Sent { title, .. } if title == "Breath: 1 more today"
+    ));
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn when_both_routines_need_today_each_gets_its_own_prompt(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    register_device(&h, &token).await;
+    two_more_needed(&h).await;
+    h.breath_weeks(&token, &["2026-11-02", "2026-11-09"]).await;
+    h.record_breath(&token, breath_session(1, "2026-11-16T23:00:00Z", 240, GOOD_HOLDS)).await;
+    let apple = MockServer::start().await;
+    apple_answers(&apple, "dev", 200, None).await;
+    let notifier = notifier(&h, &apple);
+
+    let sent = |outcome: Outcome| match outcome {
+        Outcome::Sent { title, .. } => title,
+        other => panic!("expected a prompt, got {other:?}"),
+    };
+    assert_eq!(sent(notifier.tick(at("2026-11-21T12:00:00Z")).await.unwrap()), "Gym: 2 more by Sunday");
+    assert_eq!(sent(notifier.tick(at("2026-11-21T12:05:00Z")).await.unwrap()), "Breath: 2 more by Sunday");
+    assert_eq!(notifier.tick(at("2026-11-21T12:10:00Z")).await.unwrap(), Outcome::AlreadySent);
+    assert_eq!(apple.received_requests().await.unwrap().len(), 2);
 }

@@ -22,7 +22,7 @@ struct LyfeApp: App {
                     delegate.onDeviceToken = { token in
                         Task { await model.setPushToken(token) }
                     }
-                    if model.phase == .signedIn, scenePhase == .active {
+                    if model.phase == .signedIn, scenePhase == .active, !runsItself {
                         await enableNotifications(for: model)
                     }
                 }
@@ -30,15 +30,28 @@ struct LyfeApp: App {
                     .task {
                         await reportConnectionFromEnvironment()
                         await signInFromEnvironment()
+                        await runBreathFromEnvironment()
                     }
                 #endif
         }
+    }
+
+    /// True when a development build was launched to run a breath session
+    /// by itself; it then asks no questions on the way.
+    private var runsItself: Bool {
+        #if DEBUG
+            ProcessInfo.processInfo.environment["LYFE_DEBUG_BREATH_RUN"] != nil
+        #else
+            false
+        #endif
     }
 
     @ViewBuilder private var content: some View {
         #if DEBUG
             if let gallery = ProcessInfo.processInfo.environment["LYFE_DEBUG_GALLERY"] {
                 StreakGallery(skipping: Int(gallery) ?? 0)
+            } else if let screen = ProcessInfo.processInfo.environment["LYFE_DEBUG_BREATH"] {
+                BreathGallery(screen: screen)
             } else {
                 RootView(model: model)
             }
@@ -74,6 +87,29 @@ struct LyfeApp: App {
                 print("PROBE result: \(error)")
             }
             exit(0)
+        }
+
+        /// With LYFE_DEBUG_BREATH_RUN set to a number of seconds, a signed-in
+        /// development build runs the next breath session by itself, ending
+        /// every hold after that many seconds. For watching the whole
+        /// session, sounds and upload included, without tapping; use it
+        /// against a local backend, since the session is recorded.
+        private func runBreathFromEnvironment() async {
+            guard let text = ProcessInfo.processInfo.environment["LYFE_DEBUG_BREATH_RUN"], let hold = Double(text)
+            else { return }
+            for _ in 0..<100 where model.home?.breath == nil {
+                try? await Task.sleep(for: .milliseconds(200))
+            }
+            model.openBreathSession()
+            guard let session = model.breathSession else { return }
+            try? await Task.sleep(for: .seconds(2))
+            session.start()
+            while session.isRunning {
+                if case .hold(_, let since, _) = session.phase, Date().timeIntervalSince(since) >= hold {
+                    session.tap()
+                }
+                try? await Task.sleep(for: .milliseconds(100))
+            }
         }
 
         /// Development builds can be launched already signed in, for

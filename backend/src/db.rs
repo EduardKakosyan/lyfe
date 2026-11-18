@@ -5,6 +5,9 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Row;
 
+use uuid::Uuid;
+
+use crate::routines::breath;
 use crate::routines::gym::Activity;
 
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -273,6 +276,94 @@ pub async fn activities_between(
             name: r.get("name"),
             start_local: r.get("start_local"),
             duration_s: r.get("duration_s"),
+        })
+        .collect())
+}
+
+// --- Breath sessions -----------------------------------------------------
+
+/// A breath session as the phone captured it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredBreathSession {
+    pub id: Uuid,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: DateTime<Utc>,
+    pub round_s: i32,
+    pub rounds: i32,
+    /// (round counted from 1, hold in milliseconds), in round order.
+    pub holds: Vec<(i32, i32)>,
+}
+
+/// Stores a session with its holds. Returns false, and changes nothing,
+/// when a session with this id is already stored.
+pub async fn insert_breath_session(
+    pool: &PgPool,
+    session: &StoredBreathSession,
+    device_session_id: i64,
+) -> sqlx::Result<bool> {
+    let mut tx = pool.begin().await?;
+    let inserted = sqlx::query(
+        "insert into breath_sessions (id, started_at, ended_at, round_s, rounds, device_session_id)
+         values ($1, $2, $3, $4, $5, $6)
+         on conflict (id) do nothing",
+    )
+    .bind(session.id)
+    .bind(session.started_at)
+    .bind(session.ended_at)
+    .bind(session.round_s)
+    .bind(session.rounds)
+    .bind(device_session_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        == 1;
+    if inserted {
+        let (rounds, holds): (Vec<i32>, Vec<i32>) = session.holds.iter().copied().unzip();
+        sqlx::query(
+            "insert into breath_holds (session_id, round, hold_ms)
+             select $1, * from unnest($2::integer[], $3::integer[])",
+        )
+        .bind(session.id)
+        .bind(&rounds)
+        .bind(&holds)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(inserted)
+}
+
+/// Every breath session, oldest first, with its start read in the owner's
+/// time zone.
+pub async fn breath_sessions(pool: &PgPool, timezone: chrono_tz::Tz) -> sqlx::Result<Vec<breath::Session>> {
+    let rows = sqlx::query(
+        "select s.id, s.started_at, s.round_s, s.rounds,
+                coalesce(array_agg(h.round order by h.round) filter (where h.round is not null), '{}') as hold_rounds,
+                coalesce(array_agg(h.hold_ms order by h.round) filter (where h.round is not null), '{}') as hold_ms
+         from breath_sessions s
+         left join breath_holds h on h.session_id = s.id
+         group by s.id
+         order by s.started_at, s.id",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let started_at: DateTime<Utc> = r.get("started_at");
+            let rounds: Vec<i32> = r.get("hold_rounds");
+            let holds: Vec<i32> = r.get("hold_ms");
+            breath::Session {
+                id: r.get("id"),
+                started_local: started_at.with_timezone(&timezone).naive_local(),
+                round_s: r.get::<i32, _>("round_s") as u32,
+                rounds: r.get::<i32, _>("rounds") as u32,
+                holds: rounds
+                    .into_iter()
+                    .zip(holds)
+                    .map(|(round, hold_ms)| breath::Hold { round: round as u32, hold_ms: hold_ms as u32 })
+                    .collect(),
+            }
         })
         .collect())
 }

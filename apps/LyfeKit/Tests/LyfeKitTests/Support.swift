@@ -99,10 +99,48 @@ enum Fixture {
 
     /// A Home answer in exactly the shape the backend sends. Without
     /// `streak` it is the answer from before streaks existed.
+    /// Breath training in exactly the shape the backend sends. `holds` is
+    /// one session per entry, on Monday, Tuesday and so on of week 47, each
+    /// a list of holds in seconds from round 1 on.
+    static func breath(
+        holds: [[Int]] = [], streak: String = Fixture.streak(weeks: 0, state: "not_started", recent: ""),
+        doneToday: Bool = false, roundS: Int = 240, changedFromS: Int? = nil, lastHolds: [Int?]? = nil,
+        ids: [String]? = nil
+    ) -> String {
+        func list(_ values: [Int?]) -> String {
+            "[" + values.map { $0.map { String($0 * 1000) } ?? "null" }.joined(separator: ",") + "]"
+        }
+        let sessions = holds.enumerated().map { index, held in
+            let padded: [Int?] = held.map { Optional($0) } + Array(repeating: nil, count: max(0, 6 - held.count))
+            let best = held.max().map { String($0 * 1000) } ?? "null"
+            let mean = held.isEmpty ? "null" : String(held.reduce(0, +) * 1000 / held.count)
+            let recovery = held.max().map { String((240 - $0) * 1000) } ?? "null"
+            let id = ids?[index] ?? "00000000-0000-4000-8000-00000000000\(index + 1)"
+            return """
+                {"id": "\(id)", "date": "2026-11-\(16 + index)", "round_s": 240, "rounds": 6,
+                 "holds_ms": \(list(padded)), "best_ms": \(best), "mean_ms": \(mean),
+                 "tightest_recovery_ms": \(recovery), "counts": \(held.count >= 3)}
+                """
+        }
+        let counted = holds.filter { $0.count >= 3 }.count
+        let last = lastHolds ?? (holds.last { $0.count >= 3 }.map { held in
+            held.map { Optional($0) } + Array(repeating: nil, count: max(0, 6 - held.count))
+        } ?? Array(repeating: nil, count: 6))
+        let best = holds.flatMap { $0 }.max().map { String($0 * 1000) } ?? "null"
+        return """
+            {"target": 3, "done": \(counted), "remaining": \(max(0, 3 - counted)), "done_today": \(doneToday),
+             "sessions": [\(sessions.joined(separator: ","))], "streak": \(streak),
+             "table": {"round_s": \(roundS), "rounds": 6, "changed_from_s": \(changedFromS.map(String.init) ?? "null"),
+                       "advance_under_s": 45, "step_s": 15, "last_holds_ms": \(list(last))},
+             "best_ms": \(best)}
+            """
+    }
+
     static func home(
         done: Int = 1, sources: String = Fixture.sources(), streak: String? = nil, today: String = "2026-11-17",
-        serverReady: Bool? = nil
+        serverReady: Bool? = nil, breath: String? = nil
     ) -> String {
+        let breathJSON = breath.map { ", \"breath\": \($0)" } ?? ""
         let streakJSON = streak.map { ", \"streak\": \($0)" } ?? ""
         let notifications = serverReady.map { ", \"notifications\": {\"server_ready\": \($0)}" } ?? ""
         let all = [
@@ -119,15 +157,23 @@ enum Fixture {
               "today": "\(today)",
               "week": {"iso_year": 2026, "iso_week": 47, "starts_on": "2026-11-16", "ends_on": "2026-11-22"},
               "gym": {"target": 4, "done": \(done), "remaining": \(max(0, 4 - done)), "days_left": 6,
-                      "sessions": [\(all.prefix(done).joined(separator: ","))]\(streakJSON)},
+                      "sessions": [\(all.prefix(done).joined(separator: ","))]\(streakJSON)}\(breathJSON),
               "sources": \(sources)\(notifications)
             }
             """
     }
 
-    static func snapshot(done: Int = 1, streak: String? = nil, today: String = "2026-11-17") -> HomeSnapshot {
+    static func snapshot(
+        done: Int = 1, streak: String? = nil, today: String = "2026-11-17", breath: String? = nil
+    ) -> HomeSnapshot {
         try! JSONDecoder.lyfe.decode(
-            HomeSnapshot.self, from: Data(home(done: done, streak: streak, today: today).utf8))
+            HomeSnapshot.self, from: Data(home(done: done, streak: streak, today: today, breath: breath).utf8))
+    }
+
+    /// A table of six 4:00 rounds, with last session's holds in seconds.
+    static func table(lastHolds: [Int?] = Array(repeating: nil, count: 6), roundS: Int = 240) -> BreathTable {
+        BreathTable(
+            roundS: roundS, rounds: 6, advanceUnderS: 45, stepS: 15, lastHoldsMs: lastHolds.map { $0.map { $0 * 1000 } })
     }
 
     static func temporaryDirectory() -> URL {
@@ -141,11 +187,15 @@ struct World {
     let tokens: MemoryTokenStore
     let addresses: MemoryServerAddressStore
     let cache = HomeCache(directory: Fixture.temporaryDirectory())
+    let breath = BreathStore(directory: Fixture.temporaryDirectory())
     let clock = Date(timeIntervalSince1970: 1_795_000_000)
+    /// The time the app sees; starts at `clock` and can be moved on.
+    let time: TestClock
 
     init(token: String? = nil, address: String? = nil) {
         tokens = MemoryTokenStore(token: token)
         addresses = MemoryServerAddressStore(address: address)
+        time = TestClock(clock)
     }
 
     /// A signed-in world with nothing cached.
@@ -154,9 +204,46 @@ struct World {
     }
 
     func launch(transport: (any HTTPTransport)? = nil) -> AppModel {
-        let clock = clock
+        let time = time
         return AppModel(
-            tokens: tokens, addresses: addresses, cache: cache, transport: transport ?? backend,
-            deviceName: "Test iPhone", now: { clock })
+            tokens: tokens, addresses: addresses, cache: cache, breath: breath, transport: transport ?? backend,
+            deviceName: "Test iPhone", now: { time.now })
+    }
+}
+
+/// A clock the test moves by hand.
+final class TestClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Date
+
+    init(_ start: Date) {
+        value = start
+    }
+
+    var now: Date {
+        get { lock.withLock { value } }
+        set { lock.withLock { value = newValue } }
+    }
+
+    func advance(_ seconds: TimeInterval) {
+        lock.withLock { value = value.addingTimeInterval(seconds) }
+    }
+}
+
+/// Cues that only remember what they were asked to do.
+@MainActor
+final class RecordingCues: BreathCues {
+    var log: [String] = []
+    func begin(_ run: BreathRun, now: Date) { log.append("begin") }
+    func holdEnded() { log.append("holdEnded") }
+    func beatLast() { log.append("beatLast") }
+    func end(completed: Bool) { log.append("end \(completed)") }
+}
+
+/// Lets work started in the background finish, up to a limit.
+@MainActor
+func eventually(_ done: @MainActor () -> Bool) async {
+    for _ in 0..<2000 where !done() {
+        await Task.yield()
     }
 }

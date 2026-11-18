@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use clap::Args;
 
 use crate::push::apns::Environment;
+use crate::routines::breath::BreathRules;
 use crate::routines::gym::GymRules;
 
 #[derive(Debug, Clone, Args)]
@@ -106,9 +107,36 @@ pub struct ServeConfig {
     /// Activities shorter than this many minutes do not count.
     #[arg(long, env = "LYFE_GYM_MIN_MINUTES", default_value_t = GymRules::DEFAULT_MIN_MINUTES)]
     pub gym_min_minutes: u32,
+
+    /// Round length of the first breath table, in seconds. After the first
+    /// session the table follows what was recorded.
+    #[arg(long, env = "LYFE_BREATH_START_ROUND_SECONDS", default_value_t = BreathRules::DEFAULT_START_ROUND_SECONDS, value_parser = clap::value_parser!(u32).range(30..=1800))]
+    pub breath_start_round_seconds: u32,
+
+    /// Rounds in a breath table.
+    #[arg(long, env = "LYFE_BREATH_ROUNDS", default_value_t = BreathRules::DEFAULT_ROUNDS, value_parser = clap::value_parser!(u32).range(1..=20))]
+    pub breath_rounds: u32,
+
+    /// The rounds get longer once a session leaves less recovery than this
+    /// many seconds after its longest hold...
+    #[arg(long, env = "LYFE_BREATH_ADVANCE_UNDER_SECONDS", default_value_t = BreathRules::DEFAULT_ADVANCE_UNDER_SECONDS, value_parser = clap::value_parser!(u32).range(0..=600))]
+    pub breath_advance_under_seconds: u32,
+
+    /// ...by this many seconds.
+    #[arg(long, env = "LYFE_BREATH_STEP_SECONDS", default_value_t = BreathRules::DEFAULT_STEP_SECONDS, value_parser = clap::value_parser!(u32).range(1..=120))]
+    pub breath_step_seconds: u32,
 }
 
 impl ServeConfig {
+    pub fn breath_rules(&self) -> BreathRules {
+        BreathRules {
+            start_round_s: self.breath_start_round_seconds,
+            rounds: self.breath_rounds,
+            advance_under_s: self.breath_advance_under_seconds,
+            step_s: self.breath_step_seconds,
+        }
+    }
+
     pub fn gym_rules(&self) -> GymRules {
         GymRules {
             counted_types: parse_types(&self.gym_activity_types),

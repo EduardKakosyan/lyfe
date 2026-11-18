@@ -38,7 +38,8 @@ import Testing
         func launch(saved: String?) -> AppModel {
             AppModel(
                 tokens: MemoryTokenStore(), addresses: MemoryServerAddressStore(address: saved),
-                cache: HomeCache(directory: Fixture.temporaryDirectory()), transport: backend,
+                cache: HomeCache(directory: Fixture.temporaryDirectory()),
+                breath: BreathStore(directory: Fixture.temporaryDirectory()), transport: backend,
                 deviceName: "Test iPhone", defaultServerAddress: "built-in.example.ts.net:8444")
         }
 
@@ -255,7 +256,8 @@ import Testing
         backend.on("POST /v1/sync", .ok(Fixture.sources()))
         let model = AppModel(
             tokens: BrokenTokenStore(), addresses: MemoryServerAddressStore(),
-            cache: HomeCache(directory: Fixture.temporaryDirectory()), transport: backend,
+            cache: HomeCache(directory: Fixture.temporaryDirectory()),
+            breath: BreathStore(directory: Fixture.temporaryDirectory()), transport: backend,
             deviceName: "Test iPhone")
         model.serverAddress = "lyfe.example.ts.net"
         await model.signIn(password: "a long password")

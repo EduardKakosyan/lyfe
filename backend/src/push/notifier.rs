@@ -1,9 +1,11 @@
 //! Decides when the owner is prompted, and sends the prompt.
 //!
 //! A prompt goes out only when a streak is at stake and today is a day to
-//! act on it (see `routines::gym::prompt`), only inside the daytime
-//! window, and at most once for its period. Garmin is checked again just
-//! before sending, so a session recorded this morning is not nagged about.
+//! act on it (see `routines::weekly::prompt`), only inside the daytime
+//! window, and at most once for its period. Each weekly routine, the gym
+//! and breath training, is looked at on its own. Garmin is checked again
+//! just before a gym prompt, so a session recorded this morning is not
+//! nagged about.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,7 +16,9 @@ use sqlx::PgPool;
 use super::apns::{Alert, ApnsClient, Environment, PushError};
 use crate::db::{self, PushTarget};
 use crate::garmin::sync::Syncer;
-use crate::routines::gym::{self, GymRules, Prompt, Week};
+use crate::routines::breath;
+use crate::routines::gym::{self, GymRules};
+use crate::routines::weekly::{self, Prompt, Week, Wording};
 
 /// How fresh the Garmin data must be for a prompt to be trusted.
 const FRESH_ENOUGH: Duration = Duration::from_secs(120);
@@ -51,7 +55,8 @@ pub enum Outcome {
 }
 
 impl Notifier {
-    /// Looks at the clock once and sends at most one prompt.
+    /// Looks at the clock once and sends at most one prompt. When both
+    /// routines call for one, the second goes out on the next look.
     pub async fn tick(&self, now: DateTime<Utc>) -> sqlx::Result<Outcome> {
         let local = now.with_timezone(&self.timezone);
         if local.hour() < self.from_hour || local.hour() >= self.until_hour {
@@ -62,46 +67,68 @@ impl Notifier {
             return Ok(Outcome::NoDevices);
         }
         let today = local.date_naive();
-        let Some(due) = self.due(today).await? else {
-            return Ok(Outcome::NothingDue);
+        let (mut routine, mut prompt) = match self.next_unsent(today).await? {
+            Ok(due) => due,
+            Err(outcome) => return Ok(outcome),
         };
-        if db::notification_sent(&self.pool, due.kind(), due.period(today)).await? {
-            return Ok(Outcome::AlreadySent);
+        if routine.key == gym::WORDING.key {
+            // Look again with fresh data before interrupting anyone.
+            self.syncer.poll_if_stale(now, FRESH_ENOUGH).await;
+            (routine, prompt) = match self.next_unsent(today).await? {
+                Ok(due) => due,
+                Err(outcome) => return Ok(outcome),
+            };
         }
 
-        // Look again with fresh data before interrupting anyone.
-        self.syncer.poll_if_stale(now, FRESH_ENOUGH).await;
-        let Some(prompt) = self.due(today).await? else {
-            return Ok(Outcome::NothingDue);
-        };
-        let (kind, period) = (prompt.kind(), prompt.period(today));
-        if db::notification_sent(&self.pool, kind, period).await? {
-            return Ok(Outcome::AlreadySent);
-        }
-
+        let (kind, period) = (prompt.kind(&routine), prompt.period(today));
         let alert = Alert {
-            title: prompt.title(today),
-            body: prompt.body(),
-            collapse_id: kind.to_string(),
+            title: prompt.title(&routine, today),
+            body: prompt.body(&routine),
+            collapse_id: kind.clone(),
             expires_at: self.window_end(today, now),
         };
         let devices = self.deliver(&targets, &alert, now).await;
         if devices == 0 {
             return Ok(Outcome::Undelivered);
         }
-        db::record_notification(&self.pool, kind, period, &alert.title, &alert.body).await?;
+        db::record_notification(&self.pool, &kind, period, &alert.title, &alert.body).await?;
         Ok(Outcome::Sent { title: alert.title, body: alert.body, devices })
     }
 
-    /// The prompt today calls for, from what is stored now.
-    async fn due(&self, today: NaiveDate) -> sqlx::Result<Option<Prompt>> {
+    /// The first prompt today calls for that has not gone out yet, or why
+    /// there is none.
+    async fn next_unsent(&self, today: NaiveDate) -> sqlx::Result<Result<(Wording, Prompt), Outcome>> {
+        let due = self.due(today).await?;
+        if due.is_empty() {
+            return Ok(Err(Outcome::NothingDue));
+        }
+        for (routine, prompt) in due {
+            if !db::notification_sent(&self.pool, &prompt.kind(&routine), prompt.period(today)).await? {
+                return Ok(Ok((routine, prompt)));
+            }
+        }
+        Ok(Err(Outcome::AlreadySent))
+    }
+
+    /// The prompts today calls for, from what is stored now: at most one
+    /// per routine.
+    async fn due(&self, today: NaiveDate) -> sqlx::Result<Vec<(Wording, Prompt)>> {
+        let mut due = Vec::new();
+
         let week = Week::containing(today);
         let activities = db::activities_until(&self.pool, week.ends_on).await?;
         let streak = gym::streak(&self.gym_rules, today, &activities);
         let trained_today = gym::sessions_in_week(&self.gym_rules, week, &activities)
             .iter()
             .any(|session| session.date == today);
-        Ok(gym::prompt(&streak, trained_today))
+        due.extend(gym::prompt(&streak, trained_today).map(|prompt| (gym::WORDING, prompt)));
+
+        let sessions = db::breath_sessions(&self.pool, self.timezone).await?;
+        let streak = breath::streak(today, &sessions);
+        let done_today = breath::session_days(&sessions).contains(&today);
+        due.extend(weekly::prompt(&streak, done_today).map(|prompt| (breath::WORDING, prompt)));
+
+        Ok(due)
     }
 
     /// When today's window closes; a prompt not delivered by then is

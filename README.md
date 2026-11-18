@@ -2,14 +2,14 @@
 
 A private app that keeps three routines going: gym, breath training and food logging. What it is and why is in `CONTEXT.md`, `docs/adr/` and `docs/build-plan.md`.
 
-Built so far: steps 1 and 2 of the build plan. A strength session recorded on the watch shows up as a filled square on the Home screen, with nothing entered in lyfe. The gym band shows the streak in weeks, with recovery after a missed week, and the backend can prompt the phone when a streak needs sessions.
+Built so far: steps 1 to 3 of the build plan. A strength session recorded on the watch shows up as a filled square on the Home screen, with nothing entered in lyfe. The gym band shows the streak in weeks, with recovery after a missed week, and the backend can prompt the phone when a streak needs sessions. A breath session runs in the app, one tap per hold, and the backend sets the next table from it.
 
 ## Layout
 
 | Folder | What it is |
 |---|---|
-| `backend/` | The Rust backend: API, sign-in, Garmin poller, gym and streak rules, notifications. The single authority for what counts. |
-| `apps/LyfeKit/` | Swift package shared by the iPhone app and the later Mac app: API client, local storage, app model, Poster screens. |
+| `backend/` | The Rust backend: API, sign-in, Garmin poller, gym, breath and streak rules, notifications. The single authority for what counts. |
+| `apps/LyfeKit/` | Swift package shared by the iPhone app and the later Mac app: API client, local storage, app model, breath timer, Poster screens. |
 | `apps/Lyfe/` | The iPhone app target. It only launches LyfeKit. |
 | `deploy/spark/` | Scripts and service files for running the backend on the Spark. |
 
@@ -44,7 +44,7 @@ The types and the minimum are settings (`LYFE_GYM_ACTIVITY_TYPES`, `LYFE_GYM_MIN
 
 ## Streaks and recovery
 
-The rules are one module shared by every routine (`backend/src/routines/streak.rs`); the gym applies them to weeks (`gym.rs`).
+The rules are one module shared by every routine (`backend/src/routines/streak.rs`). The gym and breath training apply them to weeks (`weekly.rs`): four sessions keep a gym week, three keep a breath week.
 
 - A week with four sessions is kept, and the streak counts kept weeks in a row. The current week counts as soon as its fourth session is recorded.
 - One missed week does not end the streak. Keeping the very next week recovers it, and the missed week is then shown as recovered (striped). Nothing has to be made up, and a missed week never adds to the count.
@@ -57,14 +57,26 @@ To see every recorded week as the rules count it, on the Spark:
 set -a; . ~/.config/lyfe/lyfe.env; set +a; ~/bin/lyfe-server gym-weeks
 ```
 
+## Breath sessions
+
+The method is fixed rounds: every round has the same length and starts with a hold taken as far as it goes, and what is left of the round is the recovery. The phone runs the session and records each hold; the backend decides the rest (`backend/src/routines/breath.rs`).
+
+- **On the phone.** The Home screen's breath band opens the table lyfe set. After START there is a ten-second lead-in, then each round begins on time with a tone; tap anywhere to end the hold. The hold screen shifts from yellow to red as the hold nears the same round's hold last session, and flashes and turns blue once it passes it. A round with no tap records no hold. The last tap ends the session.
+- **Screen locked.** The screen stays on during a session. If the phone is locked anyway, the rounds and tones carry on, because every tone is lined up against the clock when the session starts; ending a hold still needs the screen.
+- **Offline.** A session needs no connection: it runs on the last table the backend sent, is written to the phone after every tap, and is sent when the backend can next be reached. Each session carries an id made on the phone, so sending it twice counts it once.
+- **What counts.** A session counts toward the week once at least half its rounds have a hold, so one cut short still counts and a timer started by accident does not. A day counts once. How long the holds were never affects the streak.
+- **The next table.** The round length follows the last session that counts: the same again while the longest hold left at least 0:45 of the round, 0:15 longer once it left less. It never gets shorter.
+
+The first table and the two thresholds are settings (`LYFE_BREATH_START_ROUND_SECONDS`, `LYFE_BREATH_ROUNDS`, `LYFE_BREATH_ADVANCE_UNDER_SECONDS`, `LYFE_BREATH_STEP_SECONDS`); the defaults are six rounds of 4:00.
+
 ## Notifications
 
-The backend decides when to prompt; the phone only shows what arrives. A prompt is sent only when a streak is alive and today is a day to act on it:
+The backend decides when to prompt; the phone only shows what arrives. Each weekly routine, the gym and breath training, is looked at on its own. A prompt is sent only when a streak is alive and today is a day to act on it:
 
 - **Train today**: every day left this week is needed to reach four, and today has no session yet. Sent once that day.
 - **Recovery open**: last week was missed and this week recovers it. Sent once that week.
 
-Nothing is sent when there is slack left in the week, when the week is already out of reach, when no streak is alive, or outside 07:00 to 18:00 (`LYFE_NOTIFY_FROM_HOUR`, `LYFE_NOTIFY_UNTIL_HOUR`). Garmin is checked again just before sending, so a session recorded that morning cancels the prompt.
+Nothing is sent when there is slack left in the week, when the week is already out of reach, when no streak is alive, or outside 07:00 to 18:00 (`LYFE_NOTIFY_FROM_HOUR`, `LYFE_NOTIFY_UNTIL_HOUR`). Garmin is checked again just before a gym prompt, so a session recorded that morning cancels it. A breath session still waiting on the phone to be sent is not known to the backend, so it can be prompted for.
 
 Sending needs a key from the Apple developer account, set up once:
 
@@ -124,9 +136,9 @@ xcrun devicectl device process launch --console --terminate-existing \
 
 It prints what the system and Tailscale each answer for the server's name and whether the backend replied, then quits.
 
-A debug build launched with `LYFE_DEBUG_GALLERY` set shows the gym band in every streak state with made-up numbers (`LYFE_DEBUG_GALLERY=3` skips the first three).
+A debug build launched with `LYFE_DEBUG_GALLERY` set shows the gym and breath bands in every streak state with made-up numbers (`LYFE_DEBUG_GALLERY=3` skips the first three). `LYFE_DEBUG_BREATH` set to `ready`, `leadin`, `hold`, `beaten`, `recover`, `done` or `offline` shows that breath screen. `LYFE_DEBUG_BREATH_RUN=12` runs the next session by itself with 12-second holds; it plays the tones and records the session, so use it against a local backend with the sound down.
 
-The tests that need a real server are skipped unless told where one is: `LYFE_LIVE_SERVER=<name>:8444@<tailnet address> swift test`.
+The tests that need a real server are skipped unless told where one is: `LYFE_LIVE_SERVER=<name>:8444@<tailnet address> swift test`. `LYFE_LOCAL_SERVER=http://127.0.0.1:8787 LYFE_LOCAL_PASSWORD=<password> swift test` runs the app's client against a backend on this machine; it records a breath session, so give that backend a scratch database.
 
 ## Running on the Spark
 

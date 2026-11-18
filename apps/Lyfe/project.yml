@@ -27,6 +27,10 @@ targets:
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
+        # The breath timer's tones keep playing, and its rounds keep
+        # running, with the screen locked.
+        UIBackgroundModes:
+          - audio
         # The backend is reached over HTTPS on the tailnet. This only lets
         # a development build talk to a backend on the same machine.
         NSAppTransportSecurity:

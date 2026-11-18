@@ -161,6 +161,7 @@ async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         throttle: Arc::new(SignInThrottle::new()),
         timezone: config.timezone,
         gym_rules: Arc::new(config.gym_rules()),
+        breath_rules: Arc::new(config.breath_rules()),
         push_ready,
         now: Arc::new(Utc::now),
     };
@@ -273,7 +274,11 @@ async fn gym_weeks(config: ServeConfig) -> anyhow::Result<()> {
         .iter()
         .any(|s| s.date == today);
     match gym::prompt(&streak, trained_today) {
-        Some(prompt) => println!("Prompt due today: \"{}\" / \"{}\"", prompt.title(today), prompt.body()),
+        Some(prompt) => println!(
+            "Prompt due today: \"{}\" / \"{}\"",
+            prompt.title(&gym::WORDING, today),
+            prompt.body(&gym::WORDING)
+        ),
         None => println!("No prompt is due today."),
     }
     Ok(())

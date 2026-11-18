@@ -5,13 +5,18 @@
 //! many activities were recorded on it, so a warm-up saved separately from
 //! the main session does not fill two squares.
 
-use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime};
+use chrono::{NaiveDate, NaiveDateTime};
 use serde::Serialize;
 
-use super::streak::{self, Current, Mark, State};
+use super::weekly::{self, Wording};
+pub use super::weekly::{PastWeek, Prompt, Week, WeekStreak as GymStreak, RECENT_WEEKS};
 
 /// Sessions needed for a week to count toward the gym streak.
 pub const WEEKLY_TARGET: u32 = 4;
+
+/// How the gym is named in a prompt.
+pub const WORDING: Wording =
+    Wording { key: "gym", name: "Gym", do_today: "Train today", target: WEEKLY_TARGET };
 
 #[derive(Debug, Clone)]
 pub struct GymRules {
@@ -41,37 +46,6 @@ pub struct Activity {
     pub name: Option<String>,
     pub start_local: NaiveDateTime,
     pub duration_s: f64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct Week {
-    pub iso_year: i32,
-    pub iso_week: u32,
-    /// Monday.
-    pub starts_on: NaiveDate,
-    /// Sunday.
-    pub ends_on: NaiveDate,
-}
-
-impl Week {
-    pub fn containing(date: NaiveDate) -> Week {
-        let iso = date.iso_week();
-        let starts_on = date - Duration::days(date.weekday().num_days_from_monday() as i64);
-        Week {
-            iso_year: iso.year(),
-            iso_week: iso.week(),
-            starts_on,
-            ends_on: starts_on + Duration::days(6),
-        }
-    }
-
-    pub fn contains(&self, date: NaiveDate) -> bool {
-        date >= self.starts_on && date <= self.ends_on
-    }
-
-    pub fn next(&self) -> Week {
-        Week::containing(self.starts_on + Duration::days(7))
-    }
 }
 
 /// A day on which a gym session happened.
@@ -118,197 +92,38 @@ pub fn sessions_in_week(rules: &GymRules, week: Week, activities: &[Activity]) -
         .collect()
 }
 
-/// How many finished weeks the Home screen is given.
-pub const RECENT_WEEKS: usize = 12;
-
-/// A finished week and how it turned out.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct PastWeek {
-    pub iso_year: i32,
-    pub iso_week: u32,
-    pub starts_on: NaiveDate,
-    /// Days that week with a session.
-    pub done: u32,
-    pub mark: Mark,
-}
-
-/// The gym streak as of today.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct GymStreak {
-    /// Weeks in a row with the target met, counting this week once it is.
-    pub weeks: u32,
-    pub state: State,
-    /// The longest streak that has ended. Zero when none has.
-    pub previous_best: u32,
-    /// Sessions this week still needs.
-    pub remaining: u32,
-    /// Days from today to Sunday that have no session yet. A day counts
-    /// once, so this is the most sessions the week can still gain.
-    pub open_days: u32,
-    /// False once the week can no longer reach the target.
-    pub reachable: bool,
-    /// The most recent finished weeks, oldest first.
-    pub recent: Vec<PastWeek>,
-}
-
-/// Every week from the first one that met the target up to today's, with
-/// the days that had a session in each. Weeks before the first kept week
-/// say nothing about a streak and are left out.
-pub fn weeks_until(rules: &GymRules, today: NaiveDate, activities: &[Activity]) -> Vec<(Week, u32)> {
-    let all = all_weeks_until(rules, today, activities);
-    let first_kept = all
+/// The days with a gym session, in no particular order.
+pub fn session_days(rules: &GymRules, activities: &[Activity]) -> Vec<NaiveDate> {
+    activities
         .iter()
-        .position(|(_, done)| *done >= WEEKLY_TARGET)
-        .unwrap_or(all.len() - 1);
-    all[first_kept..].to_vec()
+        .filter(|a| rules.counts(a))
+        .map(|a| a.start_local.date())
+        .collect()
 }
 
 /// Every week from the first recorded session up to today's, with the days
 /// that had a session in each.
 pub fn all_weeks_until(rules: &GymRules, today: NaiveDate, activities: &[Activity]) -> Vec<(Week, u32)> {
-    let this_week = Week::containing(today);
-    let Some(earliest) = activities
-        .iter()
-        .filter(|a| rules.counts(a))
-        .map(|a| a.start_local.date())
-        .min()
-    else {
-        return vec![(this_week, 0)];
-    };
-    let mut weeks = Vec::new();
-    let mut week = Week::containing(earliest.min(today));
-    loop {
-        weeks.push((week, sessions_in_week(rules, week, activities).len() as u32));
-        if week == this_week {
-            return weeks;
-        }
-        week = week.next();
-    }
+    weekly::all_weeks_until(today, &session_days(rules, activities))
 }
 
 /// The streak rules applied to the recorded activities.
 pub fn streak(rules: &GymRules, today: NaiveDate, activities: &[Activity]) -> GymStreak {
-    let this_week = Week::containing(today);
-    let weeks = weeks_until(rules, today, activities);
-    let (finished, current) = weeks.split_at(weeks.len() - 1);
-    let done = current[0].1;
-
-    let kept: Vec<bool> = finished.iter().map(|(_, done)| *done >= WEEKLY_TARGET).collect();
-    let now = if done >= WEEKLY_TARGET { Current::Kept } else { Current::Open };
-    let standing = streak::standing(&kept, now);
-
-    let session_days: Vec<NaiveDate> = sessions_in_week(rules, this_week, activities)
-        .iter()
-        .map(|s| s.date)
-        .collect();
-    let open_days = today
-        .iter_days()
-        .take_while(|day| *day <= this_week.ends_on)
-        .filter(|day| !session_days.contains(day))
-        .count() as u32;
-    let remaining = WEEKLY_TARGET.saturating_sub(done);
-
-    let skip = finished.len().saturating_sub(RECENT_WEEKS);
-    let recent = finished
-        .iter()
-        .zip(&standing.marks)
-        .skip(skip)
-        .map(|((week, done), mark)| PastWeek {
-            iso_year: week.iso_year,
-            iso_week: week.iso_week,
-            starts_on: week.starts_on,
-            done: *done,
-            mark: *mark,
-        })
-        .collect();
-
-    GymStreak {
-        weeks: standing.length,
-        state: standing.state,
-        previous_best: standing.previous_best,
-        remaining,
-        open_days,
-        reachable: remaining <= open_days,
-        recent,
-    }
-}
-
-/// Something worth interrupting the owner for. Prompts exist only when a
-/// streak is at stake and today is a day to act on it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Prompt {
-    /// Every day left this week is needed, starting today.
-    TrainToday { remaining: u32, weeks: u32, recovering: bool },
-    /// Last week was missed and this week recovers it.
-    RecoveryOpen { weeks: u32 },
-}
-
-impl Prompt {
-    /// Names the prompt in the record of what was sent.
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Prompt::TrainToday { .. } => "gym_train_today",
-            Prompt::RecoveryOpen { .. } => "gym_recovery_open",
-        }
-    }
-
-    /// The period a prompt is sent at most once in: the day for "train
-    /// today", the week (its Monday) for "recovery open".
-    pub fn period(&self, today: NaiveDate) -> NaiveDate {
-        match self {
-            Prompt::TrainToday { .. } => today,
-            Prompt::RecoveryOpen { .. } => Week::containing(today).starts_on,
-        }
-    }
-
-    pub fn title(&self, today: NaiveDate) -> String {
-        match self {
-            Prompt::TrainToday { remaining: 1, .. } if today.weekday() == chrono::Weekday::Sun => {
-                "Gym: 1 more today".to_string()
-            }
-            Prompt::TrainToday { remaining, .. } => format!("Gym: {remaining} more by Sunday"),
-            Prompt::RecoveryOpen { .. } => "Gym: last week was missed".to_string(),
-        }
-    }
-
-    pub fn body(&self) -> String {
-        let streak = |weeks: u32| format!("{weeks}-week streak");
-        match self {
-            Prompt::TrainToday { remaining, weeks, recovering } => {
-                let verb = if *recovering { "recover" } else { "keep" };
-                let every_day = if *remaining > 1 { " It takes every day left this week." } else { "" };
-                format!("Train today to {verb} your {}.{every_day}", streak(*weeks))
-            }
-            Prompt::RecoveryOpen { weeks } => format!(
-                "{WEEKLY_TARGET} sessions by Sunday recovers your {}. Nothing to make up.",
-                streak(*weeks)
-            ),
-        }
-    }
+    weekly::streak(WEEKLY_TARGET, today, &session_days(rules, activities))
 }
 
 /// The prompt today calls for, if any. `trained_today` is whether today
 /// already has a session.
 pub fn prompt(streak: &GymStreak, trained_today: bool) -> Option<Prompt> {
-    let recovering = match streak.state {
-        State::OnTrack => false,
-        State::Recovering => true,
-        // Nothing at stake, or nothing left to do.
-        State::NotStarted | State::Kept => return None,
-    };
-    if !streak.reachable {
-        // Out of reach this week: there is nothing to do about it today.
-        return None;
-    }
-    if !trained_today && streak.remaining == streak.open_days {
-        return Some(Prompt::TrainToday { remaining: streak.remaining, weeks: streak.weeks, recovering });
-    }
-    recovering.then_some(Prompt::RecoveryOpen { weeks: streak.weeks })
+    weekly::prompt(streak, trained_today)
 }
 
 #[cfg(test)]
 mod tests {
+    use chrono::{Datelike, Duration};
+
     use super::*;
+    use crate::routines::streak::{Mark, State};
 
     fn rules() -> GymRules {
         GymRules {
@@ -329,28 +144,6 @@ mod tests {
 
     fn date(s: &str) -> NaiveDate {
         s.parse().unwrap()
-    }
-
-    #[test]
-    fn week_runs_monday_to_sunday() {
-        // Tuesday 17 November 2026 is in ISO week 47.
-        let week = Week::containing(date("2026-11-17"));
-        assert_eq!(week.iso_week, 47);
-        assert_eq!(week.iso_year, 2026);
-        assert_eq!(week.starts_on, date("2026-11-16"));
-        assert_eq!(week.ends_on, date("2026-11-22"));
-        assert_eq!(Week::containing(date("2026-11-16")), week);
-        assert_eq!(Week::containing(date("2026-11-22")), week);
-        assert_ne!(Week::containing(date("2026-11-23")), week);
-    }
-
-    #[test]
-    fn week_at_year_boundary_uses_iso_year() {
-        // Friday 1 January 2027 belongs to ISO week 53 of 2026.
-        let week = Week::containing(date("2027-01-01"));
-        assert_eq!((week.iso_year, week.iso_week), (2026, 53));
-        assert_eq!(week.starts_on, date("2026-12-28"));
-        assert_eq!(week.ends_on, date("2027-01-03"));
     }
 
     #[test]
@@ -525,85 +318,5 @@ mod tests {
         // Thursday 22 October, trained this morning: Fri, Sat, Sun remain.
         let s = streak(&rules(), date("2026-10-22"), &activities);
         assert_eq!((s.remaining, s.open_days, s.reachable), (3, 3, true));
-    }
-
-    fn standing(state: State, weeks: u32, remaining: u32, open_days: u32) -> GymStreak {
-        GymStreak {
-            weeks,
-            state,
-            previous_best: 0,
-            remaining,
-            open_days,
-            reachable: remaining <= open_days,
-            recent: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn no_prompt_while_there_is_slack_in_the_week() {
-        assert_eq!(prompt(&standing(State::OnTrack, 6, 3, 5), false), None);
-        assert_eq!(prompt(&standing(State::OnTrack, 6, 1, 2), false), None);
-    }
-
-    #[test]
-    fn a_prompt_when_every_day_left_is_needed() {
-        assert_eq!(
-            prompt(&standing(State::OnTrack, 6, 2, 2), false),
-            Some(Prompt::TrainToday { remaining: 2, weeks: 6, recovering: false })
-        );
-        assert_eq!(
-            prompt(&standing(State::Recovering, 6, 1, 1), false),
-            Some(Prompt::TrainToday { remaining: 1, weeks: 6, recovering: true })
-        );
-    }
-
-    #[test]
-    fn no_prompt_once_today_is_done_or_the_week_is() {
-        // Trained today; the remaining days are all needed, but not today.
-        assert_eq!(prompt(&standing(State::OnTrack, 6, 2, 2), true), None);
-        assert_eq!(prompt(&standing(State::Kept, 7, 0, 3), false), None);
-    }
-
-    #[test]
-    fn no_prompt_without_a_streak_or_when_the_week_is_out_of_reach() {
-        assert_eq!(prompt(&standing(State::NotStarted, 0, 2, 2), false), None);
-        assert_eq!(prompt(&standing(State::OnTrack, 6, 3, 2), false), None);
-        assert_eq!(prompt(&standing(State::Recovering, 6, 3, 2), false), None);
-    }
-
-    #[test]
-    fn a_missed_week_prompts_recovery_until_the_tight_day_takes_over() {
-        assert_eq!(
-            prompt(&standing(State::Recovering, 6, 4, 7), false),
-            Some(Prompt::RecoveryOpen { weeks: 6 })
-        );
-        assert_eq!(
-            prompt(&standing(State::Recovering, 6, 4, 4), false),
-            Some(Prompt::TrainToday { remaining: 4, weeks: 6, recovering: true })
-        );
-    }
-
-    #[test]
-    fn prompts_are_worded_for_the_day_and_the_state() {
-        let friday = date("2026-11-20");
-        let sunday = date("2026-11-22");
-        let keep = Prompt::TrainToday { remaining: 3, weeks: 6, recovering: false };
-        assert_eq!(keep.title(friday), "Gym: 3 more by Sunday");
-        assert_eq!(keep.body(), "Train today to keep your 6-week streak. It takes every day left this week.");
-        let last = Prompt::TrainToday { remaining: 1, weeks: 1, recovering: true };
-        assert_eq!(last.title(sunday), "Gym: 1 more today");
-        assert_eq!(last.body(), "Train today to recover your 1-week streak.");
-        let open = Prompt::RecoveryOpen { weeks: 6 };
-        assert_eq!(open.title(friday), "Gym: last week was missed");
-        assert_eq!(open.body(), "4 sessions by Sunday recovers your 6-week streak. Nothing to make up.");
-    }
-
-    #[test]
-    fn a_prompt_is_sent_once_per_day_or_once_per_week() {
-        let friday = date("2026-11-20");
-        let keep = Prompt::TrainToday { remaining: 3, weeks: 6, recovering: false };
-        assert_eq!((keep.kind(), keep.period(friday)), ("gym_train_today", friday));
-        let open = Prompt::RecoveryOpen { weeks: 6 };
-        assert_eq!((open.kind(), open.period(friday)), ("gym_recovery_open", date("2026-11-16")));
     }
 }

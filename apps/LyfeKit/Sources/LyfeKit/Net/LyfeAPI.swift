@@ -83,6 +83,13 @@ public struct LyfeAPI: Sendable {
         try await call("GET", "v1/home", token: token, body: nil, timeout: 15)
     }
 
+    /// Hands the backend a finished breath session. It answers with Home as
+    /// it now stands. Sending the same session again changes nothing.
+    public func recordBreathSession(token: String, run: BreathRun) async throws -> HomeSnapshot {
+        let body = try JSONEncoder.lyfe.encode(BreathSessionUpload(run))
+        return try await call("POST", "v1/breath/sessions", token: token, body: body, timeout: 20)
+    }
+
     /// Asks the backend to check Garmin now. Can take as long as Garmin does.
     public func sync(token: String) async throws -> Sources {
         try await call("POST", "v1/sync", token: token, body: nil, timeout: 45)

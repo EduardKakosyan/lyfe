@@ -12,6 +12,8 @@ public enum Poster {
     public static let redShade = Color(red: 0xdb / 255, green: 0x36 / 255, blue: 0x0c / 255)
     /// Breath and pool.
     public static let blue = Color(red: 0x28 / 255, green: 0x48 / 255, blue: 0xff / 255)
+    /// The darker stripe on the breath band while its streak is in recovery.
+    public static let blueShade = Color(red: 0x1d / 255, green: 0x38 / 255, blue: 0xd9 / 255)
     /// Food.
     public static let yellow = Color(red: 0xff / 255, green: 0xd2 / 255, blue: 0x1f / 255)
 
