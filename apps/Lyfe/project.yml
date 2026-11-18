@@ -1,0 +1,44 @@
+# The Xcode project is generated from this file: run `xcodegen` in this
+# folder, then open Lyfe.xcodeproj. The generated project is not committed.
+name: Lyfe
+options:
+  deploymentTarget:
+    iOS: "18.0"
+  createIntermediateGroups: true
+packages:
+  LyfeKit:
+    path: ../LyfeKit
+targets:
+  Lyfe:
+    type: application
+    platform: iOS
+    sources:
+      - Sources
+    dependencies:
+      - package: LyfeKit
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: lyfe
+        # Prefills the sign-in screen; set LYFE_DEFAULT_SERVER in Local.xcconfig.
+        LyfeDefaultServer: $(LYFE_DEFAULT_SERVER)
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        # The backend is reached over HTTPS on the tailnet. This only lets
+        # a development build talk to a backend on the same machine.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+    configFiles:
+      Debug: Config.xcconfig
+      Release: Config.xcconfig
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.eduardkakosyan.lyfe
+        MARKETING_VERSION: 0.1.0
+        CURRENT_PROJECT_VERSION: 1
+        SWIFT_VERSION: "6.0"
+        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGN_STYLE: Automatic

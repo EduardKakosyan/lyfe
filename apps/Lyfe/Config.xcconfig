@@ -1,0 +1,13 @@
+// Build settings shared by every machine. Per-machine values go in
+// Local.xcconfig next to this file, which is not committed:
+//
+//   LYFE_DEFAULT_SERVER = your-spark.your-tailnet.ts.net:8444
+//   DEVELOPMENT_TEAM = ABCDE12345
+//
+// LYFE_DEFAULT_SERVER prefills the server on the sign-in screen (leave off
+// the https:// prefix: two slashes start a comment in this file).
+// DEVELOPMENT_TEAM signs the app so it can be installed on your phone.
+
+LYFE_DEFAULT_SERVER =
+
+#include? "Local.xcconfig"
