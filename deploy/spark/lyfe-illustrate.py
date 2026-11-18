@@ -102,7 +102,7 @@ def main():
         diffusers_logging.disable_progress_bar()
         if not torch.cuda.is_available():
             raise RuntimeError("no GPU is available to this account")
-        pipe = Flux2KleinPipeline.from_pretrained(MODEL, revision=REVISION, torch_dtype=torch.bfloat16).to("cuda")
+        pipe = Flux2KleinPipeline.from_pretrained(MODEL, revision=REVISION, dtype=torch.bfloat16).to("cuda")
         pipe.set_progress_bar_config(disable=True)
     except Exception as error:  # Said in the answer; lyfe tries again later.
         say({"ready": False, "error": f"{type(error).__name__}: {error}"[:300]})
