@@ -1,6 +1,6 @@
 # lyfe first version: build plan
 
-Status: written 2026-11-17. Step 1 is built and tested but not yet installed on the Spark (that needs one run of `deploy/spark/bootstrap.sh` with administrator rights); steps 2 to 9 are not started. It turns the decisions in `discovery.md` and ADRs 0001 to 0005 into an order of work.
+Status: written 2026-11-17, updated 2026-11-18. Steps 1 and 2 are built and running on the Spark and the phone, with notifications switched on (the Apple push key is on the Spark; see the README). Steps 3 to 9 are not started. It turns the decisions in `discovery.md` and ADRs 0001 to 0005 into an order of work.
 
 ## What the first version is
 

@@ -31,6 +31,13 @@ final class StubBackend: HTTPTransport, @unchecked Sendable {
         lock.withLock { log.map { "\($0.httpMethod ?? "GET") \($0.url!.path)" } }
     }
 
+    /// The bodies sent to a route, oldest first.
+    func bodies(_ route: String) -> [Data] {
+        lock.withLock {
+            log.filter { "\($0.httpMethod ?? "GET") \($0.url!.path)" == route }.compactMap(\.httpBody)
+        }
+    }
+
     func lastRequest(_ route: String) -> URLRequest? {
         lock.withLock { log.last { "\($0.httpMethod ?? "GET") \($0.url!.path)" == route } }
     }
@@ -63,8 +70,41 @@ enum Fixture {
             """
     }
 
-    /// A Home answer in exactly the shape the backend sends.
-    static func home(done: Int = 1, sources: String = Fixture.sources()) -> String {
+    /// A streak in exactly the shape the backend sends. `recent` is one
+    /// letter per finished week, ending with week 46: K kept, R recovered,
+    /// A awaiting recovery, M missed.
+    static func streak(
+        weeks: Int = 6, state: String = "on_track", previousBest: Int = 0, remaining: Int = 3, openDays: Int = 6,
+        recent: String = "KKKKKK"
+    ) -> String {
+        let marks: [Character: String] = ["K": "kept", "R": "recovered", "A": "awaiting_recovery", "M": "missed"]
+        // Mondays of ISO weeks 35 to 46 of 2026.
+        let mondays = [
+            "2026-08-24", "2026-08-31", "2026-09-07", "2026-09-14", "2026-09-21", "2026-09-28",
+            "2026-10-05", "2026-10-12", "2026-10-19", "2026-10-26", "2026-11-02", "2026-11-09",
+        ]
+        let first = mondays.count - recent.count
+        let weeksJSON = recent.enumerated().map { index, letter in
+            let mark = marks[letter]!
+            let done = mark == "kept" ? 4 : 2
+            return """
+                {"iso_year": 2026, "iso_week": \(35 + first + index), "starts_on": "\(mondays[first + index])", "done": \(done), "mark": "\(mark)"}
+                """
+        }
+        return """
+            {"weeks": \(weeks), "state": "\(state)", "previous_best": \(previousBest), "remaining": \(remaining),
+             "open_days": \(openDays), "reachable": \(remaining <= openDays), "recent": [\(weeksJSON.joined(separator: ","))]}
+            """
+    }
+
+    /// A Home answer in exactly the shape the backend sends. Without
+    /// `streak` it is the answer from before streaks existed.
+    static func home(
+        done: Int = 1, sources: String = Fixture.sources(), streak: String? = nil, today: String = "2026-11-17",
+        serverReady: Bool? = nil
+    ) -> String {
+        let streakJSON = streak.map { ", \"streak\": \($0)" } ?? ""
+        let notifications = serverReady.map { ", \"notifications\": {\"server_ready\": \($0)}" } ?? ""
         let all = [
             """
             {"date": "2026-11-16", "activity_id": 501, "activity_type": "strength_training", "name": "Strength", "duration_min": 58}
@@ -76,17 +116,18 @@ enum Fixture {
         return """
             {
               "generated_at": "2026-11-17T15:00:00Z",
-              "today": "2026-11-17",
+              "today": "\(today)",
               "week": {"iso_year": 2026, "iso_week": 47, "starts_on": "2026-11-16", "ends_on": "2026-11-22"},
-              "gym": {"target": 4, "done": \(done), "remaining": \(4 - done), "days_left": 6,
-                      "sessions": [\(all.prefix(done).joined(separator: ","))]},
-              "sources": \(sources)
+              "gym": {"target": 4, "done": \(done), "remaining": \(max(0, 4 - done)), "days_left": 6,
+                      "sessions": [\(all.prefix(done).joined(separator: ","))]\(streakJSON)},
+              "sources": \(sources)\(notifications)
             }
             """
     }
 
-    static func snapshot(done: Int = 1) -> HomeSnapshot {
-        try! JSONDecoder.lyfe.decode(HomeSnapshot.self, from: Data(home(done: done).utf8))
+    static func snapshot(done: Int = 1, streak: String? = nil, today: String = "2026-11-17") -> HomeSnapshot {
+        try! JSONDecoder.lyfe.decode(
+            HomeSnapshot.self, from: Data(home(done: done, streak: streak, today: today).utf8))
     }
 
     static func temporaryDirectory() -> URL {

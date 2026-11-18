@@ -4,6 +4,8 @@ import UIKit
 
 @main
 struct LyfeApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var delegate
+    @Environment(\.scenePhase) private var scenePhase
     @State private var model = AppModel.live(
         deviceName: UIDevice.current.name,
         // Set per machine in Local.xcconfig, so the address is not in the
@@ -13,7 +15,17 @@ struct LyfeApp: App {
 
     var body: some Scene {
         WindowGroup {
-            RootView(model: model)
+            content
+                // Once signed in, and again whenever the app comes forward,
+                // since notifications can be switched off in Settings.
+                .task(id: "\(model.phase) \(scenePhase == .active)") {
+                    delegate.onDeviceToken = { token in
+                        Task { await model.setPushToken(token) }
+                    }
+                    if model.phase == .signedIn, scenePhase == .active {
+                        await enableNotifications(for: model)
+                    }
+                }
                 #if DEBUG
                     .task {
                         await reportConnectionFromEnvironment()
@@ -21,6 +33,18 @@ struct LyfeApp: App {
                     }
                 #endif
         }
+    }
+
+    @ViewBuilder private var content: some View {
+        #if DEBUG
+            if let gallery = ProcessInfo.processInfo.environment["LYFE_DEBUG_GALLERY"] {
+                StreakGallery(skipping: Int(gallery) ?? 0)
+            } else {
+                RootView(model: model)
+            }
+        #else
+            RootView(model: model)
+        #endif
     }
 
     #if DEBUG

@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use clap::Args;
 
+use crate::push::apns::Environment;
 use crate::routines::gym::GymRules;
 
 #[derive(Debug, Clone, Args)]
@@ -39,12 +40,54 @@ pub struct GarminConfig {
 }
 
 #[derive(Debug, Clone, Args)]
+pub struct PushConfig {
+    /// The key Apple issued for sending notifications (a `.p8` file from
+    /// the developer account). Without it the server runs and sends none.
+    #[arg(long, env = "LYFE_APNS_KEY_FILE")]
+    pub apns_key_file: Option<PathBuf>,
+
+    /// The key's ID. Read from the file name when it is still called
+    /// `AuthKey_<id>.p8`, as Apple names it.
+    #[arg(long, env = "LYFE_APNS_KEY_ID")]
+    pub apns_key_id: Option<String>,
+
+    /// The developer team the key belongs to.
+    #[arg(long, env = "LYFE_APNS_TEAM_ID")]
+    pub apns_team_id: Option<String>,
+
+    /// The app's bundle identifier.
+    #[arg(long, env = "LYFE_APNS_TOPIC", default_value = "com.eduardkakosyan.lyfe")]
+    pub apns_topic: String,
+
+    /// Which Apple service to try first for a new device: `development`
+    /// for an app installed from Xcode, `production` for TestFlight or the
+    /// App Store. The other is tried when the first does not know the device.
+    #[arg(long, env = "LYFE_APNS_ENVIRONMENT", default_value = "development", value_parser = parse_environment)]
+    pub apns_environment: Environment,
+
+    /// Prompts are sent from this hour of the owner's day (0 to 23)...
+    #[arg(long, env = "LYFE_NOTIFY_FROM_HOUR", default_value_t = 7, value_parser = clap::value_parser!(u32).range(0..24))]
+    pub notify_from_hour: u32,
+
+    /// ...until this hour (1 to 24), and never outside it.
+    #[arg(long, env = "LYFE_NOTIFY_UNTIL_HOUR", default_value_t = 18, value_parser = clap::value_parser!(u32).range(1..25))]
+    pub notify_until_hour: u32,
+}
+
+fn parse_environment(text: &str) -> Result<Environment, String> {
+    Environment::parse(text).ok_or_else(|| "use development or production".to_string())
+}
+
+#[derive(Debug, Clone, Args)]
 pub struct ServeConfig {
     #[command(flatten)]
     pub database: DatabaseConfig,
 
     #[command(flatten)]
     pub garmin: GarminConfig,
+
+    #[command(flatten)]
+    pub push: PushConfig,
 
     /// Address to listen on. Keep it on loopback and publish it to the
     /// tailnet with `tailscale serve`.

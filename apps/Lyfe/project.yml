@@ -31,6 +31,12 @@ targets:
         # a development build talk to a backend on the same machine.
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
+    # Lets Apple deliver notifications to this app. Builds signed for
+    # development use Apple's development service whatever this says.
+    entitlements:
+      path: Lyfe.entitlements
+      properties:
+        aps-environment: development
     configFiles:
       Debug: Config.xcconfig
       Release: Config.xcconfig

@@ -18,7 +18,7 @@ use sqlx::PgPool;
 use crate::auth::{self, SignInThrottle};
 use crate::db;
 use crate::garmin::sync::{Syncer, SOURCE as GARMIN};
-use crate::routines::gym::{self, GymRules, GymSession, Week};
+use crate::routines::gym::{self, GymRules, GymSession, GymStreak, Week};
 
 /// How recent a Garmin poll must be for an app refresh to skip polling again.
 const REFRESH_MIN_AGE: Duration = Duration::from_secs(30);
@@ -32,6 +32,8 @@ pub struct AppState {
     pub throttle: Arc<SignInThrottle>,
     pub timezone: chrono_tz::Tz,
     pub gym_rules: Arc<GymRules>,
+    /// Whether this server can send notifications (it has Apple's key).
+    pub push_ready: bool,
     pub now: Clock,
 }
 
@@ -41,6 +43,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/auth/sign-in", post(sign_in))
         .route("/v1/auth/sign-out", post(sign_out))
         .route("/v1/sync", post(sync_now))
+        .route("/v1/push-token", post(set_push_token))
         .route("/v1/home", get(home))
         .with_state(state)
 }
@@ -164,6 +167,28 @@ async fn sign_out(State(state): State<AppState>, device: Device) -> Result<Statu
     Ok(StatusCode::NO_CONTENT)
 }
 
+// --- Notifications -------------------------------------------------------
+
+#[derive(Deserialize)]
+struct PushTokenRequest {
+    /// The device token Apple gave the app, in hexadecimal.
+    apns_token: String,
+}
+
+/// Records where Apple delivers notifications for the calling device.
+async fn set_push_token(
+    State(state): State<AppState>,
+    device: Device,
+    Json(request): Json<PushTokenRequest>,
+) -> Result<StatusCode, ApiError> {
+    let token = request.apns_token.trim().to_ascii_lowercase();
+    if !(32..=400).contains(&token.len()) || !token.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(ApiError::BadRequest("apns_token must be the device token in hexadecimal"));
+    }
+    db::set_push_token(&state.pool, device.session_id, &token).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // --- Home ----------------------------------------------------------------
 
 /// Timestamps go out as whole seconds in UTC ("2026-11-17T15:00:00Z"),
@@ -192,6 +217,13 @@ struct HomeResponse {
     week: Week,
     gym: GymWeek,
     sources: Sources,
+    notifications: Notifications,
+}
+
+#[derive(Serialize)]
+struct Notifications {
+    /// False when the server has no Apple key and so cannot send any.
+    server_ready: bool,
 }
 
 #[derive(Serialize)]
@@ -205,6 +237,7 @@ struct GymWeek {
     /// Days left in the week, today included.
     days_left: u32,
     sessions: Vec<GymSession>,
+    streak: GymStreak,
 }
 
 #[derive(Serialize)]
@@ -255,8 +288,9 @@ async fn home(State(state): State<AppState>, _device: Device) -> Result<Json<Hom
     let now = (state.now)();
     let today = now.with_timezone(&state.timezone).date_naive();
     let week = Week::containing(today);
-    let activities = db::activities_between(&state.pool, week.starts_on, week.ends_on).await?;
+    let activities = db::activities_until(&state.pool, week.ends_on).await?;
     let sessions = gym::sessions_in_week(&state.gym_rules, week, &activities);
+    let streak = gym::streak(&state.gym_rules, today, &activities);
     let done = sessions.len() as u32;
     Ok(Json(HomeResponse {
         generated_at: now,
@@ -268,8 +302,10 @@ async fn home(State(state): State<AppState>, _device: Device) -> Result<Json<Hom
             remaining: gym::WEEKLY_TARGET.saturating_sub(done),
             days_left: 7 - today.weekday().num_days_from_monday(),
             sessions,
+            streak,
         },
         sources: Sources { garmin: garmin_status(&state).await? },
+        notifications: Notifications { server_ready: state.push_ready },
     }))
 }
 

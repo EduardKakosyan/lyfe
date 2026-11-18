@@ -12,6 +12,10 @@ use lyfe_server::config::{DatabaseConfig, GarminConfig, ServeConfig};
 use lyfe_server::db;
 use lyfe_server::garmin::sync::{parse_activity, Syncer};
 use lyfe_server::garmin::GarminClient;
+use lyfe_server::push::apns::{Alert, ApnsClient};
+use lyfe_server::push::notifier::Notifier;
+use lyfe_server::routines::gym::{self, Week};
+use lyfe_server::routines::streak::{Mark, State};
 
 #[derive(Parser)]
 #[command(name = "lyfe-server", about = "The lyfe backend", version)]
@@ -29,6 +33,11 @@ enum Command {
         #[command(flatten)]
         database: DatabaseConfig,
     },
+    /// Print every gym week as the streak rules count it, from the stored
+    /// activities. Changes nothing.
+    GymWeeks(Box<ServeConfig>),
+    /// Send a test notification to every signed-in device.
+    PushTest(Box<ServeConfig>),
     /// Ask Garmin for recent activities and print counts only. Touches no
     /// database; use it to confirm the key file works.
     GarminCheck {
@@ -52,6 +61,8 @@ async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Serve(config) => serve(*config).await,
         Command::SetPassword { database } => set_password(database).await,
+        Command::GymWeeks(config) => gym_weeks(*config).await,
+        Command::PushTest(config) => push_test(*config).await,
         Command::GarminCheck { garmin, days } => garmin_check(garmin, days).await,
     }
 }
@@ -64,6 +75,45 @@ fn garmin_client(config: &GarminConfig) -> anyhow::Result<Option<GarminClient>> 
         .transpose()
 }
 
+fn garmin_syncer(config: &ServeConfig, pool: &sqlx::PgPool) -> anyhow::Result<Arc<Syncer>> {
+    Ok(Arc::new(Syncer::new(
+        pool.clone(),
+        garmin_client(&config.garmin)?,
+        config.garmin.garmin_backfill_days,
+        config.garmin.garmin_window_days,
+    )))
+}
+
+/// The notifier, or `None` when no Apple key file is configured.
+fn notifier(config: &ServeConfig, pool: &sqlx::PgPool, syncer: Arc<Syncer>) -> anyhow::Result<Option<Notifier>> {
+    let push = &config.push;
+    let Some(key_file) = push.apns_key_file.clone() else {
+        return Ok(None);
+    };
+    let key_id = push
+        .apns_key_id
+        .clone()
+        .or_else(|| ApnsClient::key_id_from_file_name(&key_file))
+        .context("set LYFE_APNS_KEY_ID, or keep the key file's name as Apple gave it (AuthKey_<id>.p8)")?;
+    let team_id = push
+        .apns_team_id
+        .clone()
+        .context("set LYFE_APNS_TEAM_ID to your Apple developer team ID")?;
+    if push.notify_from_hour >= push.notify_until_hour {
+        bail!("LYFE_NOTIFY_FROM_HOUR must be earlier than LYFE_NOTIFY_UNTIL_HOUR");
+    }
+    Ok(Some(Notifier {
+        pool: pool.clone(),
+        syncer,
+        apns: ApnsClient::new(key_file, key_id, team_id, push.apns_topic.clone())?,
+        default_environment: push.apns_environment,
+        timezone: config.timezone,
+        gym_rules: Arc::new(config.gym_rules()),
+        from_hour: push.notify_from_hour,
+        until_hour: push.notify_until_hour,
+    }))
+}
+
 async fn serve(config: ServeConfig) -> anyhow::Result<()> {
     let pool = db::connect(&config.database.database_url)
         .await
@@ -72,21 +122,38 @@ async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         tracing::warn!("no password is set yet; run `lyfe-server set-password` before signing in");
     }
 
-    let client = garmin_client(&config.garmin)?;
-    if client.is_none() {
+    let syncer = garmin_syncer(&config, &pool)?;
+    if !syncer.is_configured() {
         tracing::warn!("LYFE_GARMIN_KEY_FILE is not set; no activities will be imported");
     }
-    let syncer = Arc::new(Syncer::new(
-        pool.clone(),
-        client,
-        config.garmin.garmin_backfill_days,
-        config.garmin.garmin_window_days,
-    ));
     tokio::spawn(
         syncer
             .clone()
             .run_forever(Duration::from_secs(config.garmin.garmin_poll_seconds)),
     );
+
+    let notifier = notifier(&config, &pool, syncer.clone())?;
+    let push_ready = match notifier {
+        Some(notifier) => match notifier.apns.check_key(Utc::now()).await {
+            Ok(()) => {
+                tracing::info!(
+                    from_hour = notifier.from_hour,
+                    until_hour = notifier.until_hour,
+                    "notifications are on"
+                );
+                tokio::spawn(Arc::new(notifier).run_forever(Duration::from_secs(300)));
+                true
+            }
+            Err(error) => {
+                tracing::error!(%error, "notifications are off: the Apple key cannot be used");
+                false
+            }
+        },
+        None => {
+            tracing::warn!("LYFE_APNS_KEY_FILE is not set; no notifications will be sent");
+            false
+        }
+    };
 
     let state = AppState {
         pool,
@@ -94,6 +161,7 @@ async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         throttle: Arc::new(SignInThrottle::new()),
         timezone: config.timezone,
         gym_rules: Arc::new(config.gym_rules()),
+        push_ready,
         now: Arc::new(Utc::now),
     };
     let listener = tokio::net::TcpListener::bind(config.listen_addr)
@@ -137,6 +205,105 @@ async fn set_password(database: DatabaseConfig) -> anyhow::Result<()> {
     let hash = tokio::task::spawn_blocking(move || auth::hash_password(&password)).await??;
     db::set_password_hash(&pool, &hash).await?;
     println!("Password set. Every device has been signed out.");
+    Ok(())
+}
+
+async fn gym_weeks(config: ServeConfig) -> anyhow::Result<()> {
+    let pool = db::connect(&config.database.database_url)
+        .await
+        .context("could not open the database")?;
+    let rules = config.gym_rules();
+    let today = Utc::now().with_timezone(&config.timezone).date_naive();
+    let this_week = Week::containing(today);
+    let activities = db::activities_until(&pool, this_week.ends_on).await?;
+    // Every recorded week, not only the recent ones shown on Home.
+    let weeks = gym::all_weeks_until(&rules, today, &activities);
+    let kept: Vec<bool> = weeks[..weeks.len() - 1]
+        .iter()
+        .map(|(_, done)| *done >= gym::WEEKLY_TARGET)
+        .collect();
+    let streak = gym::streak(&rules, today, &activities);
+    let current = if streak.state == State::Kept {
+        lyfe_server::routines::streak::Current::Kept
+    } else {
+        lyfe_server::routines::streak::Current::Open
+    };
+    let standing = lyfe_server::routines::streak::standing(&kept, current);
+
+    println!("Gym weeks as lyfe counts them ({} sessions keep a week; today is {today}):", gym::WEEKLY_TARGET);
+    println!();
+    println!("  week      Monday       sessions  days                  result");
+    for (index, (week, done)) in weeks.iter().enumerate() {
+        let sessions = gym::sessions_in_week(&rules, *week, &activities);
+        let days: Vec<String> = sessions.iter().map(|s| s.date.format("%a").to_string()).collect();
+        let result = match standing.marks.get(index) {
+            Some(Mark::Kept) => "kept",
+            Some(Mark::Recovered) => "missed, then recovered",
+            Some(Mark::AwaitingRecovery) => "missed, recover this week",
+            Some(Mark::Missed) => "not kept",
+            None if *done >= gym::WEEKLY_TARGET => "kept (this week)",
+            None => "this week, still open",
+        };
+        println!(
+            "  {}-W{:02}  {}   {:>8}  {:<20}  {result}",
+            week.iso_year,
+            week.iso_week,
+            week.starts_on,
+            done,
+            days.join(" ")
+        );
+    }
+    println!();
+    let state = match streak.state {
+        State::NotStarted => "no streak is alive",
+        State::OnTrack => "on track",
+        State::Recovering => "recovering from a missed week",
+        State::Kept => "this week is already kept",
+    };
+    println!("Streak: {} weeks in a row ({state}). Previous best: {}.", streak.weeks, streak.previous_best);
+    if streak.remaining > 0 {
+        println!(
+            "This week needs {} more, with {} days still open{}.",
+            streak.remaining,
+            streak.open_days,
+            if streak.reachable { "" } else { ": out of reach" }
+        );
+    }
+    let trained_today = gym::sessions_in_week(&rules, this_week, &activities)
+        .iter()
+        .any(|s| s.date == today);
+    match gym::prompt(&streak, trained_today) {
+        Some(prompt) => println!("Prompt due today: \"{}\" / \"{}\"", prompt.title(today), prompt.body()),
+        None => println!("No prompt is due today."),
+    }
+    Ok(())
+}
+
+async fn push_test(config: ServeConfig) -> anyhow::Result<()> {
+    let pool = db::connect(&config.database.database_url)
+        .await
+        .context("could not open the database")?;
+    let syncer = garmin_syncer(&config, &pool)?;
+    let Some(notifier) = notifier(&config, &pool, syncer)? else {
+        bail!("set LYFE_APNS_KEY_FILE to the key Apple issued (.p8); see the README");
+    };
+    let now = Utc::now();
+    notifier.apns.check_key(now).await?;
+    let targets = db::push_targets(&pool).await?;
+    if targets.is_empty() {
+        bail!("no signed-in device accepts notifications yet; open lyfe on the phone and allow them");
+    }
+    let alert = Alert {
+        title: "lyfe".to_string(),
+        body: "Test notification. Prompts will arrive like this.".to_string(),
+        collapse_id: "test".to_string(),
+        expires_at: now + chrono::Duration::minutes(10),
+    };
+    let delivered = notifier.deliver(&targets, &alert, now).await;
+    println!("Apple accepted the test for {delivered} of {} devices.", targets.len());
+    if delivered == 0 {
+        bail!("no device was reached; the log above says why");
+    }
     Ok(())
 }
 

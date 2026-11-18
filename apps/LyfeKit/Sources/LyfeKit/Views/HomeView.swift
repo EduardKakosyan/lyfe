@@ -21,8 +21,16 @@ public struct HomeView: View {
                             SourceStrip(model: model, home: home, now: timeline.date)
                         }
                         PosterRule()
-                        GymBand(gym: home.gym)
+                        if let problem = model.notificationsProblem {
+                            NoticeRow(text: problem)
+                            PosterRule()
+                        }
+                        GymBand(home: home)
                         PosterRule()
+                        if let streak = home.gym.streak, !streak.recent.isEmpty || streak.previousBest > 0 {
+                            StreakWeeks(streak: streak)
+                            PosterRule()
+                        }
                         SessionRows(gym: home.gym)
                         signOutButton
                     }
@@ -159,32 +167,61 @@ struct SourceStrip: View {
     }
 }
 
-/// The gym band: this week's sessions as squares, and the count as the
-/// screen's one giant numeral.
+/// Something the owner should know that is not about a routine.
+struct NoticeRow: View {
+    let text: String
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 6) {
+            PosterSquare(state: .outline, size: 10).padding(.top, 1)
+            Text(text).posterLabel()
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, Poster.margin)
+        .padding(.vertical, 7)
+    }
+}
+
+/// The gym band: the streak as the screen's one giant numeral, this
+/// week's sessions as squares, and stripes while the streak is in recovery.
 struct GymBand: View {
-    let gym: HomeSnapshot.GymWeek
+    let home: HomeSnapshot
 
     private static let height: CGFloat = 150
 
+    private var gym: HomeSnapshot.GymWeek { home.gym }
+    /// The streak once the backend sends one; this week's count before that.
+    private var numeral: Int { gym.streak?.weeks ?? gym.done }
+    private var recovering: Bool { gym.streak?.state == .recovering }
+
     var body: some View {
+        let lines = HomeText.gymLines(for: home)
         // The numeral is far taller than the band and is cut off by it on
         // purpose, so it is laid over the band and never sizes it.
         Poster.red
             .frame(height: Self.height)
+            .overlay {
+                if recovering {
+                    Hatch(colour: Poster.redShade)
+                }
+            }
             .overlay(alignment: .bottomTrailing) {
-                Text("\(gym.done)")
-                    .font(.system(size: 190, weight: .heavy))
-                    .kerning(-10)
+                Text("\(numeral)")
+                    .font(.system(size: numeral > 9 ? 150 : 190, weight: .heavy))
+                    .kerning(numeral > 9 ? -8 : -10)
                     .contentTransition(.numericText())
                     .fixedSize()
-                    .padding(.trailing, 22)
-                    .offset(y: 46)
+                    .padding(.trailing, numeral > 9 ? 14 : 22)
+                    .offset(y: numeral > 9 ? 36 : 46)
                     .accessibilityHidden(true)
             }
             .overlay(alignment: .topLeading) {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Gym").posterHeading()
-                    Text("sessions this week").posterLabel()
+                    Text(lines.headline).posterLabel()
+                    if let detail = lines.detail {
+                        Text(detail).posterLabel()
+                    }
                     HStack(spacing: 4) {
                         ForEach(0..<max(gym.target, gym.done), id: \.self) { index in
                             PosterSquare(state: index < gym.done ? .solid : .outline)
@@ -192,13 +229,43 @@ struct GymBand: View {
                     }
                     .padding(.top, 6)
                 }
+                // Leaves the right of the band to the numeral.
+                .frame(maxWidth: 190, alignment: .leading)
                 .padding(.horizontal, Poster.margin)
                 .padding(.top, 10)
             }
             .clipped()
-        .animation(.snappy, value: gym.done)
+            .animation(.snappy, value: gym.done)
+            .animation(.snappy, value: numeral)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(HomeText.gymSpoken(for: home))
+    }
+}
+
+/// The finished weeks behind the streak: solid for kept, stripes for a
+/// missed week that was or can still be recovered, outline for missed.
+struct StreakWeeks: View {
+    let streak: HomeSnapshot.GymStreak
+
+    var body: some View {
+        HStack(spacing: 8) {
+            HStack(spacing: 3) {
+                ForEach(streak.recent) { week in
+                    PosterSquare(state: HomeText.mark(for: week.mark), size: 12)
+                }
+            }
+            if !streak.recent.isEmpty {
+                Text(streak.recent.count == 1 ? "Last week" : "Last \(streak.recent.count) weeks").posterLabel()
+            }
+            Spacer(minLength: 0)
+            if streak.previousBest > 0 {
+                Text("Best \(streak.previousBest)").posterLabel()
+            }
+        }
+        .padding(.horizontal, Poster.margin)
+        .padding(.vertical, 8)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Gym: \(gym.done) of \(gym.target) sessions this week")
+        .accessibilityLabel(HomeText.weeksSpoken(for: streak))
     }
 }
 
@@ -264,16 +331,104 @@ enum HomeText {
         typeKey.replacingOccurrences(of: "_", with: " ").uppercased()
     }
 
+    static func weeksInARow(_ weeks: Int) -> String {
+        weeks == 1 ? "WEEK IN A ROW" : "WEEKS IN A ROW"
+    }
+
+    /// "BY SUNDAY", or "TODAY" when today is the Sunday.
+    static func deadline(for home: HomeSnapshot) -> String {
+        home.today == home.week.endsOn ? "TODAY" : "BY SUNDAY"
+    }
+
+    /// "Yet" only until a first streak has existed.
+    private static func noStreak(_ streak: HomeSnapshot.GymStreak) -> String {
+        streak.previousBest > 0 ? "STARTING AGAIN" : "NO STREAK YET"
+    }
+
+    /// The two lines under "GYM" in the band.
+    static func gymLines(for home: HomeSnapshot) -> (headline: String, detail: String?) {
+        guard let streak = home.gym.streak else { return ("SESSIONS THIS WEEK", nil) }
+        let more = "\(streak.remaining) MORE \(deadline(for: home))"
+        switch (streak.state, streak.reachable) {
+        case (.kept, _):
+            return (weeksInARow(streak.weeks), "THIS WEEK DONE")
+        case (.onTrack, true):
+            return (weeksInARow(streak.weeks), more)
+        case (.onTrack, false):
+            return (weeksInARow(streak.weeks), "THIS WEEK IS OUT OF REACH")
+        case (.recovering, true):
+            return ("RECOVERING", more)
+        case (.recovering, false):
+            return ("RECOVERING", "THE STREAK ENDS SUNDAY")
+        case (.notStarted, true):
+            return (noStreak(streak), "\(more) STARTS ONE")
+        case (.notStarted, false):
+            return (noStreak(streak), "NEXT WEEK CAN START ONE")
+        }
+    }
+
+    /// The band read aloud.
+    static func gymSpoken(for home: HomeSnapshot) -> String {
+        let gym = home.gym
+        let week = "\(gym.done) of \(gym.target) sessions this week"
+        guard let streak = gym.streak else { return "Gym: \(week)" }
+        let weeks = "\(streak.weeks) \(streak.weeks == 1 ? "week" : "weeks") in a row"
+        switch streak.state {
+        case .notStarted: return "Gym: no streak yet. \(week)."
+        case .recovering: return "Gym: \(weeks), recovering. \(week)."
+        case .onTrack, .kept: return "Gym: \(weeks). \(week)."
+        }
+    }
+
+    static func mark(for mark: HomeSnapshot.GymStreak.Mark) -> MarkState {
+        switch mark {
+        case .kept: .solid
+        case .recovered, .awaitingRecovery: .striped
+        case .missed: .outline
+        }
+    }
+
+    static func weeksSpoken(for streak: HomeSnapshot.GymStreak) -> String {
+        let kept = streak.recent.filter { $0.mark == .kept }.count
+        let recovered = streak.recent.filter { $0.mark == .recovered || $0.mark == .awaitingRecovery }.count
+        let missed = streak.recent.filter { $0.mark == .missed }.count
+        var parts = ["Last \(streak.recent.count) weeks: \(kept) kept, \(recovered) recovered, \(missed) missed"]
+        if streak.previousBest > 0 {
+            parts.append("Previous best \(streak.previousBest) weeks")
+        }
+        return parts.joined(separator: ". ")
+    }
+
     /// What the black bar says.
     static func nextAction(for home: HomeSnapshot) -> (small: String, big: String) {
         let gym = home.gym
         if gym.remaining == 0 {
+            if let streak = gym.streak {
+                return ("\(streak.weeks) \(weeksInARow(streak.weeks)) · \(gym.done) SESSIONS", "GYM WEEK DONE")
+            }
             return ("WEEK \(home.week.isoWeek) · \(gym.done) SESSIONS", "GYM WEEK DONE")
         }
+        if let streak = gym.streak, !streak.reachable {
+            switch streak.state {
+            case .onTrack:
+                return ("THIS WEEK IS OUT OF REACH", "NEXT WEEK RECOVERS IT")
+            case .recovering:
+                return ("THE STREAK ENDS SUNDAY", "START AGAIN MONDAY")
+            case .notStarted, .kept:
+                return ("THIS WEEK IS OUT OF REACH", "START AGAIN MONDAY")
+            }
+        }
         let trainedToday = gym.sessions.contains { $0.date == home.today }
-        let small = "\(gym.remaining) MORE BY SUNDAY"
+        let small = "\(gym.remaining) MORE \(deadline(for: home))"
         if trainedToday {
             return (small, "DONE FOR TODAY")
+        }
+        if let streak = gym.streak, streak.remaining == streak.openDays {
+            // Every day left is needed, starting with this one.
+            return ("NEEDED TODAY · " + small, "GYM SESSION")
+        }
+        if gym.streak?.state == .recovering {
+            return ("RECOVERY · " + small, "GYM SESSION")
         }
         return ("NEXT · " + small, "GYM SESSION")
     }

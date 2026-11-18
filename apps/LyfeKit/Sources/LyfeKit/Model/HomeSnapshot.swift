@@ -8,6 +8,13 @@ public struct HomeSnapshot: Codable, Equatable, Sendable {
     public var week: Week
     public var gym: GymWeek
     public var sources: Sources
+    /// Missing in answers cached before notifications existed.
+    public var notifications: Notifications?
+
+    public struct Notifications: Codable, Equatable, Sendable {
+        /// False when the server has no Apple key and so cannot send any.
+        public var serverReady: Bool
+    }
 
     public struct Week: Codable, Equatable, Sendable {
         public var isoYear: Int
@@ -25,6 +32,53 @@ public struct HomeSnapshot: Codable, Equatable, Sendable {
         /// Days left in the week, today included.
         public var daysLeft: Int
         public var sessions: [GymSession]
+        /// Missing in answers cached before streaks existed.
+        public var streak: GymStreak?
+    }
+
+    /// The gym streak as the backend counts it.
+    public struct GymStreak: Codable, Equatable, Sendable {
+        /// Weeks in a row with the target met, counting this week once it is.
+        public var weeks: Int
+        public var state: State
+        /// The longest streak that has ended; zero when none has.
+        public var previousBest: Int
+        /// Sessions this week still needs.
+        public var remaining: Int
+        /// Days from today to Sunday without a session yet.
+        public var openDays: Int
+        /// False once this week can no longer reach the target.
+        public var reachable: Bool
+        /// The most recent finished weeks, oldest first.
+        public var recent: [PastWeek]
+
+        public enum State: String, Codable, Sendable {
+            /// No streak is alive; keeping this week starts one.
+            case notStarted = "not_started"
+            case onTrack = "on_track"
+            /// Last week was missed; keeping this week recovers it.
+            case recovering
+            /// This week is already kept.
+            case kept
+        }
+
+        public enum Mark: String, Codable, Sendable {
+            case kept
+            /// Missed, with this week still to decide whether it is recovered.
+            case awaitingRecovery = "awaiting_recovery"
+            case recovered
+            case missed
+        }
+
+        public struct PastWeek: Codable, Equatable, Sendable, Identifiable {
+            public var isoYear: Int
+            public var isoWeek: Int
+            public var startsOn: CalendarDay
+            public var done: Int
+            public var mark: Mark
+
+            public var id: CalendarDay { startsOn }
+        }
     }
 
     public struct GymSession: Codable, Equatable, Sendable, Identifiable {

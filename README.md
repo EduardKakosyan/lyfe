@@ -2,13 +2,13 @@
 
 A private app that keeps three routines going: gym, breath training and food logging. What it is and why is in `CONTEXT.md`, `docs/adr/` and `docs/build-plan.md`.
 
-Built so far: step 1 of the build plan. A strength session recorded on the watch shows up as a filled square on the Home screen, with nothing entered in lyfe.
+Built so far: steps 1 and 2 of the build plan. A strength session recorded on the watch shows up as a filled square on the Home screen, with nothing entered in lyfe. The gym band shows the streak in weeks, with recovery after a missed week, and the backend can prompt the phone when a streak needs sessions.
 
 ## Layout
 
 | Folder | What it is |
 |---|---|
-| `backend/` | The Rust backend: API, sign-in, Garmin poller, gym rules. The single authority for what counts. |
+| `backend/` | The Rust backend: API, sign-in, Garmin poller, gym and streak rules, notifications. The single authority for what counts. |
 | `apps/LyfeKit/` | Swift package shared by the iPhone app and the later Mac app: API client, local storage, app model, Poster screens. |
 | `apps/Lyfe/` | The iPhone app target. It only launches LyfeKit. |
 | `deploy/spark/` | Scripts and service files for running the backend on the Spark. |
@@ -21,6 +21,7 @@ flowchart LR
     garmin -- polled every 15 min --> server[lyfe-server on the Spark]
     server --- db[(PostgreSQL, lyfe account only)]
     phone[iPhone app] -- HTTPS over Tailscale, lyfe sign-in --> server
+    server -- prompts --> apple[Apple push service] --> phone
 ```
 
 - The backend listens on loopback only. `tailscale serve` publishes it to the tailnet over HTTPS; nothing is reachable from the public internet.
@@ -40,6 +41,39 @@ Decided by the backend (`backend/src/routines/gym.rs`):
 - The week runs Monday to Sunday in the time zone set on the server.
 
 The types and the minimum are settings (`LYFE_GYM_ACTIVITY_TYPES`, `LYFE_GYM_MIN_MINUTES`).
+
+## Streaks and recovery
+
+The rules are one module shared by every routine (`backend/src/routines/streak.rs`); the gym applies them to weeks (`gym.rs`).
+
+- A week with four sessions is kept, and the streak counts kept weeks in a row. The current week counts as soon as its fourth session is recorded.
+- One missed week does not end the streak. Keeping the very next week recovers it, and the missed week is then shown as recovered (striped). Nothing has to be made up, and a missed week never adds to the count.
+- Two missed weeks in a row end the streak. The next kept week starts a new one, and the longest ended streak stays visible as the best.
+- Weeks before the first kept week are not part of any streak and are not shown.
+
+To see every recorded week as the rules count it, on the Spark:
+
+```sh
+set -a; . ~/.config/lyfe/lyfe.env; set +a; ~/bin/lyfe-server gym-weeks
+```
+
+## Notifications
+
+The backend decides when to prompt; the phone only shows what arrives. A prompt is sent only when a streak is alive and today is a day to act on it:
+
+- **Train today**: every day left this week is needed to reach four, and today has no session yet. Sent once that day.
+- **Recovery open**: last week was missed and this week recovers it. Sent once that week.
+
+Nothing is sent when there is slack left in the week, when the week is already out of reach, when no streak is alive, or outside 07:00 to 18:00 (`LYFE_NOTIFY_FROM_HOUR`, `LYFE_NOTIFY_UNTIL_HOUR`). Garmin is checked again just before sending, so a session recorded that morning cancels the prompt.
+
+Sending needs a key from the Apple developer account, set up once:
+
+1. At developer.apple.com, under Certificates, Identifiers & Profiles > Keys, create a key with Apple Push Notifications service enabled and download it (`AuthKey_<key id>.p8`). Apple lets you download it only once.
+2. Copy it to the Spark, readable only by `lyfe`, keeping Apple's file name: `scp -i <key> AuthKey_*.p8 lyfe@<spark>:.config/lyfe/ && ssh -i <key> lyfe@<spark> 'chmod 600 ~/.config/lyfe/AuthKey_*.p8'`.
+3. In `~/.config/lyfe/lyfe.env` on the Spark, set `LYFE_APNS_KEY_FILE` to that path and `LYFE_APNS_TEAM_ID` to your team ID, then `systemctl --user restart lyfe-server`.
+4. Open lyfe on the phone and allow notifications, then send a test: `~/bin/lyfe-server push-test` (with the settings loaded as above).
+
+Without the key the server runs and sends nothing, and the Home screen says prompts are off.
 
 ## Working on the backend
 
@@ -89,6 +123,8 @@ xcrun devicectl device process launch --console --terminate-existing \
 ```
 
 It prints what the system and Tailscale each answer for the server's name and whether the backend replied, then quits.
+
+A debug build launched with `LYFE_DEBUG_GALLERY` set shows the gym band in every streak state with made-up numbers (`LYFE_DEBUG_GALLERY=3` skips the first three).
 
 The tests that need a real server are skipped unless told where one is: `LYFE_LIVE_SERVER=<name>:8444@<tailnet address> swift test`.
 

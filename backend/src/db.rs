@@ -72,6 +72,106 @@ pub async fn revoke_session(pool: &PgPool, session_id: i64) -> sqlx::Result<()> 
     Ok(())
 }
 
+// --- Push notifications --------------------------------------------------
+
+/// Records where Apple delivers notifications for this device. The same
+/// install signing in again moves its token to the newer session.
+pub async fn set_push_token(pool: &PgPool, session_id: i64, apns_token: &str) -> sqlx::Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("update device_sessions set apns_token = null, apns_environment = null where apns_token = $1 and id <> $2")
+        .bind(apns_token)
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "update device_sessions
+         set apns_environment = case when apns_token = $1 then apns_environment end,
+             apns_token = $1, apns_token_at = now()
+         where id = $2",
+    )
+    .bind(apns_token)
+    .bind(session_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushTarget {
+    pub session_id: i64,
+    pub device_name: String,
+    pub apns_token: String,
+    pub apns_environment: Option<String>,
+}
+
+/// Signed-in devices that can be notified.
+pub async fn push_targets(pool: &PgPool) -> sqlx::Result<Vec<PushTarget>> {
+    let rows = sqlx::query(
+        "select id, device_name, apns_token, apns_environment from device_sessions
+         where revoked_at is null and apns_token is not null
+         order by id",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| PushTarget {
+            session_id: r.get("id"),
+            device_name: r.get("device_name"),
+            apns_token: r.get("apns_token"),
+            apns_environment: r.get("apns_environment"),
+        })
+        .collect())
+}
+
+/// Remembers which Apple service accepted a device's token.
+pub async fn set_push_environment(pool: &PgPool, session_id: i64, environment: &str) -> sqlx::Result<()> {
+    sqlx::query("update device_sessions set apns_environment = $2 where id = $1")
+        .bind(session_id)
+        .bind(environment)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Forgets a token Apple no longer accepts (the app was removed, or
+/// notifications were re-registered).
+pub async fn clear_push_token(pool: &PgPool, session_id: i64) -> sqlx::Result<()> {
+    sqlx::query("update device_sessions set apns_token = null, apns_environment = null where id = $1")
+        .bind(session_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn notification_sent(pool: &PgPool, kind: &str, period: NaiveDate) -> sqlx::Result<bool> {
+    sqlx::query_scalar("select exists (select 1 from notifications where kind = $1 and period = $2)")
+        .bind(kind)
+        .bind(period)
+        .fetch_one(pool)
+        .await
+}
+
+pub async fn record_notification(
+    pool: &PgPool,
+    kind: &str,
+    period: NaiveDate,
+    title: &str,
+    body: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "insert into notifications (kind, period, title, body) values ($1, $2, $3, $4)
+         on conflict (kind, period) do nothing",
+    )
+    .bind(kind)
+    .bind(period)
+    .bind(title)
+    .bind(body)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 // --- Garmin activities ---------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq)]
@@ -142,6 +242,11 @@ pub async fn latest_activity_date(pool: &PgPool) -> sqlx::Result<Option<NaiveDat
             .fetch_one(pool)
             .await?;
     Ok(latest.map(|t| t.date()))
+}
+
+/// Every activity still present in Garmin that started on or before `to`.
+pub async fn activities_until(pool: &PgPool, to: NaiveDate) -> sqlx::Result<Vec<Activity>> {
+    activities_between(pool, NaiveDate::from_ymd_opt(1970, 1, 1).expect("a real date"), to).await
 }
 
 /// Activities still present in Garmin that started within `[from, to]`.

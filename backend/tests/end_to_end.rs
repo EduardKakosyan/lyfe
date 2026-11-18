@@ -80,6 +80,7 @@ async fn harness_at(pool: PgPool, now: &str, with_key: bool) -> Harness {
             counted_types: lyfe_server::config::parse_types(GymRules::DEFAULT_TYPES),
             min_duration_s: 15.0 * 60.0,
         }),
+        push_ready: false,
         now: Arc::new(move || now),
     };
     Harness { state, garmin, _key_dir: key_dir }
@@ -583,4 +584,391 @@ async fn repeated_wrong_passwords_are_slowed_down(pool: PgPool) {
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(body["error"], "too_many_attempts");
     assert!(body["retry_after_s"].as_u64().unwrap() >= 1);
+}
+
+// --- Streaks and recovery ------------------------------------------------
+
+/// One 50-minute strength session on each of the first `count` days of
+/// the week starting on `monday`.
+fn week_of_sessions(monday: &str, count: u32) -> Vec<Value> {
+    let monday: chrono::NaiveDate = monday.parse().unwrap();
+    (0..count)
+        .map(|day| {
+            let on = monday + chrono::Duration::days(day as i64);
+            let id = chrono::Datelike::num_days_from_ce(&on) as i64;
+            activity(id, "strength_training", &format!("{on} 06:30:00"), 50.0)
+        })
+        .collect()
+}
+
+/// Weeks of sessions starting Monday 5 October 2026 (ISO week 41), one
+/// count per week. Week 47 is the seventh.
+fn history(counts: &[u32]) -> Value {
+    let monday: chrono::NaiveDate = "2026-10-05".parse().unwrap();
+    Value::Array(
+        counts
+            .iter()
+            .enumerate()
+            .flat_map(|(index, count)| {
+                week_of_sessions(&(monday + chrono::Duration::days(7 * index as i64)).to_string(), *count)
+            })
+            .collect(),
+    )
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn home_shows_the_streak_built_from_history(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    h.mock_activities(history(&[4, 5, 4, 4, 6, 4, 1])).await;
+    h.poll().await;
+
+    let (status, home) = h.get("/v1/home", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    let streak = &home["gym"]["streak"];
+    assert_eq!(streak["weeks"], 6);
+    assert_eq!(streak["state"], "on_track");
+    assert_eq!(streak["previous_best"], 0);
+    assert_eq!(streak["remaining"], 3);
+    // Tuesday with only Monday trained: Tuesday to Sunday are open.
+    assert_eq!(streak["open_days"], 6);
+    assert_eq!(streak["reachable"], true);
+    let recent = streak["recent"].as_array().unwrap();
+    assert_eq!(recent.len(), 6);
+    assert_eq!(recent[0], json!({"iso_year": 2026, "iso_week": 41, "starts_on": "2026-10-05", "done": 4, "mark": "kept"}));
+    assert_eq!(recent[5]["iso_week"], 46);
+    assert_eq!(home["notifications"]["server_ready"], false);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_missed_week_is_recovered_by_the_next_and_two_end_the_streak(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+
+    // Week 46 had two sessions; this week has one so far.
+    h.mock_activities(history(&[4, 4, 4, 4, 4, 2, 1])).await;
+    h.poll().await;
+    let (_, home) = h.get("/v1/home", Some(&token)).await;
+    let streak = &home["gym"]["streak"];
+    assert_eq!((streak["weeks"].as_u64(), streak["state"].as_str()), (Some(5), Some("recovering")));
+    assert_eq!(streak["recent"][5]["mark"], "awaiting_recovery");
+
+    // Thursday evening, with four sessions this week: recovered, and the
+    // week counts at once.
+    let later = harness_at(h.state.pool.clone(), "2026-11-19T22:00:00Z", true).await;
+    later.mock_activities(history(&[4, 4, 4, 4, 4, 2, 4])).await;
+    later.poll().await;
+    let (_, home) = later.get("/v1/home", Some(&token)).await;
+    let streak = &home["gym"]["streak"];
+    assert_eq!((streak["weeks"].as_u64(), streak["state"].as_str()), (Some(6), Some("kept")));
+    assert_eq!(streak["recent"][5]["mark"], "recovered");
+
+    // Had this week been missed too, the streak would have ended.
+    let ended = harness_at(h.state.pool.clone(), "2026-11-23T15:00:00Z", true).await;
+    ended.mock_activities(history(&[4, 4, 4, 4, 4, 2, 2])).await;
+    ended.poll().await;
+    let (_, home) = ended.get("/v1/home", Some(&token)).await;
+    let streak = &home["gym"]["streak"];
+    assert_eq!((streak["weeks"].as_u64(), streak["state"].as_str()), (Some(0), Some("not_started")));
+    assert_eq!(streak["previous_best"], 5);
+    assert_eq!(streak["recent"][5]["mark"], "missed");
+    assert_eq!(streak["recent"][6]["mark"], "missed");
+}
+
+// --- Notifications -------------------------------------------------------
+
+use lyfe_server::push::apns::{ApnsClient, Environment};
+use lyfe_server::push::notifier::{Notifier, Outcome};
+use wiremock::matchers::path_regex;
+
+const DEVICE_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+/// A key made for one test, in the form Apple issues them. No key is kept
+/// in the repository.
+fn throwaway_apns_key() -> String {
+    use p256::pkcs8::{EncodePrivateKey, LineEnding};
+    loop {
+        let mut bytes = [0u8; 32];
+        getrandom::fill(&mut bytes).unwrap();
+        if let Ok(key) = p256::ecdsa::SigningKey::from_slice(&bytes) {
+            return key.to_pkcs8_pem(LineEnding::LF).unwrap().to_string();
+        }
+    }
+}
+
+/// A notifier that talks to `apple` instead of Apple: its development
+/// service under /dev and its production service under /prod.
+fn notifier(h: &Harness, apple: &MockServer) -> Notifier {
+    let key_file = h._key_dir.0.join("AuthKey_TESTKEY123.p8");
+    std::fs::write(&key_file, throwaway_apns_key()).unwrap();
+    Notifier {
+        pool: h.state.pool.clone(),
+        syncer: h.state.syncer.clone(),
+        apns: ApnsClient::with_urls(
+            key_file,
+            "TESTKEY123".into(),
+            "TESTTEAM12".into(),
+            "com.example.lyfe".into(),
+            &format!("{}/dev", apple.uri()),
+            &format!("{}/prod", apple.uri()),
+        )
+        .unwrap(),
+        default_environment: Environment::Development,
+        timezone: h.state.timezone,
+        gym_rules: h.state.gym_rules.clone(),
+        from_hour: 7,
+        until_hour: 18,
+    }
+}
+
+async fn apple_answers(apple: &MockServer, service: &str, status: u16, reason: Option<&str>) {
+    let response = match reason {
+        Some(reason) => ResponseTemplate::new(status).set_body_json(json!({ "reason": reason })),
+        None => ResponseTemplate::new(status),
+    };
+    Mock::given(method("POST"))
+        .and(path_regex(format!("^/{service}/3/device/")))
+        .respond_with(response)
+        .mount(apple)
+        .await;
+}
+
+async fn register_device(h: &Harness, token: &str) {
+    let (status, _) = h
+        .post("/v1/push-token", Some(token), Some(json!({ "apns_token": DEVICE_TOKEN })))
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+/// Six kept weeks, then Monday and Tuesday of week 47: two more needed.
+async fn two_more_needed(h: &Harness) {
+    h.mock_activities(history(&[4, 4, 4, 4, 4, 4, 2])).await;
+    h.poll().await;
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_device_registers_where_apple_reaches_it(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+
+    let (status, _) = h.post("/v1/push-token", None, Some(json!({ "apns_token": DEVICE_TOKEN }))).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    for bad in ["", "not hex at all, not hex at all, not hex", "abc123"] {
+        let (status, _) = h.post("/v1/push-token", Some(&token), Some(json!({ "apns_token": bad }))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+    }
+    assert!(db::push_targets(&h.state.pool).await.unwrap().is_empty());
+
+    register_device(&h, &token).await;
+    let targets = db::push_targets(&h.state.pool).await.unwrap();
+    assert_eq!(targets.len(), 1);
+    assert_eq!((targets[0].apns_token.as_str(), targets[0].apns_environment.as_deref()), (DEVICE_TOKEN, None));
+
+    // The same install signing in again is one device, not two.
+    let second = h.sign_in().await;
+    register_device(&h, &second).await;
+    assert_eq!(db::push_targets(&h.state.pool).await.unwrap().len(), 1);
+
+    // A signed-out device is not notified.
+    h.post("/v1/auth/sign-out", Some(&second), None).await;
+    assert!(db::push_targets(&h.state.pool).await.unwrap().is_empty());
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn the_day_every_remaining_day_is_needed_prompts_once(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    register_device(&h, &token).await;
+    two_more_needed(&h).await;
+    let apple = MockServer::start().await;
+    apple_answers(&apple, "dev", 200, None).await;
+    let notifier = notifier(&h, &apple);
+
+    // Friday 08:00 in San Juan: three days left for two sessions. Nothing yet.
+    assert_eq!(notifier.tick(at("2026-11-20T12:00:00Z")).await.unwrap(), Outcome::NothingDue);
+    // Saturday 08:00: today and Sunday are both needed.
+    let saturday = at("2026-11-21T12:00:00Z");
+    assert_eq!(
+        notifier.tick(saturday).await.unwrap(),
+        Outcome::Sent {
+            title: "Gym: 2 more by Sunday".into(),
+            body: "Train today to keep your 6-week streak. It takes every day left this week.".into(),
+            devices: 1,
+        }
+    );
+    assert_eq!(notifier.tick(at("2026-11-21T12:05:00Z")).await.unwrap(), Outcome::AlreadySent);
+
+    let requests = apple.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    assert_eq!(request.url.path(), format!("/dev/3/device/{DEVICE_TOKEN}"));
+    let header = |name: &str| request.headers.get(name).unwrap().to_str().unwrap().to_string();
+    assert_eq!(header("apns-topic"), "com.example.lyfe");
+    assert_eq!(header("apns-push-type"), "alert");
+    assert_eq!(header("apns-collapse-id"), "gym_train_today");
+    // Dropped if not delivered by 18:00 in San Juan.
+    assert_eq!(header("apns-expiration"), at("2026-11-21T22:00:00Z").timestamp().to_string());
+    let bearer = header("authorization");
+    assert!(bearer.starts_with("Bearer ") && bearer.split('.').count() == 3, "{bearer}");
+    let body: Value = serde_json::from_slice(&request.body).unwrap();
+    assert_eq!(body["aps"]["alert"]["title"], "Gym: 2 more by Sunday");
+
+    // Apple's development service took it, and that is remembered.
+    let targets = db::push_targets(&h.state.pool).await.unwrap();
+    assert_eq!(targets[0].apns_environment.as_deref(), Some("development"));
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn nothing_is_sent_at_night_or_without_a_device(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    two_more_needed(&h).await;
+    let apple = MockServer::start().await;
+    apple_answers(&apple, "dev", 200, None).await;
+    let notifier = notifier(&h, &apple);
+
+    // Saturday 08:00, a prompt is due, but no device accepts notifications.
+    assert_eq!(notifier.tick(at("2026-11-21T12:00:00Z")).await.unwrap(), Outcome::NoDevices);
+    register_device(&h, &token).await;
+    // 06:59 and 18:00 in San Juan are outside the window.
+    assert_eq!(notifier.tick(at("2026-11-21T10:59:00Z")).await.unwrap(), Outcome::Quiet);
+    assert_eq!(notifier.tick(at("2026-11-21T22:00:00Z")).await.unwrap(), Outcome::Quiet);
+    assert!(apple.received_requests().await.unwrap().is_empty());
+    // 17:59 is inside it.
+    assert!(matches!(notifier.tick(at("2026-11-21T21:59:00Z")).await.unwrap(), Outcome::Sent { .. }));
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_session_recorded_this_morning_cancels_the_prompt(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    register_device(&h, &token).await;
+    two_more_needed(&h).await;
+    let apple = MockServer::start().await;
+    apple_answers(&apple, "dev", 200, None).await;
+    let notifier = notifier(&h, &apple);
+
+    // The watch synced a Saturday-morning session that lyfe has not polled yet.
+    let mut activities = history(&[4, 4, 4, 4, 4, 4, 2]);
+    activities
+        .as_array_mut()
+        .unwrap()
+        .push(activity(7001, "strength_training", "2026-11-21 06:30:00", 45.0));
+    h.mock_activities(activities).await;
+
+    assert_eq!(notifier.tick(at("2026-11-21T12:00:00Z")).await.unwrap(), Outcome::NothingDue);
+    assert!(apple.received_requests().await.unwrap().is_empty());
+    // Sunday morning the last one is needed.
+    assert_eq!(
+        notifier.tick(at("2026-11-22T12:00:00Z")).await.unwrap(),
+        Outcome::Sent {
+            title: "Gym: 1 more today".into(),
+            body: "Train today to keep your 6-week streak.".into(),
+            devices: 1,
+        }
+    );
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_missed_week_prompts_recovery_once_that_week(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    register_device(&h, &token).await;
+    // Week 46 had two sessions; week 47 has none yet.
+    h.mock_activities(history(&[4, 4, 4, 4, 4, 2])).await;
+    h.poll().await;
+    let apple = MockServer::start().await;
+    apple_answers(&apple, "dev", 200, None).await;
+    let notifier = notifier(&h, &apple);
+
+    assert_eq!(
+        notifier.tick(at("2026-11-16T12:00:00Z")).await.unwrap(),
+        Outcome::Sent {
+            title: "Gym: last week was missed".into(),
+            body: "4 sessions by Sunday recovers your 5-week streak. Nothing to make up.".into(),
+            devices: 1,
+        }
+    );
+    assert_eq!(notifier.tick(at("2026-11-17T12:00:00Z")).await.unwrap(), Outcome::AlreadySent);
+    assert_eq!(notifier.tick(at("2026-11-18T12:00:00Z")).await.unwrap(), Outcome::AlreadySent);
+    // Thursday: all four remaining days are needed, which is its own prompt.
+    assert_eq!(
+        notifier.tick(at("2026-11-19T12:00:00Z")).await.unwrap(),
+        Outcome::Sent {
+            title: "Gym: 4 more by Sunday".into(),
+            body: "Train today to recover your 5-week streak. It takes every day left this week.".into(),
+            devices: 1,
+        }
+    );
+    // Friday without Thursday's session: out of reach, so nothing to act on.
+    assert_eq!(notifier.tick(at("2026-11-20T12:00:00Z")).await.unwrap(), Outcome::NothingDue);
+    assert_eq!(apple.received_requests().await.unwrap().len(), 2);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn apples_other_service_is_tried_and_remembered(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    register_device(&h, &token).await;
+    two_more_needed(&h).await;
+    let apple = MockServer::start().await;
+    apple_answers(&apple, "dev", 400, Some("BadDeviceToken")).await;
+    apple_answers(&apple, "prod", 200, None).await;
+    let notifier = notifier(&h, &apple);
+
+    assert!(matches!(notifier.tick(at("2026-11-21T12:00:00Z")).await.unwrap(), Outcome::Sent { devices: 1, .. }));
+    let targets = db::push_targets(&h.state.pool).await.unwrap();
+    assert_eq!(targets[0].apns_environment.as_deref(), Some("production"));
+
+    // The next alert goes straight to the service that worked.
+    let alert = lyfe_server::push::apns::Alert {
+        title: "lyfe".into(),
+        body: "Another".into(),
+        collapse_id: "test".into(),
+        expires_at: at("2026-11-21T13:00:00Z"),
+    };
+    assert_eq!(notifier.deliver(&targets, &alert, at("2026-11-21T12:10:00Z")).await, 1);
+    let paths: Vec<String> = apple
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.url.path()[..5].trim_end_matches('/').to_string())
+        .collect();
+    assert_eq!(paths, vec!["/dev", "/prod", "/prod"]);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_device_apple_no_longer_knows_is_forgotten(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    register_device(&h, &token).await;
+    two_more_needed(&h).await;
+    let apple = MockServer::start().await;
+    apple_answers(&apple, "dev", 400, Some("BadDeviceToken")).await;
+    apple_answers(&apple, "prod", 410, Some("Unregistered")).await;
+    let notifier = notifier(&h, &apple);
+
+    assert_eq!(notifier.tick(at("2026-11-21T12:00:00Z")).await.unwrap(), Outcome::Undelivered);
+    assert!(db::push_targets(&h.state.pool).await.unwrap().is_empty());
+    assert_eq!(notifier.tick(at("2026-11-21T12:05:00Z")).await.unwrap(), Outcome::NoDevices);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_prompt_apple_could_not_take_is_tried_again(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    register_device(&h, &token).await;
+    two_more_needed(&h).await;
+    let apple = MockServer::start().await;
+    apple_answers(&apple, "dev", 503, Some("ServiceUnavailable")).await;
+    let notifier = notifier(&h, &apple);
+
+    assert_eq!(notifier.tick(at("2026-11-21T12:00:00Z")).await.unwrap(), Outcome::Undelivered);
+    // The device is kept: the fault was Apple's, not the token's.
+    assert_eq!(db::push_targets(&h.state.pool).await.unwrap().len(), 1);
+
+    apple.reset().await;
+    apple_answers(&apple, "dev", 200, None).await;
+    assert!(matches!(notifier.tick(at("2026-11-21T12:05:00Z")).await.unwrap(), Outcome::Sent { .. }));
 }

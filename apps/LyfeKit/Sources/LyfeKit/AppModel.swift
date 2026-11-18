@@ -30,7 +30,14 @@ public final class AppModel {
     /// the week (a server error, an answer that could not be read).
     public private(set) var refreshProblem: String?
     public var serverAddress: String
+    /// Whether the owner lets lyfe show notifications on this device; nil
+    /// until they have been asked. Set by the app, which owns the prompt.
+    public var notificationsAllowed: Bool?
 
+    /// Where Apple delivers notifications for this install, once known.
+    private var apnsToken: String?
+    /// The token the backend has for the current session.
+    private var apnsTokenSent: String?
     /// The device token for this run. The store only carries it between
     /// launches, so a failed save costs a sign-in next time, not this session.
     private var token: String?
@@ -106,6 +113,7 @@ public final class AppModel {
             tokens.save(token)
             addresses.save(serverAddress)
             phase = .signedIn
+            await sendPushToken()
             await refresh()
         } catch let error as LyfeAPIError {
             signInProblem = Self.signInMessage(for: error)
@@ -144,8 +152,41 @@ public final class AppModel {
         forgetSession()
     }
 
+    // MARK: Notifications
+
+    /// Called when Apple hands the app its device token, which happens on
+    /// every launch once notifications are allowed.
+    public func setPushToken(_ apnsToken: String) async {
+        self.apnsToken = apnsToken
+        await sendPushToken()
+    }
+
+    /// Tells the backend the device token, once per session and whenever
+    /// it changes. A failure is retried on the next refresh.
+    private func sendPushToken() async {
+        guard phase == .signedIn, let api, let token, let apnsToken, apnsToken != apnsTokenSent else { return }
+        do {
+            try await api.setPushToken(token: token, apnsToken: apnsToken)
+            apnsTokenSent = apnsToken
+        } catch {
+            // Offline or signed out elsewhere; refresh deals with both.
+        }
+    }
+
+    /// Why prompts will not arrive, when they will not.
+    public var notificationsProblem: String? {
+        if notificationsAllowed == false {
+            return "Prompts are off. Allow notifications for lyfe in Settings."
+        }
+        if home?.notifications?.serverReady == false {
+            return "Prompts are off. The server has no Apple key yet."
+        }
+        return nil
+    }
+
     private func forgetSession() {
         token = nil
+        apnsTokenSent = nil
         tokens.clear()
         cache.clear()
         home = nil
@@ -164,6 +205,7 @@ public final class AppModel {
         guard phase == .signedIn, !isRefreshing, let api, let token else { return }
         isRefreshing = true
         defer { isRefreshing = false }
+        await sendPushToken()
         do {
             try await loadHome(api, token)
             let before = home?.sources.garmin

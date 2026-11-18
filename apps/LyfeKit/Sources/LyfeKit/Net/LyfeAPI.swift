@@ -48,6 +48,15 @@ public struct LyfeAPI: Sendable {
         self.transport = transport
     }
 
+    /// Tells the backend where Apple delivers notifications for this device.
+    public func setPushToken(token: String, apnsToken: String) async throws {
+        struct Body: Encodable {
+            var apnsToken: String
+        }
+        let body = try JSONEncoder.lyfe.encode(Body(apnsToken: apnsToken))
+        _ = try await perform("POST", "v1/push-token", token: token, body: body, timeout: 15)
+    }
+
     /// Whether the backend answers at all, without signing in.
     public func isReachable() async throws {
         _ = try await perform("GET", "healthz", token: nil, body: nil, timeout: 15)
