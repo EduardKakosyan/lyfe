@@ -9,6 +9,8 @@ public struct HomeSnapshot: Codable, Equatable, Sendable {
     public var gym: GymWeek
     /// Missing in answers cached before breath sessions existed.
     public var breath: BreathWeek?
+    /// Missing in answers cached before weigh-ins existed.
+    public var weight: WeightTrend?
     public var sources: Sources
     /// Missing in answers cached before notifications existed.
     public var notifications: Notifications?
@@ -129,6 +131,70 @@ public struct HomeSnapshot: Codable, Equatable, Sendable {
     }
 }
 
+/// Weight as the backend worked it out: the day's weight is the last one
+/// typed that day, and the seven-day average is the trend. Every figure is
+/// in `unit`.
+public struct WeightTrend: Codable, Equatable, Sendable {
+    /// "kg" or "lb".
+    public var unit: String
+    /// When the morning prompt goes out ("06:30"); nil when it is off.
+    public var promptAt: String?
+    /// The most recent day with a weight.
+    public var latest: Reading?
+    /// The seven-day average as of today; nil while fewer than three of
+    /// the seven days have a weight.
+    public var average: Double?
+    /// Days of the last seven, today included, with a weight.
+    public var daysWeighed: Int
+    /// The average now minus the average a week ago.
+    public var change: Double?
+    /// The same as a percentage of a week ago.
+    public var changePct: Double?
+    /// The last eight weeks, oldest first: every day with a weight or an
+    /// average.
+    public var days: [Day]
+
+    public struct Reading: Codable, Equatable, Sendable {
+        public var date: CalendarDay
+        public var value: Double
+
+        public init(date: CalendarDay, value: Double) {
+            self.date = date
+            self.value = value
+        }
+    }
+
+    public struct Day: Codable, Equatable, Sendable, Identifiable {
+        public var date: CalendarDay
+        /// The weight typed that day.
+        public var value: Double?
+        /// The seven-day average as of that day.
+        public var average: Double?
+
+        public var id: CalendarDay { date }
+
+        public init(date: CalendarDay, value: Double?, average: Double?) {
+            self.date = date
+            self.value = value
+            self.average = average
+        }
+    }
+
+    public init(
+        unit: String, promptAt: String?, latest: Reading?, average: Double?, daysWeighed: Int, change: Double?,
+        changePct: Double?, days: [Day]
+    ) {
+        self.unit = unit
+        self.promptAt = promptAt
+        self.latest = latest
+        self.average = average
+        self.daysWeighed = daysWeighed
+        self.change = change
+        self.changePct = changePct
+        self.days = days
+    }
+}
+
 /// The table lyfe set for a breath session: fixed rounds, each opened by a
 /// hold taken as far as it goes.
 public struct BreathTable: Codable, Equatable, Sendable {
@@ -238,6 +304,19 @@ extension CalendarDay: CustomStringConvertible {
     /// "TUE 17 NOV"
     public var posterLabel: String {
         "\(weekdayLabel) \(day) \(Self.months[month - 1])"
+    }
+
+    /// "17 NOV"
+    public var shortLabel: String {
+        "\(day) \(Self.months[month - 1])"
+    }
+
+    /// Days since 1 January 1970, for placing days on a line.
+    public var ordinal: Int {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let date = calendar.date(from: DateComponents(year: year, month: month, day: day, hour: 12)) ?? .distantPast
+        return Int((date.timeIntervalSince1970 / 86_400).rounded(.down))
     }
 }
 

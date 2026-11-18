@@ -195,4 +195,88 @@
                 bestMs: 132_000)
         }
     }
+
+    /// Progress and the weight entry with made-up numbers: a debug build
+    /// shows one when launched with LYFE_DEBUG_PROGRESS set to `full`
+    /// (eight weeks, some mornings missed), `new` (two weigh-ins), `empty`,
+    /// `entry` or `kg`.
+    public struct ProgressGallery: View {
+        var screen: String
+
+        public init(screen: String) {
+            self.screen = screen
+        }
+
+        static let today = CalendarDay(year: 2026, month: 11, day: 18)
+
+        public var body: some View {
+            Group {
+                if screen == "entry" {
+                    WeighInView(
+                        unit: "lb", latest: .init(date: CalendarDay(year: 2026, month: 11, day: 17), value: 181.2),
+                        today: Self.today, onSave: { _ in .sent }, onClose: {})
+                } else {
+                    ProgressScreen(
+                        weight: Self.weight(for: screen), today: Self.today, unsent: screen == "new" ? 1 : 0,
+                        onBack: {}, onWeighIn: {})
+                }
+            }
+            .preferredColorScheme(.light)
+        }
+
+        static func weight(for screen: String) -> WeightTrend? {
+            switch screen {
+            case "empty":
+                return WeightTrend(
+                    unit: "lb", promptAt: "06:30", latest: nil, average: nil, daysWeighed: 0, change: nil,
+                    changePct: nil, days: [])
+            case "new":
+                return trend(from: [(1, 182.2), (0, 181.6)], unit: "lb")
+            case "kg":
+                return trend(from: eightWeeks(), unit: "kg")
+            default:
+                return trend(from: eightWeeks().map { ($0.0, $0.1 * 2.204_62) }, unit: "lb")
+            }
+        }
+
+        /// Eight weeks drifting down about 0.4 kg a week, with the day to
+        /// day noise of water and food, and a few mornings missed.
+        static func eightWeeks() -> [(daysAgo: Int, value: Double)] {
+            let noise = [0.3, -0.2, 0.5, 0.1, -0.4, 0.2, -0.1, 0.6, -0.3, 0.0, 0.4, -0.5, 0.2, 0.1]
+            let missed: Set<Int> = [3, 9, 10, 17, 24, 25, 26, 33, 41, 48, 52]
+            return (0..<56).reversed().compactMap { back in
+                missed.contains(back) ? nil : (back, 82.2 + Double(back) * 0.057 + noise[back % noise.count])
+            }
+        }
+
+        /// What the backend would send for these weights, worked out the
+        /// same way: the average needs three of the last seven days.
+        static func trend(from weights: [(daysAgo: Int, value: Double)], unit: String) -> WeightTrend {
+            let byDay = Dictionary(uniqueKeysWithValues: weights.map { ($0.daysAgo, ($0.value * 10).rounded() / 10) })
+            func average(_ back: Int) -> Double? {
+                let window = (back..<(back + 7)).compactMap { byDay[$0] }
+                return window.count >= 3 ? window.reduce(0, +) / Double(window.count) : nil
+            }
+            func day(_ back: Int) -> CalendarDay {
+                var calendar = Calendar(identifier: .gregorian)
+                calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+                let date = calendar.date(byAdding: .day, value: -back, to: calendar.date(from: DateComponents(year: 2026, month: 11, day: 18, hour: 12))!)!
+                let parts = calendar.dateComponents([.year, .month, .day], from: date)
+                return CalendarDay(year: parts.year!, month: parts.month!, day: parts.day!)
+            }
+            let days = (0..<56).reversed().compactMap { back -> WeightTrend.Day? in
+                let value = byDay[back]
+                let mean = average(back)
+                return value == nil && mean == nil ? nil : WeightTrend.Day(date: day(back), value: value, average: mean)
+            }
+            let latest = byDay.keys.min().map { WeightTrend.Reading(date: day($0), value: byDay[$0]!) }
+            let now = average(0)
+            let then = average(7)
+            return WeightTrend(
+                unit: unit, promptAt: "06:30", latest: latest, average: now,
+                daysWeighed: (0..<7).filter { byDay[$0] != nil }.count,
+                change: now.flatMap { now in then.map { now - $0 } },
+                changePct: now.flatMap { now in then.map { (now - $0) / $0 * 100 } }, days: days)
+        }
+    }
 #endif

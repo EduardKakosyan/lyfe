@@ -81,6 +81,11 @@ async fn harness_at(pool: PgPool, now: &str, with_key: bool) -> Harness {
             min_duration_s: 15.0 * 60.0,
         }),
         breath_rules: Arc::new(lyfe_server::routines::breath::BreathRules::default()),
+        // Kilograms here; pounds, the default, have their own test.
+        weight: lyfe_server::routines::weight::WeightSettings {
+            unit: lyfe_server::routines::weight::Unit::Kg,
+            ..Default::default()
+        },
         push_ready: false,
         now: Arc::new(move || now),
     };
@@ -719,6 +724,7 @@ fn notifier(h: &Harness, apple: &MockServer) -> Notifier {
         gym_rules: h.state.gym_rules.clone(),
         from_hour: 7,
         until_hour: 18,
+        weight: h.state.weight,
     }
 }
 
@@ -927,6 +933,7 @@ async fn apples_other_service_is_tried_and_remembered(pool: PgPool) {
         body: "Another".into(),
         collapse_id: "test".into(),
         expires_at: at("2026-11-21T13:00:00Z"),
+        category: None,
     };
     assert_eq!(notifier.deliver(&targets, &alert, at("2026-11-21T12:10:00Z")).await, 1);
     let paths: Vec<String> = apple
@@ -1295,4 +1302,223 @@ async fn when_both_routines_need_today_each_gets_its_own_prompt(pool: PgPool) {
     assert_eq!(sent(notifier.tick(at("2026-11-21T12:05:00Z")).await.unwrap()), "Breath: 2 more by Sunday");
     assert_eq!(notifier.tick(at("2026-11-21T12:10:00Z")).await.unwrap(), Outcome::AlreadySent);
     assert_eq!(apple.received_requests().await.unwrap().len(), 2);
+}
+
+// --- Weigh-ins -----------------------------------------------------------
+
+/// A weigh-in as the phone sends it.
+fn weigh_in(n: u32, measured_at: &str, value: f64, unit: &str) -> Value {
+    json!({
+        "id": format!("00000000-0000-4000-9000-{n:012}"),
+        "measured_at": measured_at,
+        "value": value,
+        "unit": unit,
+    })
+}
+
+impl Harness {
+    async fn record_weight(&self, token: &str, body: Value) -> Value {
+        let (status, home) = self.post("/v1/weigh-ins", Some(token), Some(body)).await;
+        assert_eq!(status, StatusCode::OK, "{home}");
+        home
+    }
+}
+
+async fn weigh_in_count(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("select count(*) from weigh_ins").fetch_one(pool).await.unwrap()
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_weight_typed_into_the_prompt_shows_on_home(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+
+    let (status, home) = h.get("/v1/home", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        home["weight"],
+        json!({"unit": "kg", "prompt_at": "06:30", "latest": null, "average": null, "days_weighed": 0,
+               "change": null, "change_pct": null, "days": []})
+    );
+
+    let body = weigh_in(1, "2026-11-17T10:35:00Z", 82.4, "kg");
+    let (status, _) = h.post("/v1/weigh-ins", None, Some(body.clone())).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(weigh_in_count(&h.state.pool).await, 0);
+
+    // 06:35 in San Juan: Tuesday's weight. The answer is Home as it now stands.
+    let home = h.record_weight(&token, body).await;
+    assert_eq!(home["weight"]["latest"], json!({"date": "2026-11-17", "value": 82.4}));
+    assert_eq!(home["weight"]["days_weighed"], 1);
+    assert_eq!(home["weight"]["average"], Value::Null);
+    assert_eq!(home["weight"]["days"], json!([{"date": "2026-11-17", "value": 82.4, "average": null}]));
+    assert_eq!(home["gym"]["target"], 4);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_weigh_in_sent_twice_is_stored_once_and_a_retype_corrects_the_day(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+
+    let slip = weigh_in(1, "2026-11-17T10:35:00Z", 28.4, "kg");
+    h.record_weight(&token, slip.clone()).await;
+    h.record_weight(&token, slip).await;
+    assert_eq!(weigh_in_count(&h.state.pool).await, 1);
+
+    // Typed again a minute later: the day's weight is the later one.
+    let home = h.record_weight(&token, weigh_in(2, "2026-11-17T10:36:00Z", 82.4, "kg")).await;
+    assert_eq!(home["weight"]["latest"]["value"], 82.4);
+    assert_eq!(home["weight"]["days_weighed"], 1);
+    assert_eq!(weigh_in_count(&h.state.pool).await, 2);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn the_seven_day_average_and_its_change_on_last_week(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+
+    // Fourteen mornings to Tuesday 17 November, down 0.1 kg a day from 84.0.
+    for day in 0..14u32 {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 11, 4 + day).unwrap();
+        let measured = format!("{date}T10:30:00Z");
+        h.record_weight(&token, weigh_in(day, &measured, 84.0 - f64::from(day) * 0.1, "kg")).await;
+    }
+    let (_, home) = h.get("/v1/home", Some(&token)).await;
+    let weight = &home["weight"];
+    assert_eq!(weight["latest"], json!({"date": "2026-11-17", "value": 82.7}));
+    assert_eq!(weight["average"], 83.0);
+    assert_eq!(weight["days_weighed"], 7);
+    assert_eq!(weight["change"], -0.7);
+    assert_eq!(weight["change_pct"], -0.84);
+    let days = weight["days"].as_array().unwrap();
+    assert_eq!(days.len(), 14);
+    assert_eq!(days[0], json!({"date": "2026-11-04", "value": 84.0, "average": null}));
+    assert_eq!(days[2], json!({"date": "2026-11-06", "value": 83.8, "average": 83.9}));
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_weight_in_pounds_is_kept_as_the_same_weight(pool: PgPool) {
+    let mut h = harness(pool).await;
+    let token = h.signed_in().await;
+
+    let home = h.record_weight(&token, weigh_in(1, "2026-11-17T10:35:00Z", 181.4, "lb")).await;
+    assert_eq!(home["weight"]["unit"], "kg");
+    assert_eq!(home["weight"]["latest"]["value"], 82.28);
+
+    // A server left on its default, pounds, shows it as typed and asks in pounds.
+    h.state.weight = lyfe_server::routines::weight::WeightSettings::default();
+    let (_, home) = h.get("/v1/home", Some(&token)).await;
+    assert_eq!(home["weight"]["unit"], "lb");
+    assert_eq!(home["weight"]["latest"]["value"], 181.4);
+    assert_eq!(
+        lyfe_server::routines::weight::prompt_body(h.state.weight.unit),
+        "Hold this and type your weight in lb. No need to open lyfe."
+    );
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_weight_that_makes_no_sense_is_refused(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+
+    for (body, why) in [
+        (weigh_in(1, "2026-11-17T10:35:00Z", 824.0, "kg"), "a slipped decimal point"),
+        (weigh_in(2, "2026-11-17T10:35:00Z", 8.24, "kg"), "the other way"),
+        (weigh_in(3, "2026-11-17T10:35:00Z", 82.4, "st"), "an unknown unit"),
+        (weigh_in(4, "2026-11-19T10:35:00Z", 82.4, "kg"), "in the future"),
+    ] {
+        let (status, body) = h.post("/v1/weigh-ins", Some(&token), Some(body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{why}: {body}");
+    }
+    assert_eq!(weigh_in_count(&h.state.pool).await, 0);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn the_weigh_in_prompt_comes_once_at_its_time_with_a_reply_field(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    register_device(&h, &token).await;
+    let apple = MockServer::start().await;
+    apple_answers(&apple, "dev", 200, None).await;
+    let notifier = notifier(&h, &apple);
+
+    // Wednesday 18 November in San Juan (UTC-4): not before 06:30...
+    assert_eq!(notifier.weigh_in(at("2026-11-18T10:29:00Z")).await.unwrap(), Outcome::Quiet);
+    // ...then once, before the daytime window for streak prompts opens.
+    assert_eq!(
+        notifier.weigh_in(at("2026-11-18T10:30:00Z")).await.unwrap(),
+        Outcome::Sent {
+            title: "Morning weigh-in".into(),
+            body: "Hold this and type your weight in kg. No need to open lyfe.".into(),
+            devices: 1,
+        }
+    );
+    assert_eq!(notifier.weigh_in(at("2026-11-18T10:35:00Z")).await.unwrap(), Outcome::AlreadySent);
+
+    let requests = apple.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let header = |name: &str| requests[0].headers.get(name).unwrap().to_str().unwrap().to_string();
+    assert_eq!(header("apns-collapse-id"), "weigh_in");
+    // Dropped if not delivered by 09:30: it is a morning weigh-in.
+    assert_eq!(header("apns-expiration"), at("2026-11-18T13:30:00Z").timestamp().to_string());
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["aps"]["category"], "WEIGH_IN");
+    assert_eq!(body["aps"]["alert"]["title"], "Morning weigh-in");
+
+    // A missed morning is just missed: no second reminder, nothing after 09:30.
+    assert_eq!(notifier.weigh_in(at("2026-11-18T16:00:00Z")).await.unwrap(), Outcome::Quiet);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_server_down_at_the_time_still_prompts_that_morning(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    register_device(&h, &token).await;
+    let apple = MockServer::start().await;
+    apple_answers(&apple, "dev", 200, None).await;
+    let notifier = notifier(&h, &apple);
+
+    // Up again at 09:29: still the morning.
+    assert!(matches!(notifier.weigh_in(at("2026-11-18T13:29:00Z")).await.unwrap(), Outcome::Sent { .. }));
+    // Up at 09:30 the next day: too late, nothing that day.
+    assert_eq!(notifier.weigh_in(at("2026-11-19T13:30:00Z")).await.unwrap(), Outcome::Quiet);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn no_weigh_in_prompt_once_today_is_weighed_or_when_it_is_off(pool: PgPool) {
+    let mut h = harness(pool).await;
+    let token = h.signed_in().await;
+    register_device(&h, &token).await;
+    let apple = MockServer::start().await;
+    apple_answers(&apple, "dev", 200, None).await;
+
+    // Weighed at 06:10, before the prompt, from the app.
+    h.record_weight(&token, weigh_in(1, "2026-11-17T10:10:00Z", 82.4, "kg")).await;
+    let notifier_on = notifier(&h, &apple);
+    assert_eq!(notifier_on.weigh_in(at("2026-11-17T10:30:00Z")).await.unwrap(), Outcome::NothingDue);
+
+    h.state.weight.prompt_at = None;
+    let notifier_off = notifier(&h, &apple);
+    assert_eq!(notifier_off.weigh_in(at("2026-11-18T10:30:00Z")).await.unwrap(), Outcome::Quiet);
+    assert!(apple.received_requests().await.unwrap().is_empty());
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn the_weigh_in_prompt_and_streak_prompts_do_not_crowd_each_other_out(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    register_device(&h, &token).await;
+    two_more_needed(&h).await;
+    let apple = MockServer::start().await;
+    apple_answers(&apple, "dev", 200, None).await;
+    let notifier = notifier(&h, &apple);
+
+    // Saturday: the weigh-in at 06:30 and the gym prompt once the day opens.
+    assert!(matches!(notifier.weigh_in(at("2026-11-21T10:30:00Z")).await.unwrap(), Outcome::Sent { .. }));
+    assert_eq!(notifier.tick(at("2026-11-21T10:30:00Z")).await.unwrap(), Outcome::Quiet);
+    assert!(matches!(
+        notifier.tick(at("2026-11-21T11:00:00Z")).await.unwrap(),
+        Outcome::Sent { title, .. } if title == "Gym: 2 more by Sunday"
+    ));
+    assert_eq!(notifier.weigh_in(at("2026-11-21T11:00:00Z")).await.unwrap(), Outcome::AlreadySent);
 }

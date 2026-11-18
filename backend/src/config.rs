@@ -8,6 +8,7 @@ use clap::Args;
 use crate::push::apns::Environment;
 use crate::routines::breath::BreathRules;
 use crate::routines::gym::GymRules;
+use crate::routines::weight::{Unit, WeightSettings};
 
 #[derive(Debug, Clone, Args)]
 pub struct DatabaseConfig {
@@ -125,6 +126,34 @@ pub struct ServeConfig {
     /// ...by this many seconds.
     #[arg(long, env = "LYFE_BREATH_STEP_SECONDS", default_value_t = BreathRules::DEFAULT_STEP_SECONDS, value_parser = clap::value_parser!(u32).range(1..=120))]
     pub breath_step_seconds: u32,
+
+    /// The unit weights are typed and shown in: `kg` or `lb`. Weights are
+    /// stored in grams, so changing it later changes only what is shown.
+    #[arg(long, env = "LYFE_WEIGHT_UNIT", default_value = "lb", value_parser = parse_unit)]
+    pub weight_unit: Unit,
+
+    /// When the morning weigh-in prompt goes out, in the owner's time zone
+    /// (`06:30`), or `off` for none.
+    #[arg(long, env = "LYFE_WEIGH_IN_AT", default_value = "06:30", value_parser = parse_prompt_at)]
+    pub weigh_in_at: PromptAt,
+}
+
+/// A time of day for a prompt, or none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptAt(pub Option<chrono::NaiveTime>);
+
+fn parse_prompt_at(text: &str) -> Result<PromptAt, String> {
+    let text = text.trim();
+    if text.eq_ignore_ascii_case("off") {
+        return Ok(PromptAt(None));
+    }
+    chrono::NaiveTime::parse_from_str(text, "%H:%M")
+        .map(|at| PromptAt(Some(at)))
+        .map_err(|_| "use a time like 06:30, or off".to_string())
+}
+
+fn parse_unit(text: &str) -> Result<Unit, String> {
+    Unit::parse(text).ok_or_else(|| "use kg or lb".to_string())
 }
 
 impl ServeConfig {
@@ -135,6 +164,10 @@ impl ServeConfig {
             advance_under_s: self.breath_advance_under_seconds,
             step_s: self.breath_step_seconds,
         }
+    }
+
+    pub fn weight_settings(&self) -> WeightSettings {
+        WeightSettings { unit: self.weight_unit, prompt_at: self.weigh_in_at.0 }
     }
 
     pub fn gym_rules(&self) -> GymRules {
@@ -163,5 +196,13 @@ mod tests {
         assert!(types.contains(&"indoor_rowing".to_string()));
         assert!(types.iter().all(|t| !t.contains(' ') && !t.is_empty()));
         assert!(!types.contains(&"walking".to_string()));
+    }
+
+    #[test]
+    fn the_weigh_in_time_is_a_time_of_day_or_off() {
+        assert_eq!(parse_prompt_at("06:30"), Ok(PromptAt(chrono::NaiveTime::from_hms_opt(6, 30, 0))));
+        assert_eq!(parse_prompt_at(" OFF "), Ok(PromptAt(None)));
+        assert!(parse_prompt_at("6.30").is_err());
+        assert!(parse_prompt_at("25:00").is_err());
     }
 }

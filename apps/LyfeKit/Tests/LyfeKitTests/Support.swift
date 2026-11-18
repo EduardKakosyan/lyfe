@@ -136,11 +136,35 @@ enum Fixture {
             """
     }
 
+    /// Weight in exactly the shape the backend sends: `weights` are
+    /// (date, value) pairs, oldest first, one a day; like the backend's,
+    /// the average needs three of the last seven days.
+    static func weight(_ weights: [(String, Double)] = [], unit: String = "kg", promptAt: String? = "06:30") -> String {
+        func number(_ value: Double?) -> String { value.map { String($0) } ?? "null" }
+        func average(upTo index: Int) -> Double? {
+            let window = weights[max(0, index - 6)...index].map(\.1)
+            guard window.count >= 3 else { return nil }
+            return (window.reduce(0, +) / Double(window.count) * 100).rounded() / 100
+        }
+        let days = weights.enumerated().map { index, entry in
+            #"{"date": "\#(entry.0)", "value": \#(entry.1), "average": \#(number(average(upTo: index)))}"#
+        }
+        let latest = weights.last.map { #"{"date": "\#($0.0)", "value": \#($0.1)}"# } ?? "null"
+        let now = weights.isEmpty ? nil : average(upTo: weights.count - 1)
+        let prompt = promptAt.map { "\"\($0)\"" } ?? "null"
+        return #"""
+            {"unit": "\#(unit)", "prompt_at": \#(prompt), "latest": \#(latest), "average": \#(number(now)),
+             "days_weighed": \#(min(weights.count, 7)), "change": null, "change_pct": null,
+             "days": [\#(days.joined(separator: ","))]}
+            """#
+    }
+
     static func home(
         done: Int = 1, sources: String = Fixture.sources(), streak: String? = nil, today: String = "2026-11-17",
-        serverReady: Bool? = nil, breath: String? = nil
+        serverReady: Bool? = nil, breath: String? = nil, weight: String? = nil
     ) -> String {
-        let breathJSON = breath.map { ", \"breath\": \($0)" } ?? ""
+        let breathJSON =
+            (breath.map { ", \"breath\": \($0)" } ?? "") + (weight.map { ", \"weight\": \($0)" } ?? "")
         let streakJSON = streak.map { ", \"streak\": \($0)" } ?? ""
         let notifications = serverReady.map { ", \"notifications\": {\"server_ready\": \($0)}" } ?? ""
         let all = [
@@ -188,6 +212,7 @@ struct World {
     let addresses: MemoryServerAddressStore
     let cache = HomeCache(directory: Fixture.temporaryDirectory())
     let breath = BreathStore(directory: Fixture.temporaryDirectory())
+    let weighIns = WeighInStore(directory: Fixture.temporaryDirectory())
     let clock = Date(timeIntervalSince1970: 1_795_000_000)
     /// The time the app sees; starts at `clock` and can be moved on.
     let time: TestClock
@@ -203,11 +228,12 @@ struct World {
         World(token: "device-token", address: "lyfe.example.ts.net:8444")
     }
 
-    func launch(transport: (any HTTPTransport)? = nil) -> AppModel {
+    func launch(transport: (any HTTPTransport)? = nil, ownerCheck: any OwnerCheck = NoOwnerCheck()) -> AppModel {
         let time = time
         return AppModel(
-            tokens: tokens, addresses: addresses, cache: cache, breath: breath, transport: transport ?? backend,
-            deviceName: "Test iPhone", now: { time.now })
+            tokens: tokens, addresses: addresses, cache: cache, breath: breath, weighIns: weighIns,
+            transport: transport ?? backend,
+            deviceName: "Test iPhone", ownerCheck: ownerCheck, now: { time.now })
     }
 }
 
@@ -245,5 +271,33 @@ final class RecordingCues: BreathCues {
 func eventually(_ done: @MainActor () -> Bool) async {
     for _ in 0..<2000 where !done() {
         await Task.yield()
+    }
+}
+
+/// A stand-in for Face ID: answers as told and counts how often it was asked.
+final class StubOwnerCheck: OwnerCheck, @unchecked Sendable {
+    private let lock = NSLock()
+    private var answer: Bool
+    private var available: Bool
+    private var count = 0
+
+    init(passes: Bool = true, available: Bool = true) {
+        answer = passes
+        self.available = available
+    }
+
+    var passes: Bool {
+        get { lock.withLock { answer } }
+        set { lock.withLock { answer = newValue } }
+    }
+
+    var asked: Int { lock.withLock { count } }
+    var isAvailable: Bool { lock.withLock { available } }
+
+    func confirm(reason: String) async -> Bool {
+        lock.withLock {
+            count += 1
+            return answer
+        }
     }
 }

@@ -42,6 +42,28 @@ public final class AppModel {
     /// Set when the backend answered but would not take a saved session.
     public private(set) var breathProblem: String?
 
+    /// Weights typed on this phone that the backend has not confirmed yet,
+    /// oldest first.
+    public private(set) var unsentWeighIns: [UUID]
+    /// Set when the backend would not take a weight that was typed.
+    public private(set) var weighInProblem: String?
+
+    /// The screens other than Home, for a signed-in owner.
+    public enum Screen: Equatable, Sendable {
+        case home
+        case progress
+    }
+
+    /// True while lyfe is waiting for Face ID. Set when it is opened and
+    /// each time it leaves the screen; everything it shows is behind it.
+    /// A weight typed into the morning prompt does not need it.
+    public private(set) var isLocked = false
+    private var isUnlocking = false
+
+    public private(set) var screen: Screen = .home
+    /// True while the weight entry is on screen.
+    public private(set) var isEnteringWeight = false
+
     /// Where Apple delivers notifications for this install, once known.
     private var apnsToken: String?
     /// The token the backend has for the current session.
@@ -53,6 +75,9 @@ public final class AppModel {
     private let addresses: any ServerAddressStore
     private let cache: HomeCache
     private let breath: BreathStore
+    private let weighIns: WeighInStore
+    private var isSendingWeighIns = false
+    private let ownerCheck: any OwnerCheck
     private let makeCues: @MainActor () -> any BreathCues
     private var isSendingBreath = false
     private let transport: any HTTPTransport
@@ -64,9 +89,11 @@ public final class AppModel {
         addresses: any ServerAddressStore,
         cache: HomeCache,
         breath: BreathStore,
+        weighIns: WeighInStore,
         transport: any HTTPTransport,
         deviceName: String,
         defaultServerAddress: String = "",
+        ownerCheck: any OwnerCheck = NoOwnerCheck(),
         cues: @escaping @MainActor () -> any BreathCues = { SilentCues() },
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
@@ -74,6 +101,8 @@ public final class AppModel {
         self.addresses = addresses
         self.cache = cache
         self.breath = breath
+        self.weighIns = weighIns
+        self.ownerCheck = ownerCheck
         makeCues = cues
         self.transport = transport
         self.deviceName = deviceName
@@ -90,19 +119,25 @@ public final class AppModel {
         home = hasSession ? cached?.snapshot : nil
         homeFetchedAt = hasSession ? cached?.fetchedAt : nil
         unsentBreath = breath.outbox().map(\.id)
+        unsentWeighIns = weighIns.outbox().map(\.id)
         pickUpBreathSession()
+        lock()
     }
 
     /// The app wired to the real Keychain, disk and network.
-    public static func live(deviceName: String, defaultServerAddress: String = "") -> AppModel {
+    public static func live(
+        deviceName: String, defaultServerAddress: String = "", ownerCheck: any OwnerCheck = DeviceOwnerCheck()
+    ) -> AppModel {
         AppModel(
             tokens: KeychainTokenStore(),
             addresses: DefaultsServerAddressStore(),
             cache: .standard(),
             breath: .standard(),
+            weighIns: .standard(),
             transport: TailnetTransport.live(),
             deviceName: deviceName,
             defaultServerAddress: defaultServerAddress,
+            ownerCheck: ownerCheck,
             cues: { ToneCues() }
         )
     }
@@ -171,6 +206,31 @@ public final class AppModel {
         forgetSession()
     }
 
+    // MARK: The lock
+
+    /// Puts lyfe behind Face ID. Called when it starts and whenever it
+    /// leaves the screen. Not while signed out, where the password is the
+    /// lock; not on a device that cannot check; and not while a breath
+    /// session is running, whose next tap must not wait for a face.
+    public func lock() {
+        guard phase == .signedIn, ownerCheck.isAvailable, breathSession?.isRunning != true else { return }
+        isLocked = true
+    }
+
+    /// Asks for Face ID and opens lyfe if it is the owner.
+    public func unlock() async {
+        guard isLocked, !isUnlocking else { return }
+        isUnlocking = true
+        defer { isUnlocking = false }
+        guard ownerCheck.isAvailable else {
+            isLocked = false
+            return
+        }
+        if await ownerCheck.confirm(reason: "Open lyfe") {
+            isLocked = false
+        }
+    }
+
     // MARK: Notifications
 
     /// Called when Apple hands the app its device token, which happens on
@@ -214,6 +274,10 @@ public final class AppModel {
         offlineReason = nil
         refreshProblem = nil
         breathProblem = nil
+        weighInProblem = nil
+        screen = .home
+        isEnteringWeight = false
+        isLocked = false
         phase = .signedOut
     }
 
@@ -227,6 +291,7 @@ public final class AppModel {
         defer { isRefreshing = false }
         await sendPushToken()
         await sendUnsentBreath()
+        await sendUnsentWeighIns()
         guard phase == .signedIn else { return }
         do {
             try await loadHome(api, token)
@@ -358,5 +423,93 @@ public final class AppModel {
     private func confirmed(_ id: UUID) {
         breath.remove(id)
         unsentBreath.removeAll { $0 == id }
+    }
+
+    // MARK: Progress and weigh-ins
+
+    public func openProgress() {
+        screen = .progress
+    }
+
+    public func closeProgress() {
+        isEnteringWeight = false
+        screen = .home
+    }
+
+    /// Opens the weight entry over Progress. Also what tapping the morning
+    /// prompt itself does, rather than typing into it.
+    public func openWeighIn() {
+        screen = .progress
+        isEnteringWeight = true
+    }
+
+    public func closeWeighIn() {
+        isEnteringWeight = false
+    }
+
+    /// The unit lyfe shows weights in, as the backend last said.
+    public var weightUnit: String {
+        home?.weight?.unit ?? "lb"
+    }
+
+    /// Takes a weight the owner typed, into the morning prompt or the app.
+    /// It is kept on this phone before anything is sent, then sent at once;
+    /// with no connection it waits for the next refresh. Says what became
+    /// of it, so a reply that was not a weight can be asked for again.
+    @discardableResult
+    public func recordWeight(_ text: String) async -> WeighInOutcome {
+        guard let typed = TypedWeight(text, unit: weightUnit) else { return .unreadable }
+        let weighIn = WeighIn(measuredAt: now(), value: typed.value, unit: typed.unit)
+        weighIns.enqueue(weighIn)
+        unsentWeighIns.append(weighIn.id)
+        let refused = await sendUnsentWeighIns()
+        if refused.contains(weighIn.id) { return .refused }
+        return unsentWeighIns.contains(weighIn.id) ? .saved : .sent
+    }
+
+    /// Sends every weigh-in the backend has not confirmed, oldest first,
+    /// and shows the state it answers with. Each carries its own id, so one
+    /// that was received but whose answer was lost is not stored twice.
+    /// Returns the ones the backend refused, which are dropped: sending
+    /// them again would never work.
+    @discardableResult
+    public func sendUnsentWeighIns() async -> Set<UUID> {
+        guard phase == .signedIn, !isSendingWeighIns, let api, let token else { return [] }
+        isSendingWeighIns = true
+        defer { isSendingWeighIns = false }
+        var refused: Set<UUID> = []
+        for weighIn in weighIns.outbox() {
+            do {
+                show(try await api.recordWeighIn(token: token, weighIn: weighIn))
+                confirmedWeighIn(weighIn.id)
+                weighInProblem = nil
+            } catch LyfeAPIError.unreadableResponse {
+                // The backend took it; only its answer could not be read.
+                confirmedWeighIn(weighIn.id)
+                refreshProblem = "The server's answer could not be read. The app may be older than the server."
+            } catch LyfeAPIError.unauthorized {
+                forgetSession()
+                break
+            } catch LyfeAPIError.unreachable(let why) {
+                isOffline = true
+                offlineReason = why
+                break
+            } catch LyfeAPIError.server(let status) where (400..<500).contains(status) {
+                confirmedWeighIn(weighIn.id)
+                refused.insert(weighIn.id)
+                weighInProblem = "The server would not take the weight \(WeightText.number(weighIn.value)) \(weighIn.unit) (\(status))."
+            } catch LyfeAPIError.server(let status) {
+                weighInProblem = "The server could not store a weight just now (\(status)). It stays on this phone."
+                break
+            } catch {
+                break
+            }
+        }
+        return refused
+    }
+
+    private func confirmedWeighIn(_ id: UUID) {
+        weighIns.remove(id)
+        unsentWeighIns.removeAll { $0 == id }
     }
 }

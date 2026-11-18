@@ -2,14 +2,14 @@
 
 A private app that keeps three routines going: gym, breath training and food logging. What it is and why is in `CONTEXT.md`, `docs/adr/` and `docs/build-plan.md`.
 
-Built so far: steps 1 to 3 of the build plan. A strength session recorded on the watch shows up as a filled square on the Home screen, with nothing entered in lyfe. The gym band shows the streak in weeks, with recovery after a missed week, and the backend can prompt the phone when a streak needs sessions. A breath session runs in the app, one tap per hold, and the backend sets the next table from it.
+Built so far: steps 1 to 4 of the build plan. A strength session recorded on the watch shows up as a filled square on the Home screen, with nothing entered in lyfe. The gym band shows the streak in weeks, with recovery after a missed week, and the backend can prompt the phone when a streak needs sessions. A breath session runs in the app, one tap per hold, and the backend sets the next table from it. A morning prompt takes your weight typed into the notification itself, and Progress shows the seven-day average as a line. lyfe asks for Face ID each time it is opened.
 
 ## Layout
 
 | Folder | What it is |
 |---|---|
-| `backend/` | The Rust backend: API, sign-in, Garmin poller, gym, breath and streak rules, notifications. The single authority for what counts. |
-| `apps/LyfeKit/` | Swift package shared by the iPhone app and the later Mac app: API client, local storage, app model, breath timer, Poster screens. |
+| `backend/` | The Rust backend: API, sign-in, Garmin poller, gym, breath, weight and streak rules, notifications. The single authority for what counts. |
+| `apps/LyfeKit/` | Swift package shared by the iPhone app and the later Mac app: API client, local storage, app model, breath timer, weigh-ins, Poster screens. |
 | `apps/Lyfe/` | The iPhone app target. It only launches LyfeKit. |
 | `deploy/spark/` | Scripts and service files for running the backend on the Spark. |
 
@@ -69,12 +69,37 @@ The method is fixed rounds: every round has the same length and starts with a ho
 
 The first table and the two thresholds are settings (`LYFE_BREATH_START_ROUND_SECONDS`, `LYFE_BREATH_ROUNDS`, `LYFE_BREATH_ADVANCE_UNDER_SECONDS`, `LYFE_BREATH_STEP_SECONDS`); the defaults are six rounds of 4:00.
 
+## Weigh-ins
+
+The scale is not connected, so the weight is typed, normally straight into the morning prompt without opening lyfe. The backend decides what the numbers mean (`backend/src/routines/weight.rs`).
+
+- **The prompt.** One notification a day at 06:30 in your time zone. Press and hold it, type the weight, tap Save. It needs no unlock and lyfe does not come forward. If the server was not running at 06:30 the prompt still goes out until 09:30, and not after; it is a morning weigh-in. It is skipped once today has a weight, and there is never a second one that day.
+- **Not a streak.** A missed morning costs nothing and nothing nags about it.
+- **What was typed.** `181.4`, `181,4` and `181.4 lb` all read the same; a unit typed after the number wins (`82.4 kg` on a server set to pounds is stored as the same weight). Anything under 44 lb or over 880 lb (20 to 400 kg) is a slip and is refused; a reply that is not a weight brings the prompt straight back, asking again.
+- **Offline.** A weight is written to the phone before it is sent, with an id made on the phone, so a reply typed without a connection is sent the next time lyfe opens and is never stored twice.
+- **The numbers.** A day's weight is the last one typed that day, so typing it again corrects it. The seven-day average covers the days of the last seven that have a weight, and is shown once at least three do. Progress shows it as the giant figure and as a line over eight weeks, each morning's weight as a small square, with the change on the week before.
+- **In the app.** Home's weight strip opens Progress; the black bar there opens the entry, for a morning the prompt was missed or switched off. Tapping the prompt instead of typing into it opens the same entry.
+
+The unit and the prompt's time are settings (`LYFE_WEIGHT_UNIT`, `lb` unless set to `kg`; `LYFE_WEIGH_IN_AT`, a time like `06:30` or `off`). Weights are stored in grams, so changing the unit changes only what is shown. The weight itself is never written to the server log.
+
+## The lock
+
+lyfe asks for Face ID, with the passcode behind it, each time it is opened (`AppModel.lock`, `apps/LyfeKit/Sources/LyfeKit/Store/OwnerCheck.swift`).
+
+- It locks when it starts and every time it leaves the screen, so the picture iOS keeps for the app switcher is the lock screen, not your week.
+- A weight typed into the morning prompt does not need it: that only adds a number from the lock screen and shows nothing.
+- A running breath session is not locked away. The phone can be locked and woken mid-session, and the next tap lands without waiting for a face. It locks again once the session is over and lyfe leaves the screen.
+- Signed out, the password is the lock; just after typing it you are not asked for a face as well.
+- A device with no passcode cannot check, and lyfe then opens without asking.
+
 ## Notifications
 
 The backend decides when to prompt; the phone only shows what arrives. Each weekly routine, the gym and breath training, is looked at on its own. A prompt is sent only when a streak is alive and today is a day to act on it:
 
 - **Train today**: every day left this week is needed to reach four, and today has no session yet. Sent once that day.
 - **Recovery open**: last week was missed and this week recovers it. Sent once that week.
+
+The morning weigh-in prompt (above) has its own time and is not held to this window.
 
 Nothing is sent when there is slack left in the week, when the week is already out of reach, when no streak is alive, or outside 07:00 to 18:00 (`LYFE_NOTIFY_FROM_HOUR`, `LYFE_NOTIFY_UNTIL_HOUR`). Garmin is checked again just before a gym prompt, so a session recorded that morning cancels it. A breath session still waiting on the phone to be sent is not known to the backend, so it can be prompted for.
 
@@ -136,7 +161,7 @@ xcrun devicectl device process launch --console --terminate-existing \
 
 It prints what the system and Tailscale each answer for the server's name and whether the backend replied, then quits.
 
-A debug build launched with `LYFE_DEBUG_GALLERY` set shows the gym and breath bands in every streak state with made-up numbers (`LYFE_DEBUG_GALLERY=3` skips the first three). `LYFE_DEBUG_BREATH` set to `ready`, `leadin`, `hold`, `beaten`, `recover`, `done` or `offline` shows that breath screen. `LYFE_DEBUG_BREATH_RUN=12` runs the next session by itself with 12-second holds; it plays the tones and records the session, so use it against a local backend with the sound down.
+A debug build launched with `LYFE_DEBUG_GALLERY` set shows the gym and breath bands in every streak state with made-up numbers (`LYFE_DEBUG_GALLERY=3` skips the first three). `LYFE_DEBUG_BREATH` set to `ready`, `leadin`, `hold`, `beaten`, `recover`, `done` or `offline` shows that breath screen. `LYFE_DEBUG_PROGRESS` set to `full`, `new`, `empty`, `entry` or `kg` shows Progress or the weight entry with made-up weights. `LYFE_DEBUG_UNLOCKED` opens lyfe without Face ID, `LYFE_DEBUG_LOCKED` keeps it on the lock screen, and `LYFE_DEBUG_LOCKED=open` lets the lock open by itself each time, for trying it in the simulator. `LYFE_DEBUG_BREATH_RUN=12` runs the next session by itself with 12-second holds; it plays the tones and records the session, so use it against a local backend with the sound down.
 
 The tests that need a real server are skipped unless told where one is: `LYFE_LIVE_SERVER=<name>:8444@<tailnet address> swift test`. `LYFE_LOCAL_SERVER=http://127.0.0.1:8787 LYFE_LOCAL_PASSWORD=<password> swift test` runs the app's client against a backend on this machine; it records a breath session, so give that backend a scratch database.
 

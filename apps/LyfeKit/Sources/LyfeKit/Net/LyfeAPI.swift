@@ -90,6 +90,15 @@ public struct LyfeAPI: Sendable {
         return try await call("POST", "v1/breath/sessions", token: token, body: body, timeout: 20)
     }
 
+    /// Hands the backend a weight the owner typed. It answers with Home as
+    /// it now stands. Sending the same weigh-in again changes nothing.
+    /// Kept short: it may be running behind the lock screen, where the
+    /// system allows only a few seconds.
+    public func recordWeighIn(token: String, weighIn: WeighIn) async throws -> HomeSnapshot {
+        let body = try JSONEncoder.lyfe.encode(weighIn)
+        return try await call("POST", "v1/weigh-ins", token: token, body: body, timeout: 12)
+    }
+
     /// Asks the backend to check Garmin now. Can take as long as Garmin does.
     public func sync(token: String) async throws -> Sources {
         try await call("POST", "v1/sync", token: token, body: nil, timeout: 45)

@@ -6,12 +6,9 @@ import UIKit
 struct LyfeApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @Environment(\.scenePhase) private var scenePhase
-    @State private var model = AppModel.live(
-        deviceName: UIDevice.current.name,
-        // Set per machine in Local.xcconfig, so the address is not in the
-        // repository and does not have to be typed on the phone.
-        defaultServerAddress: Bundle.main.object(forInfoDictionaryKey: "LyfeDefaultServer") as? String ?? ""
-    )
+    /// Owned by the app delegate, which also takes weights typed into the
+    /// morning prompt while lyfe has no screen.
+    private var model: AppModel { delegate.model }
 
     var body: some Scene {
         WindowGroup {
@@ -19,9 +16,6 @@ struct LyfeApp: App {
                 // Once signed in, and again whenever the app comes forward,
                 // since notifications can be switched off in Settings.
                 .task(id: "\(model.phase) \(scenePhase == .active)") {
-                    delegate.onDeviceToken = { token in
-                        Task { await model.setPushToken(token) }
-                    }
                     if model.phase == .signedIn, scenePhase == .active, !runsItself {
                         await enableNotifications(for: model)
                     }
@@ -52,6 +46,8 @@ struct LyfeApp: App {
                 StreakGallery(skipping: Int(gallery) ?? 0)
             } else if let screen = ProcessInfo.processInfo.environment["LYFE_DEBUG_BREATH"] {
                 BreathGallery(screen: screen)
+            } else if let screen = ProcessInfo.processInfo.environment["LYFE_DEBUG_PROGRESS"] {
+                ProgressGallery(screen: screen)
             } else {
                 RootView(model: model)
             }

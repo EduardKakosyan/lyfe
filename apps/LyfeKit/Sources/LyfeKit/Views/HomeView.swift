@@ -51,6 +51,14 @@ public struct HomeView: View {
                             }
                         }
                         SessionRows(home: home)
+                        Button {
+                            model.openProgress()
+                        } label: {
+                            WeightStrip(weight: home.weight)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityHint("Opens Progress")
+                        PosterRule()
                         signOutButton
                     }
                 }
@@ -79,6 +87,11 @@ public struct HomeView: View {
             notices.append(problem)
         } else if !model.unsentBreath.isEmpty {
             notices.append(HomeText.unsentBreath(model.unsentBreath.count))
+        }
+        if let problem = model.weighInProblem {
+            notices.append(problem)
+        } else if !model.unsentWeighIns.isEmpty {
+            notices.append(WeightText.unsent(model.unsentWeighIns.count))
         }
         return notices
     }
@@ -385,6 +398,22 @@ struct SessionRows: View {
                     .padding(.vertical, 12)
             }
         }
+    }
+}
+
+/// The way to Progress, with the weight trend as it stands.
+struct WeightStrip: View {
+    let weight: WeightTrend?
+
+    var body: some View {
+        HStack {
+            Text(WeightText.homeLine(weight)).posterLabel()
+            Spacer()
+            Text("Progress →").posterLabel()
+        }
+        .padding(.horizontal, Poster.margin)
+        .padding(.vertical, 11)
+        .contentShape(Rectangle())
     }
 }
 

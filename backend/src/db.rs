@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::routines::breath;
 use crate::routines::gym::Activity;
+use crate::routines::weight::{self, Unit};
 
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
@@ -363,6 +364,55 @@ pub async fn breath_sessions(pool: &PgPool, timezone: chrono_tz::Tz) -> sqlx::Re
                     .zip(holds)
                     .map(|(round, hold_ms)| breath::Hold { round: round as u32, hold_ms: hold_ms as u32 })
                     .collect(),
+            }
+        })
+        .collect())
+}
+
+// --- Weigh-ins -----------------------------------------------------------
+
+/// A weight as the phone captured it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredWeighIn {
+    pub id: Uuid,
+    pub measured_at: DateTime<Utc>,
+    pub grams: i32,
+    /// The unit it was typed in.
+    pub unit: Unit,
+}
+
+/// Stores a weigh-in. Returns false, and changes nothing, when one with
+/// this id is already stored.
+pub async fn insert_weigh_in(pool: &PgPool, weigh_in: &StoredWeighIn, device_session_id: i64) -> sqlx::Result<bool> {
+    let result = sqlx::query(
+        "insert into weigh_ins (id, measured_at, grams, unit, device_session_id)
+         values ($1, $2, $3, $4, $5)
+         on conflict (id) do nothing",
+    )
+    .bind(weigh_in.id)
+    .bind(weigh_in.measured_at)
+    .bind(weigh_in.grams)
+    .bind(weigh_in.unit.as_str())
+    .bind(device_session_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Every weigh-in, oldest first, with its time read in the owner's time
+/// zone.
+pub async fn weigh_ins(pool: &PgPool, timezone: chrono_tz::Tz) -> sqlx::Result<Vec<weight::WeighIn>> {
+    let rows = sqlx::query("select id, measured_at, grams from weigh_ins order by measured_at, id")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let measured_at: DateTime<Utc> = r.get("measured_at");
+            weight::WeighIn {
+                id: r.get("id"),
+                measured_local: measured_at.with_timezone(&timezone).naive_local(),
+                grams: r.get::<i32, _>("grams") as u32,
             }
         })
         .collect())

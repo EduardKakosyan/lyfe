@@ -111,6 +111,7 @@ fn notifier(config: &ServeConfig, pool: &sqlx::PgPool, syncer: Arc<Syncer>) -> a
         gym_rules: Arc::new(config.gym_rules()),
         from_hour: push.notify_from_hour,
         until_hour: push.notify_until_hour,
+        weight: config.weight_settings(),
     }))
 }
 
@@ -139,6 +140,7 @@ async fn serve(config: ServeConfig) -> anyhow::Result<()> {
                 tracing::info!(
                     from_hour = notifier.from_hour,
                     until_hour = notifier.until_hour,
+                    weigh_in_at = ?notifier.weight.prompt_at.map(|at| at.format("%H:%M").to_string()),
                     "notifications are on"
                 );
                 tokio::spawn(Arc::new(notifier).run_forever(Duration::from_secs(300)));
@@ -162,6 +164,7 @@ async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         timezone: config.timezone,
         gym_rules: Arc::new(config.gym_rules()),
         breath_rules: Arc::new(config.breath_rules()),
+        weight: config.weight_settings(),
         push_ready,
         now: Arc::new(Utc::now),
     };
@@ -303,6 +306,7 @@ async fn push_test(config: ServeConfig) -> anyhow::Result<()> {
         body: "Test notification. Prompts will arrive like this.".to_string(),
         collapse_id: "test".to_string(),
         expires_at: now + chrono::Duration::minutes(10),
+        category: None,
     };
     let delivered = notifier.deliver(&targets, &alert, now).await;
     println!("Apple accepted the test for {delivered} of {} devices.", targets.len());

@@ -22,6 +22,7 @@ use crate::garmin::sync::{Syncer, SOURCE as GARMIN};
 use crate::routines::breath::{self, BreathRules};
 use crate::routines::gym::{self, GymRules, GymSession, GymStreak, Week};
 use crate::routines::weekly::WeekStreak;
+use crate::routines::weight::{self, Unit, WeightSettings, WeightTrend};
 
 /// How recent a Garmin poll must be for an app refresh to skip polling again.
 const REFRESH_MIN_AGE: Duration = Duration::from_secs(30);
@@ -36,6 +37,7 @@ pub struct AppState {
     pub timezone: chrono_tz::Tz,
     pub gym_rules: Arc<GymRules>,
     pub breath_rules: Arc<BreathRules>,
+    pub weight: WeightSettings,
     /// Whether this server can send notifications (it has Apple's key).
     pub push_ready: bool,
     pub now: Clock,
@@ -50,6 +52,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/push-token", post(set_push_token))
         .route("/v1/home", get(home))
         .route("/v1/breath/sessions", post(record_breath_session))
+        .route("/v1/weigh-ins", post(record_weigh_in))
         .with_state(state)
 }
 
@@ -222,6 +225,7 @@ struct HomeResponse {
     week: Week,
     gym: GymWeek,
     breath: BreathWeek,
+    weight: WeightTrend,
     sources: Sources,
     notifications: Notifications,
 }
@@ -335,6 +339,7 @@ async fn home_now(state: &AppState) -> Result<HomeResponse, ApiError> {
             streak,
         },
         breath: breath_week(state, today).await?,
+        weight: weight::trend(&state.weight, today, &db::weigh_ins(&state.pool, state.timezone).await?),
         sources: Sources { garmin: garmin_status(state).await? },
         notifications: Notifications { server_ready: state.push_ready },
     })
@@ -428,6 +433,41 @@ async fn record_breath_session(
     };
     if db::insert_breath_session(&state.pool, &session, device.session_id).await? {
         tracing::info!(id = %session.id, holds = session.holds.len(), "breath session recorded");
+    }
+    Ok(Json(home_now(&state).await?))
+}
+
+// --- Weigh-ins -----------------------------------------------------------
+
+#[derive(Deserialize)]
+struct WeighInRequest {
+    /// Made on the phone when the weight is typed. Sending the same weigh-in
+    /// again changes nothing.
+    id: Uuid,
+    measured_at: DateTime<Utc>,
+    /// As typed, in `unit`.
+    value: f64,
+    unit: String,
+}
+
+/// Stores a weight typed on the phone, usually into the morning prompt,
+/// and answers with Home as it now stands, the weight trend included.
+async fn record_weigh_in(
+    State(state): State<AppState>,
+    device: Device,
+    Json(request): Json<WeighInRequest>,
+) -> Result<Json<HomeResponse>, ApiError> {
+    let unit = Unit::parse(&request.unit).ok_or(ApiError::BadRequest("unit must be kg or lb"))?;
+    let grams = unit
+        .to_grams(request.value)
+        .ok_or(ApiError::BadRequest("that is not a weight: use one between 20 and 400 kg"))?;
+    if request.measured_at > (state.now)() + chrono::Duration::days(1) {
+        return Err(ApiError::BadRequest("measured_at is in the future"));
+    }
+    let weigh_in = db::StoredWeighIn { id: request.id, measured_at: request.measured_at, grams: grams as i32, unit };
+    if db::insert_weigh_in(&state.pool, &weigh_in, device.session_id).await? {
+        // The weight itself is not logged; it is the owner's.
+        tracing::info!(id = %weigh_in.id, "weigh-in recorded");
     }
     Ok(Json(home_now(&state).await?))
 }

@@ -25,6 +25,9 @@ targets:
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         UILaunchScreen: {}
+        # Shown the first time lyfe asks for Face ID, which it does each
+        # time it is opened.
+        NSFaceIDUsageDescription: lyfe asks for Face ID each time it is opened, so only you see your routines and weight.
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
         # The breath timer's tones keep playing, and its rounds keep
