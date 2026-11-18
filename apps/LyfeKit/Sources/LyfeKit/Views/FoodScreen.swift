@@ -359,7 +359,8 @@ struct TargetBar: View {
 }
 
 /// One line of the day or of the saved meals: a mark, a name with a line
-/// under it, and its calories.
+/// under it, and its calories, with the meal's illustration beside them
+/// once it has been drawn.
 struct FoodRow: View {
     let row: FoodText.Row
     /// A saved meal waiting to be tapped, marked with a plus.
@@ -383,6 +384,12 @@ struct FoodRow: View {
                 Text(row.label).posterLabel().lineLimit(2).multilineTextAlignment(.leading)
             }
             Spacer(minLength: 8)
+            // Left of the figure, so figures line up with or without one.
+            if let picture = row.picture {
+                MealIllustration(id: picture)
+                    .frame(width: 40, height: 40)
+                    .padding(.vertical, -6)
+            }
             Text(row.value)
                 .font(.system(size: 15, weight: .heavy))
                 .monospacedDigit()
@@ -593,6 +600,8 @@ public enum FoodText {
         var dim = false
         /// What tapping it does.
         var tap: RowTap = .none
+        /// The meal whose illustration is shown on the row, once drawn.
+        var picture: UUID? = nil
 
         var spoken: String {
             let figure =
@@ -646,6 +655,12 @@ public enum FoodText {
     /// estimated, outlined with a question mark while its figures are not
     /// known.
     static func entryRow(_ entry: FoodDay.Entry) -> Row {
+        var row = figuresRow(entry)
+        row.picture = entry.illustrationID
+        return row
+    }
+
+    private static func figuresRow(_ entry: FoodDay.Entry) -> Row {
         let id = "entry-\(entry.id)"
         switch (entry.from, entry.figures ?? .known) {
         case (.photo, .estimating):

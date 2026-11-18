@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use clap::Args;
 
 use crate::estimator::EstimatorSettings;
+use crate::illustrator::IllustratorSettings;
 use crate::push::apns::Environment;
 use crate::routines::breath::BreathRules;
 use crate::routines::food::FoodSettings;
@@ -129,6 +130,47 @@ impl PhotoConfig {
 }
 
 #[derive(Debug, Clone, Args)]
+pub struct IllustrationConfig {
+    /// The program that draws meal photos as Poster illustrations with the
+    /// image model on this machine (installed by `lyfe-illustrator-setup`),
+    /// or `off` for none: meals then keep their photos. A leading `~/` is
+    /// the home folder.
+    #[arg(long, env = "LYFE_ILLUSTRATOR", default_value = "~/bin/lyfe-illustrate")]
+    pub illustrator: String,
+
+    /// The illustrator is not started unless this many GB of memory are free.
+    #[arg(long, env = "LYFE_ILLUSTRATION_MIN_FREE_GB", default_value_t = 24, value_parser = clap::value_parser!(u32).range(0..=1024))]
+    pub illustration_min_free_gb: u32,
+
+    /// Seconds the illustrator stays loaded after the last photo, so meals
+    /// logged together are drawn together.
+    #[arg(long, env = "LYFE_ILLUSTRATION_KEEP_ALIVE_SECONDS", default_value_t = 180, value_parser = clap::value_parser!(u32).range(0..=3600))]
+    pub illustration_keep_alive_seconds: u32,
+}
+
+impl IllustrationConfig {
+    pub fn illustrator_settings(&self) -> IllustratorSettings {
+        let program = self.illustrator.trim();
+        let program = (!program.eq_ignore_ascii_case("off") && !program.is_empty())
+            .then(|| vec![home_relative(program, std::env::var_os("HOME"))]);
+        IllustratorSettings {
+            program,
+            min_free_gb: self.illustration_min_free_gb,
+            keep_alive: std::time::Duration::from_secs(u64::from(self.illustration_keep_alive_seconds)),
+            ..IllustratorSettings::default()
+        }
+    }
+}
+
+/// `path` with a leading `~/` read as the home folder.
+fn home_relative(path: &str, home: Option<std::ffi::OsString>) -> String {
+    match (path.strip_prefix("~/"), home) {
+        (Some(rest), Some(home)) => PathBuf::from(home).join(rest).to_string_lossy().into_owned(),
+        _ => path.to_string(),
+    }
+}
+
+#[derive(Debug, Clone, Args)]
 pub struct ServeConfig {
     #[command(flatten)]
     pub database: DatabaseConfig,
@@ -141,6 +183,9 @@ pub struct ServeConfig {
 
     #[command(flatten)]
     pub photo: PhotoConfig,
+
+    #[command(flatten)]
+    pub illustration: IllustrationConfig,
 
     /// Address to listen on. Keep it on loopback and publish it to the
     /// tailnet with `tailscale serve`.
@@ -249,6 +294,24 @@ pub fn parse_types(list: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_illustrator_is_found_in_the_home_folder_or_switched_off() {
+        let home = Some(std::ffi::OsString::from("/home/lyfe"));
+        assert_eq!(home_relative("~/bin/lyfe-illustrate", home.clone()), "/home/lyfe/bin/lyfe-illustrate");
+        assert_eq!(home_relative("/opt/lyfe-illustrate", home), "/opt/lyfe-illustrate");
+        assert_eq!(home_relative("~/bin/lyfe-illustrate", None), "~/bin/lyfe-illustrate");
+        let config = |illustrator: &str| IllustrationConfig {
+            illustrator: illustrator.into(),
+            illustration_min_free_gb: 24,
+            illustration_keep_alive_seconds: 180,
+        };
+        assert_eq!(config("off").illustrator_settings().program, None);
+        assert_eq!(config(" OFF ").illustrator_settings().program, None);
+        let settings = config("/opt/lyfe-illustrate").illustrator_settings();
+        assert_eq!(settings.program, Some(vec!["/opt/lyfe-illustrate".to_string()]));
+        assert_eq!(settings.keep_alive, std::time::Duration::from_secs(180));
+    }
 
     #[test]
     fn default_types_parse_cleanly() {

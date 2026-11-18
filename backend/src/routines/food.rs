@@ -311,6 +311,8 @@ pub struct PhotoDetail {
     pub note: String,
     /// False for a meal described without a photo.
     pub has_photo: bool,
+    /// Whether the photo has been drawn as a Poster illustration yet.
+    pub illustrated: bool,
     /// What the model saw; empty until it has answered.
     pub items: Vec<photo::Item>,
     /// Whether the model judged it fried, sauced or from a restaurant.
@@ -679,6 +681,9 @@ pub struct WeighedView {
 pub struct PhotoView {
     pub note: String,
     pub has_photo: bool,
+    /// Whether the photo's illustration can be fetched; until it can, and
+    /// if it never can, the app shows the photo.
+    pub illustrated: bool,
     pub items: Vec<ItemView>,
     /// Whether to ask how much oil or sauce went in.
     pub oil_asked: bool,
@@ -805,6 +810,7 @@ fn entry_view(entry: &Entry, range_pct: u32) -> EntryView {
                 Some(PhotoView {
                     note: detail.note.clone(),
                     has_photo: detail.has_photo,
+                    illustrated: detail.illustrated,
                     items: detail
                         .items
                         .iter()

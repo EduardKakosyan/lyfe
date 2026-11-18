@@ -562,6 +562,17 @@ struct CapturesAgainstARealBackendTests {
         await other.signIn(password: environment["LYFE_LOCAL_PASSWORD"] ?? "")
         #expect(await other.mealPhoto(id) == jpeg)
 
+        // Drawn by the illustrator once the estimate is in (the stand-in on
+        // this Mac answers at once), and fetched as a PNG.
+        for _ in 0..<40 where entry.photo?.illustrated != true {
+            try await Task.sleep(for: .milliseconds(250))
+            await model.reloadHome()
+            entry = try #require(model.home?.food?.entries.first { $0.id == id })
+        }
+        #expect(entry.illustrationID == id, "set LYFE_ILLUSTRATOR to the stand-in (see the README)")
+        let png = try #require(await model.mealIllustration(id))
+        #expect(png.starts(with: [0x89, 0x50, 0x4E, 0x47]))
+
         #expect(await model.correctEstimate(id, .portions(grams: [300, 120], oil: .nothing)) == nil)
         entry = try #require(model.home?.food?.entries.first { $0.id == id })
         #expect((entry.kcal, entry.photo?.oil) == (588, Oil.nothing))

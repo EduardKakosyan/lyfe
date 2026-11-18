@@ -202,6 +202,8 @@ public struct PhotoMealView: View {
 public struct EstimateView: View {
     let entry: FoodDay.Entry
     let loadPhoto: () async -> Data?
+    /// The photo drawn as a Poster illustration, once it has been.
+    let loadIllustration: () async -> Data?
     let onCorrect: (LyfeAPI.EstimateChange) async -> String?
     /// Fetches the day again, to follow an estimate still being made.
     let onReload: () async -> Void
@@ -212,6 +214,9 @@ public struct EstimateView: View {
     private let inMeal: Bool
 
     @State private var photo: Data?
+    @State private var drawing: Data?
+    /// The photo shown in place of its drawing, after a tap.
+    @State private var showingPhoto = false
     @State private var changing: Int?
     @State private var grams = ""
     @State private var typing = false
@@ -223,12 +228,14 @@ public struct EstimateView: View {
 
     public init(
         entry: FoodDay.Entry, inMeal: Bool = false, loadPhoto: @escaping () async -> Data?,
+        loadIllustration: @escaping () async -> Data? = { nil },
         onCorrect: @escaping (LyfeAPI.EstimateChange) async -> String?, onReload: @escaping () async -> Void,
         onTakeBack: @escaping () async -> String?, onClose: @escaping () -> Void
     ) {
         self.inMeal = inMeal
         self.entry = entry
         self.loadPhoto = loadPhoto
+        self.loadIllustration = loadIllustration
         self.onCorrect = onCorrect
         self.onReload = onReload
         self.onTakeBack = onTakeBack
@@ -236,6 +243,9 @@ public struct EstimateView: View {
     }
 
     private var detail: FoodDay.PhotoDetail? { entry.photo }
+    private var awaitingDrawing: Bool {
+        entry.figures != .estimating && detail?.hasPhoto == true && detail?.illustrated != true
+    }
 
     public var body: some View {
         VStack(spacing: 0) {
@@ -284,6 +294,21 @@ public struct EstimateView: View {
         .foregroundStyle(Poster.ink)
         .background(Poster.paper.ignoresSafeArea())
         .task { photo = await loadPhoto() }
+        .task(id: detail?.illustrated == true) {
+            if detail?.illustrated == true { drawing = await loadIllustration() }
+        }
+        // Estimated and not drawn yet: look again now and then for a while,
+        // so the drawing takes the photo's place without leaving the
+        // screen. Loading the image model can take a couple of minutes.
+        .task(id: awaitingDrawing) {
+            var looks = 0
+            while awaitingDrawing, looks < 20, !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(15))
+                guard !Task.isCancelled else { return }
+                await onReload()
+                looks += 1
+            }
+        }
         // While the model is at it, look again every few seconds.
         .task(id: entry.figures) {
             while entry.figures == .estimating, !Task.isCancelled {
@@ -305,16 +330,25 @@ public struct EstimateView: View {
         }
     }
 
+    /// The illustration once drawn, else the photo; a tap swaps them.
     private var shot: some View {
-        ZStack(alignment: .bottomLeading) {
-            // The picture fills the frame without setting its size, so the
-            // line stays at the bottom of what is seen.
-            Rectangle().fill(Poster.ink).overlay {
-                if let photo, let image = pictureImage(photo) {
-                    image.resizable().scaledToFill()
+        let drawn = drawing.flatMap(pictureImage)
+        return ZStack(alignment: .bottomLeading) {
+            if let drawn, !showingPhoto {
+                // Drawn on the paper colour, so it needs no frame.
+                Rectangle().fill(Poster.paper).overlay {
+                    drawn.resizable().interpolation(.medium).scaledToFit().padding(.top, 8).padding(.bottom, 28)
                 }
+            } else {
+                // The picture fills the frame without setting its size, so
+                // the line stays at the bottom of what is seen.
+                Rectangle().fill(Poster.ink).overlay {
+                    if let photo, let image = pictureImage(photo) {
+                        image.resizable().scaledToFill()
+                    }
+                }
+                .clipped()
             }
-            .clipped()
             if let line = detail?.note, !line.isEmpty {
                 Text("“\(line)”")
                     .posterLabel()
@@ -328,9 +362,28 @@ public struct EstimateView: View {
         }
         .frame(height: detail?.hasPhoto == false ? 70 : 210)
         .clipped()
+        .overlay(alignment: .topTrailing) {
+            if drawn != nil {
+                Text(showingPhoto ? "Drawing" : "Photo")
+                    .posterLabel()
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(Poster.paper)
+                    .overlay(Rectangle().strokeBorder(Poster.ink, lineWidth: 1.5))
+                    .padding(10)
+            }
+        }
         .overlay(alignment: .bottom) { PosterRule() }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            if drawn != nil { showingPhoto.toggle() }
+        }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(detail?.note ?? entry.name)
+        .accessibilityLabel(
+            drawn != nil && !showingPhoto
+                ? "Drawing of \(detail?.note ?? entry.name)" : (detail?.note ?? entry.name))
+        .accessibilityHint(drawn == nil ? "" : showingPhoto ? "Shows the drawing" : "Shows the photo")
+        .accessibilityAddTraits(drawn == nil ? [] : .isButton)
     }
 
     /// The giant figure and, beside it, the range and the protein.

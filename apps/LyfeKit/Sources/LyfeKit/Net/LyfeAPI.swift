@@ -279,6 +279,17 @@ public struct LyfeAPI: Sendable {
         try await perform("GET", "v1/food/entries/\(id.uuidString.lowercased())/photo", token: token, body: nil, timeout: 20)
     }
 
+    /// A meal's photo drawn as a Poster illustration (a PNG), or nil while
+    /// it has not been drawn.
+    public func foodIllustration(token: String, id: UUID) async throws -> Data? {
+        do {
+            return try await perform(
+                "GET", "v1/food/entries/\(id.uuidString.lowercased())/illustration", token: token, body: nil, timeout: 20)
+        } catch LyfeAPIError.server(status: 404) {
+            return nil
+        }
+    }
+
     /// The label lyfe has for a barcode, or nil when it has none.
     public func product(token: String, code: String) async throws -> Product? {
         do {

@@ -7,5 +7,6 @@ pub mod config;
 pub mod db;
 pub mod estimator;
 pub mod garmin;
+pub mod illustrator;
 pub mod push;
 pub mod routines;

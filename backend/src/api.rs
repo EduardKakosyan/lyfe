@@ -52,6 +52,9 @@ pub struct AppState {
     pub estimate_range_pct: u32,
     /// Wakes the photo estimator when a photo meal arrives.
     pub estimator_wake: Arc<tokio::sync::Notify>,
+    /// Wakes the illustrator when a photo can be drawn: it arrives, or the
+    /// built meal it is a part of does.
+    pub illustrator_wake: Arc<tokio::sync::Notify>,
     pub now: Clock,
 }
 
@@ -76,6 +79,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/food/built-entries", post(record_built_meal))
         .route("/v1/food/entries/{id}/estimate", put(correct_estimate))
         .route("/v1/food/entries/{id}/photo", get(food_photo))
+        .route("/v1/food/entries/{id}/illustration", get(food_illustration))
         .route("/v1/food/products/{code}", get(find_product).put(set_product))
         .route("/v1/food/meals/{id}", put(save_meal).delete(remove_meal))
         .route("/v1/food/targets", put(set_food_targets))
@@ -677,6 +681,7 @@ async fn record_photo_entry(
         // What was eaten is not logged; it is the owner's.
         tracing::info!(id = %entry.id, photo = entry.jpeg.is_some(), part = entry.part_of.is_some(), "photo meal recorded");
         state.estimator_wake.notify_one();
+        state.illustrator_wake.notify_one();
         if entry.part_of.is_some() {
             let dropped = db::drop_stale_drafts(&state.pool).await?;
             if dropped > 0 {
@@ -889,6 +894,8 @@ async fn record_built_meal(
     if db::insert_built_meal(&state.pool, &meal, device.session_id).await? {
         // What was eaten is not logged; it is the owner's.
         tracing::info!(id = %meal.id, parts = meal.parts.len(), "built meal recorded");
+        // Its photos, sent ahead, are on a day now and can be drawn.
+        state.illustrator_wake.notify_one();
     }
     Ok(Json(home_now(&state).await?))
 }
@@ -949,6 +956,14 @@ async fn correct_estimate(
 async fn food_photo(State(state): State<AppState>, _device: Device, Path(id): Path<Uuid>) -> Result<Response, ApiError> {
     let jpeg = db::food_photo(&state.pool, id).await?.ok_or(ApiError::NotFound)?;
     Ok(([(header::CONTENT_TYPE, "image/jpeg"), (header::CACHE_CONTROL, "private, max-age=86400")], jpeg).into_response())
+}
+
+/// A meal's photo drawn as a Poster illustration, once it has been. Until
+/// then, and for a meal never drawn, there is none and the app shows the
+/// photo. It never changes once drawn, so the app may keep it.
+async fn food_illustration(State(state): State<AppState>, _device: Device, Path(id): Path<Uuid>) -> Result<Response, ApiError> {
+    let png = db::food_illustration(&state.pool, id).await?.ok_or(ApiError::NotFound)?;
+    Ok(([(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, "private, max-age=604800, immutable")], png).into_response())
 }
 
 /// The label lyfe has for a barcode: the one the owner typed, else the

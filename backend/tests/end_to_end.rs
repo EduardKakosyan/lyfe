@@ -89,6 +89,7 @@ async fn harness_at(pool: PgPool, now: &str, with_key: bool) -> Harness {
         push_ready: false,
         estimate_range_pct: 35,
         estimator_wake: Arc::new(tokio::sync::Notify::new()),
+        illustrator_wake: Arc::new(tokio::sync::Notify::new()),
         now: Arc::new(move || now),
     };
     Harness { state, garmin, _key_dir: key_dir }
@@ -1979,7 +1980,9 @@ impl Model {
             ..Default::default()
         };
         let estimator =
-            lyfe_server::estimator::Estimator::new(h.state.pool.clone(), settings, h.state.estimator_wake.clone()).unwrap();
+            lyfe_server::estimator::Estimator::new(h.state.pool.clone(), settings, h.state.estimator_wake.clone())
+                .unwrap()
+                .waking(h.state.illustrator_wake.clone());
         Model { server, estimator, _dir: dir }
     }
 
@@ -2772,4 +2775,270 @@ async fn a_saved_meal_keeps_a_photos_estimate_as_an_estimate(pool: PgPool) {
         let (status, _) = h.put(&format!("/v1/food/meals/{}", food_id(4)), Some(&token), recipe).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
+}
+
+// --- Meal illustrations ---------------------------------------------------
+
+/// The stand-in illustrator (`tests/illustrator_stand_in.py`), started the
+/// way the Spark's is, on a machine with `free_gb` of memory free. What it
+/// is asked is written to a file to look at afterwards.
+struct Drawer {
+    illustrator: lyfe_server::illustrator::Illustrator,
+    log: PathBuf,
+    _dir: tempdir::Dir,
+}
+
+impl Drawer {
+    async fn start(h: &Harness, free_gb: u64, how: &[&str]) -> Drawer {
+        let dir = tempdir::Dir::new();
+        let meminfo = dir.0.join("meminfo");
+        std::fs::write(&meminfo, format!("MemTotal: 128000000 kB\nMemAvailable: {} kB\n", free_gb * 1024 * 1024)).unwrap();
+        let log = dir.0.join("asked.jsonl");
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/illustrator_stand_in.py");
+        let mut program: Vec<String> = ["python3", "-I", script, "--log"].map(String::from).to_vec();
+        program.push(log.to_string_lossy().into_owned());
+        program.extend(how.iter().map(|arg| arg.to_string()));
+        Drawer::with(h, Some(program), meminfo, log, dir)
+    }
+
+    fn with(h: &Harness, program: Option<Vec<String>>, meminfo: PathBuf, log: PathBuf, dir: tempdir::Dir) -> Drawer {
+        let settings = lyfe_server::illustrator::IllustratorSettings {
+            program,
+            meminfo,
+            // Let go as soon as nothing is waiting.
+            keep_alive: std::time::Duration::ZERO,
+            ..Default::default()
+        };
+        let illustrator =
+            lyfe_server::illustrator::Illustrator::new(h.state.pool.clone(), settings, h.state.illustrator_wake.clone());
+        Drawer { illustrator, log, _dir: dir }
+    }
+
+    async fn draw(&self) -> lyfe_server::illustrator::Outcome {
+        self.illustrator.run_once().await.unwrap()
+    }
+
+    /// What the illustrator was asked to draw.
+    fn asked(&self) -> Vec<Value> {
+        std::fs::read_to_string(&self.log)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+}
+
+impl Harness {
+    /// The illustration of meal number `entry`: its status and the bytes.
+    async fn illustration(&self, token: Option<&str>, entry: u32) -> (StatusCode, Option<String>, Vec<u8>) {
+        let mut request = Request::get(format!("/v1/food/entries/{}/illustration", food_id(entry)));
+        if let Some(token) = token {
+            request = request.header("Authorization", format!("Bearer {token}"));
+        }
+        let response = api::router(self.state.clone()).oneshot(request.body(Body::empty()).unwrap()).await.unwrap();
+        let status = response.status();
+        let kind = response.headers().get("content-type").map(|v| v.to_str().unwrap().to_string());
+        let bytes = response.into_body().collect().await.unwrap().to_bytes().to_vec();
+        (status, kind, bytes)
+    }
+}
+
+/// Brings every illustration's next try forward to now.
+async fn illustrations_due(pool: &PgPool) {
+    sqlx::query("update food_photos set illustration_due_at = now() where illustration_due_at is not null")
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_photo_meal_is_illustrated_after_its_estimate_without_holding_it_up(pool: PgPool) {
+    use lyfe_server::illustrator::Outcome;
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    let model = Model::start(&h, 72).await;
+    model.answers(STIR_FRY).await;
+    let drawer = Drawer::start(&h, 72, &[]).await;
+
+    // Logged and counted at once, with no illustration yet: the app shows
+    // the photo.
+    let home = h.log_photo(&token, 21, "2026-11-17T23:00:00Z", "dinner", "stir fry, rice, some oil").await;
+    let dinner = &home["food"]["entries"][0];
+    assert_eq!((&dinner["photo"]["has_photo"], &dinner["photo"]["illustrated"]), (&json!(true), &json!(false)));
+    assert_eq!(home["food"]["streak"]["state"], "kept");
+    assert_eq!(h.illustration(Some(&token), 21).await.0, StatusCode::NOT_FOUND);
+
+    // The illustrator was woken by the photo arriving...
+    let woken = || tokio::time::timeout(std::time::Duration::from_millis(50), h.state.illustrator_wake.notified());
+    assert!(woken().await.is_ok());
+    // ...but the estimate comes first: the two models are not loaded for it
+    // at once. It is woken again when the estimate is in.
+    assert_eq!(drawer.draw().await, Outcome::Idle);
+    assert!(drawer.asked().is_empty());
+    assert!(woken().await.is_err());
+    model.estimate().await;
+    assert!(woken().await.is_ok());
+
+    assert_eq!(drawer.draw().await, Outcome::Drew(1));
+    assert_eq!(drawer.draw().await, Outcome::Idle);
+    let asked = drawer.asked();
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0]["id"], food_id(21));
+    assert_eq!(asked[0]["jpeg"], jpeg_base64());
+    let prompt = asked[0]["prompt"].as_str().unwrap();
+    assert!(prompt.starts_with("Minimal screen-print food poster of this meal: stir fry, rice, some oil. "), "{prompt}");
+    assert!(prompt.ends_with("centred on a plain off-white background, no text."), "{prompt}");
+
+    let (_, home) = h.get("/v1/home", Some(&token)).await;
+    let dinner = &home["food"]["entries"][0];
+    assert_eq!(dinner["photo"]["illustrated"], true);
+    // Drawing it changed nothing that counts.
+    assert_eq!((&dinner["kcal"], &home["food"]["kcal"]), (&json!(578), &json!(578)));
+
+    let (status, kind, png) = h.illustration(Some(&token), 21).await;
+    assert_eq!((status, kind.as_deref()), (StatusCode::OK, Some("image/png")));
+    assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert_eq!(h.illustration(None, 21).await.0, StatusCode::UNAUTHORIZED);
+    // The photo is still there to look at.
+    assert_eq!(h.get(&format!("/v1/food/entries/{}/photo", food_id(21)), Some(&token)).await.0, StatusCode::OK);
+
+    // A meal taken back is not shown, drawn or not.
+    h.delete(&format!("/v1/food/entries/{}", food_id(21)), Some(&token)).await;
+    assert_eq!(h.illustration(Some(&token), 21).await.0, StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn photos_logged_together_are_drawn_with_one_load_and_only_photos_are_drawn(pool: PgPool) {
+    use lyfe_server::illustrator::Outcome;
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    let model = Model::start(&h, 72).await;
+    model.answers(STIR_FRY).await;
+    h.log_photo(&token, 21, "2026-11-17T16:00:00Z", "lunch", "pho").await;
+    h.log_photo(&token, 22, "2026-11-17T23:00:00Z", "dinner", "").await;
+    // Described in words only: there is nothing to draw from.
+    let body = json!({"id": food_id(23), "eaten_at": "2026-11-17T20:00:00Z", "slot": "snack", "note": "an apple"});
+    assert_eq!(h.post("/v1/food/photo-entries", Some(&token), Some(body)).await.0, StatusCode::OK);
+    // One taken back before it was drawn.
+    h.log_photo(&token, 24, "2026-11-17T21:00:00Z", "snack", "chips").await;
+    h.delete(&format!("/v1/food/entries/{}", food_id(24)), Some(&token)).await;
+    while model.estimate().await != lyfe_server::estimator::Outcome::Idle {}
+
+    let drawer = Drawer::start(&h, 72, &[]).await;
+    assert_eq!(drawer.draw().await, Outcome::Drew(2));
+    let asked = drawer.asked();
+    assert_eq!(asked.iter().map(|a| a["id"].as_str().unwrap()).collect::<Vec<_>>(), [food_id(21), food_id(22)]);
+    // No line: the photo alone says what it is.
+    assert!(asked[1]["prompt"].as_str().unwrap().starts_with("Minimal screen-print food poster of the meal in this photo."));
+    let (_, home) = h.get("/v1/home", Some(&token)).await;
+    let illustrated: Vec<_> = home["food"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| (e["name"].as_str().unwrap(), &e["photo"]["illustrated"]))
+        .collect();
+    assert_eq!(illustrated, [("pho", &json!(true)), ("Photo meal", &json!(true)), ("an apple", &json!(false))]);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_photo_sent_ahead_is_drawn_once_its_meal_is_logged(pool: PgPool) {
+    use lyfe_server::illustrator::Outcome;
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    h.import_products().await;
+    let model = Model::start(&h, 72).await;
+    model.answers(STIR_FRY).await;
+    let drawer = Drawer::start(&h, 72, &[]).await;
+
+    // Still being put together on the phone: on no day, so not drawn; it
+    // may yet be thrown away.
+    h.send_photo_part(&token, 34, 30, "eggs on toast").await;
+    model.estimate().await;
+    assert_eq!(drawer.draw().await, Outcome::Idle);
+
+    let (status, _) = h.log_built(&token, 30, "", breakfast_parts()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(drawer.draw().await, Outcome::Drew(1));
+    let (_, home) = h.get("/v1/home", Some(&token)).await;
+    let parts = &home["food"]["entries"][0]["parts"];
+    assert_eq!((&parts[3]["source"], &parts[3]["photo"]["illustrated"]), (&json!("photo"), &json!(true)));
+    assert_eq!(h.illustration(Some(&token), 34).await.0, StatusCode::OK);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_busy_spark_or_a_missing_illustrator_puts_illustrations_off(pool: PgPool) {
+    use lyfe_server::illustrator::Outcome;
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    let model = Model::start(&h, 72).await;
+    model.answers(STIR_FRY).await;
+    h.log_photo(&token, 21, "2026-11-17T16:00:00Z", "lunch", "pho").await;
+    model.estimate().await;
+
+    // 12 GB free: the program is not even started.
+    let busy = Drawer::start(&h, 12, &[]).await;
+    let Outcome::PutOff(why) = busy.draw().await else { panic!("not put off") };
+    assert_eq!(why, "The Spark is busy: 12 GB free, and the illustrator needs 24.");
+    assert!(busy.asked().is_empty());
+    // Not due again for a while.
+    assert_eq!(busy.draw().await, Outcome::Idle);
+
+    // Not installed yet.
+    illustrations_due(&h.state.pool).await;
+    let dir = tempdir::Dir::new();
+    let meminfo = dir.0.join("meminfo");
+    std::fs::write(&meminfo, "MemAvailable: 75000000 kB\n").unwrap();
+    let missing = Drawer::with(&h, Some(vec!["/no/such/lyfe-illustrate".into()]), meminfo, dir.0.join("log"), dir);
+    let Outcome::PutOff(why) = missing.draw().await else { panic!("not put off") };
+    assert_eq!(why, "The illustrator is not installed (/no/such/lyfe-illustrate).");
+
+    // The model would not load.
+    illustrations_due(&h.state.pool).await;
+    let failing = Drawer::start(&h, 72, &["--fail-load"]).await;
+    let Outcome::PutOff(why) = failing.draw().await else { panic!("not put off") };
+    assert_eq!(why, "The illustrator could not load the model: CUDA out of memory (stand-in).");
+
+    // None of that is the photo's fault: it is drawn once the Spark can.
+    for _ in 0..5 {
+        illustrations_due(&h.state.pool).await;
+        assert!(matches!(busy.draw().await, Outcome::PutOff(_)));
+    }
+    illustrations_due(&h.state.pool).await;
+    assert_eq!(Drawer::start(&h, 72, &[]).await.draw().await, Outcome::Drew(1));
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_photo_that_cannot_be_drawn_keeps_showing_the_photo(pool: PgPool) {
+    use lyfe_server::illustrator::Outcome;
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    let model = Model::start(&h, 72).await;
+    model.answers(STIR_FRY).await;
+    h.log_photo(&token, 21, "2026-11-17T16:00:00Z", "lunch", "pho").await;
+    model.estimate().await;
+
+    // Answered with an error, then the program dying on it: each counts.
+    let cannot = Drawer::start(&h, 72, &["--cannot-draw"]).await;
+    assert_eq!(cannot.draw().await, Outcome::Drew(0));
+    // Tried again a minute later, not at once.
+    assert_eq!(cannot.draw().await, Outcome::Idle);
+    illustrations_due(&h.state.pool).await;
+    let dying = Drawer::start(&h, 72, &["--exit-on-draw"]).await;
+    assert_eq!(dying.draw().await, Outcome::Drew(0));
+    illustrations_due(&h.state.pool).await;
+    assert_eq!(cannot.draw().await, Outcome::Drew(0));
+
+    // Three times: given up on, and never tried again.
+    illustrations_due(&h.state.pool).await;
+    assert_eq!(Drawer::start(&h, 72, &[]).await.draw().await, Outcome::Idle);
+    let (problem, tries): (Option<String>, i32) =
+        sqlx::query_as("select illustration_problem, illustration_tries from food_photos").fetch_one(&h.state.pool).await.unwrap();
+    assert_eq!(tries, 3);
+    assert_eq!(problem.as_deref(), Some("The illustrator could not draw it: cannot identify image file (stand-in)."));
+
+    let (_, home) = h.get("/v1/home", Some(&token)).await;
+    let lunch = &home["food"]["entries"][0];
+    assert_eq!((&lunch["photo"]["illustrated"], &lunch["kcal"]), (&json!(false), &json!(578)));
+    assert_eq!(h.illustration(Some(&token), 21).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(h.get(&format!("/v1/food/entries/{}/photo", food_id(21)), Some(&token)).await.0, StatusCode::OK);
 }

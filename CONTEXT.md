@@ -42,6 +42,10 @@ _Avoid_: AI meal, scanned meal
 A photo meal's figures as the model judged them, always shown with a range either way. Estimated figures are kept apart from measured ones: a weighed ingredient, a label or figures typed by hand are measured, a photo is estimated, also as a part of a meal or an ingredient of a saved one.
 _Avoid_: Guess (in the app), approximation
 
+**Illustration**:
+A meal photo redrawn on the Spark as a pictogram in the five Poster colours, shown in the photo's place once it is ready. It only ever adds to a meal: the meal counts without it, and the photo stays if it never comes.
+_Avoid_: Filter, AI image, thumbnail
+
 **Label**:
 The calories and protein per 100 g printed on packaged food, found by its barcode in the downloaded food database or typed once by the owner. A meal logged from a label is measured.
 _Avoid_: Nutrition facts (as a term in lyfe), product entry

@@ -1,0 +1,12 @@
+#!/bin/sh
+# Starts the meal illustrator (lyfe-illustrate.py) in its own Python, with
+# the model read from lyfe's own copy and nothing fetched from the network.
+# lyfe-server runs this when a photo is waiting; there is no need to run it
+# by hand (use `lyfe-server illustration-check` to try it).
+ILLUSTRATOR=$HOME/illustrator
+if [ ! -x "$ILLUSTRATOR/venv/bin/python" ] || [ ! -e "$ILLUSTRATOR/ready" ]; then
+    echo '{"ready": false, "error": "the illustrator is not set up yet: run lyfe-illustrator-setup"}'
+    exit 1
+fi
+export HF_HOME="$ILLUSTRATOR/hf" HF_HUB_OFFLINE=1 HF_HUB_DISABLE_TELEMETRY=1 HF_HUB_DISABLE_PROGRESS_BARS=1
+exec "$ILLUSTRATOR/venv/bin/python" -I "$ILLUSTRATOR/lyfe-illustrate.py" "$@"

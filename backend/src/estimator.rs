@@ -69,6 +69,8 @@ pub struct Estimator {
     http: reqwest::Client,
     settings: EstimatorSettings,
     wake: Arc<Notify>,
+    /// Woken once a photo is done with here: the illustrator waits for it.
+    then_wake: Option<Arc<Notify>>,
 }
 
 /// How long to wait before asking again, by what went wrong.
@@ -84,7 +86,20 @@ const IDLE_CHECK: Duration = Duration::from_secs(30);
 impl Estimator {
     pub fn new(pool: PgPool, settings: EstimatorSettings, wake: Arc<Notify>) -> anyhow::Result<Estimator> {
         let http = reqwest::Client::builder().connect_timeout(Duration::from_secs(5)).build()?;
-        Ok(Estimator { pool, http, settings, wake })
+        Ok(Estimator { pool, http, settings, wake, then_wake: None })
+    }
+
+    /// Wakes `next` each time a photo is done with: estimated, or left for
+    /// the owner to type.
+    pub fn waking(mut self, next: Arc<Notify>) -> Estimator {
+        self.then_wake = Some(next);
+        self
+    }
+
+    fn done_with_one(&self) {
+        if let Some(next) = &self.then_wake {
+            next.notify_one();
+        }
     }
 
     pub fn settings(&self) -> &EstimatorSettings {
@@ -124,12 +139,14 @@ impl Estimator {
                 db::record_estimate(&self.pool, meal.id, estimate).await?;
                 // What was eaten is not logged; it is the owner's.
                 tracing::info!(id = %meal.id, items = estimate.items.len(), "photo meal estimated");
+                self.done_with_one();
                 Ok(Outcome::Estimated)
             }
             Err(Problem::Off) => {
                 // Nothing will ever estimate it: it is the owner's to type.
                 let words = "Photo estimates are switched off on the server. Type the figures instead.";
                 db::give_up_estimate(&self.pool, meal.id, words).await?;
+                self.done_with_one();
                 Ok(Outcome::GaveUp(words.into()))
             }
             Err(problem) => {
@@ -137,6 +154,7 @@ impl Estimator {
                 tracing::warn!(id = %meal.id, problem = %words, "photo meal not estimated this time");
                 db::record_estimate_problem(&self.pool, meal.id, &words, counts, retry).await?;
                 if counts && meal.tries + 1 >= photo::MAX_TRIES {
+                    self.done_with_one();
                     Ok(Outcome::GaveUp(words))
                 } else {
                     Ok(Outcome::Deferred(words))

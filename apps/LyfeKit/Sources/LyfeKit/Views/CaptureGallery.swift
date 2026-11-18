@@ -16,13 +16,15 @@
     /// (a meal being built from four parts), `building` (one with a photo
     /// still being estimated), `logged` (a built meal after logging),
     /// `photo`, `estimate`, `estimating`, `failed`, `scan`, `product`,
-    /// `notfound` or `label`.
+    /// `notfound` or `label`; with the photos drawn as illustrations,
+    /// `drawn` (an estimate), `drawnday` (the day) or `drawnmeal` (a built
+    /// meal after logging).
     struct CaptureGallery: View {
         var screen: String
 
         static let screens: Set<String> = [
             "mixed", "builder", "building", "logged", "photo", "estimate", "estimating", "failed", "scan", "product",
-            "notfound", "label",
+            "notfound", "label", "drawn", "drawnday", "drawnmeal",
         ]
 
         static let bar = Product(
@@ -59,6 +61,17 @@
                         onSetLabel: { _ in nil }, onLog: { _, _, _, _ in }, onClose: {})
                 case "label":
                     LabelView(code: "0628915423456", onSave: { _ in nil }, onClose: {})
+                case "drawn":
+                    EstimateView(
+                        entry: Self.drawn(Self.dinner()), loadPhoto: { Self.plate() },
+                        loadIllustration: { Self.pictogram() }, onCorrect: { _ in nil }, onReload: {},
+                        onTakeBack: { nil }, onClose: {})
+                case "drawnmeal":
+                    LoggedMealView(meal: Self.drawn(Self.builtBreakfast()), onTakeBack: { _ in nil }, onClose: {})
+                case "drawnday":
+                    FoodScreen(
+                        food: Self.day(drawn: true), building: nil, onBack: {}, onLog: { _, _ in },
+                        onTakeBack: { _ in nil }, onEditMeal: { _ in }, onTargets: {})
                 default:
                     FoodScreen(
                         food: Self.day(),
@@ -70,7 +83,16 @@
                         onTakeBack: { _ in nil }, onEditMeal: { _ in }, onTargets: {})
                 }
             }
+            .environment(\.mealIllustration, IllustrationSource { _ in Self.pictogram() })
             .preferredColorScheme(.light)
+        }
+
+        /// The same meal once its photos have been drawn.
+        static func drawn(_ entry: FoodDay.Entry) -> FoodDay.Entry {
+            var entry = entry
+            entry.photo?.illustrated = true
+            entry.parts = entry.parts?.map(drawn)
+            return entry
         }
 
         /// The builder holding a draft that its buttons really change.
@@ -167,11 +189,11 @@
                         ? "The model's answer could not be used: the answer was not the JSON asked for." : nil))
         }
 
-        static func day() -> FoodDay {
+        static func day(drawn: Bool = false) -> FoodDay {
             let entries = [
-                builtBreakfast(),
+                drawn ? Self.drawn(builtBreakfast()) : builtBreakfast(),
                 lunch(figures: .estimating),
-                dinner(),
+                drawn ? Self.drawn(dinner()) : dinner(),
                 FoodDay.Entry(
                     id: UUID(), slot: .snack, name: "Protein bar", mealId: nil, servings: 1, kcal: 210, proteinG: 19.8,
                     source: .barcode, figures: .known, estimated: false, barcode: .init(code: "96385074", grams: 60)),
@@ -185,6 +207,46 @@
                     lastDays: (11...17).map { .init(date: CalendarDay(year: 2026, month: 11, day: $0), state: .kept) }),
                 kcalMeasured: 630, proteinMeasuredG: 45.1, kcalEstimated: 890, proteinEstimatedG: 56, kcalLow: 1210,
                 kcalHigh: 1830, unknown: 1, estimateRangePct: 35, products: [bar])
+        }
+
+        /// A made-up illustration, in the five Poster colours on paper as the
+        /// Spark draws them: a plate with an egg and a slab of something.
+        nonisolated static func pictogram() -> Data? {
+            let size = 512
+            // sRGB, as the Spark's untagged PNGs are read, so the paper
+            // matches the screen's.
+            guard let srgb = CGColorSpace(name: CGColorSpace.sRGB),
+                let context = CGContext(
+                    data: nil, width: size, height: size, bitsPerComponent: 8, bytesPerRow: 0,
+                    space: srgb, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)
+            else { return nil }
+            func colour(_ hex: Int) -> CGColor {
+                let parts = [CGFloat(hex >> 16) / 255, CGFloat(hex >> 8 & 0xff) / 255, CGFloat(hex & 0xff) / 255, 1]
+                return CGColor(colorSpace: srgb, components: parts)!
+            }
+            let (paper, ink, red, blue, yellow) = (0xf3efe6, 0x0e0e0e, 0xff4a1c, 0x2848ff, 0xffd21f)
+            context.setFillColor(colour(paper))
+            context.fill(CGRect(x: 0, y: 0, width: size, height: size))
+            context.setLineWidth(10)
+            context.setStrokeColor(colour(ink))
+            context.setFillColor(colour(blue))
+            context.fillEllipse(in: CGRect(x: 56, y: 56, width: 400, height: 400))
+            context.strokeEllipse(in: CGRect(x: 56, y: 56, width: 400, height: 400))
+            context.setFillColor(colour(paper))
+            context.fillEllipse(in: CGRect(x: 96, y: 96, width: 320, height: 320))
+            context.setFillColor(colour(red))
+            context.fill(CGRect(x: 250, y: 150, width: 120, height: 190))
+            context.stroke(CGRect(x: 250, y: 150, width: 120, height: 190))
+            context.setFillColor(colour(yellow))
+            context.fillEllipse(in: CGRect(x: 130, y: 220, width: 150, height: 150))
+            context.strokeEllipse(in: CGRect(x: 130, y: 220, width: 150, height: 150))
+            guard let image = context.makeImage() else { return nil }
+            let data = NSMutableData()
+            guard let destination = CGImageDestinationCreateWithData(data, UTType.png.identifier as CFString, 1, nil)
+            else { return nil }
+            CGImageDestinationAddImage(destination, image, nil)
+            CGImageDestinationFinalize(destination)
+            return data as Data
         }
 
         /// A made-up plate seen from above, as the drawn screen has it.

@@ -52,6 +52,7 @@ ssh "${SSH_OPTS[@]}" "$LYFE_SSH" 'mkdir -p ~/bin ~/.config/lyfe ~/.config/system
 scp -q "${SSH_OPTS[@]}" "$BINARY" "$LYFE_SSH:.cache/lyfe-install/lyfe-server"
 scp -q "${SSH_OPTS[@]}" lyfe-postgres.service lyfe-server.service lyfe.env.template \
     lyfe-backup lyfe-backup.service lyfe-backup.timer backup.env.template lyfe-food-db \
+    lyfe-illustrate lyfe-illustrate.py lyfe-illustrator-setup \
     "$LYFE_SSH:.cache/lyfe-install/"
 
 echo "== Installing"
@@ -102,6 +103,15 @@ if [ ! -e ~/.config/lyfe/backup.env ]; then
 fi
 install -m 755 "$STAGE/lyfe-backup" ~/bin/lyfe-backup
 install -m 755 "$STAGE/lyfe-food-db" ~/bin/lyfe-food-db
+# The meal illustrator. The program is updated here; its Python and the
+# model are set up once, by lyfe-illustrator-setup.
+mkdir -p ~/illustrator && chmod 700 ~/illustrator
+install -m 644 "$STAGE/lyfe-illustrate.py" ~/illustrator/lyfe-illustrate.py
+install -m 755 "$STAGE/lyfe-illustrate" ~/bin/lyfe-illustrate
+install -m 755 "$STAGE/lyfe-illustrator-setup" ~/bin/lyfe-illustrator-setup
+if [ ! -e ~/illustrator/ready ]; then
+    echo "Meals are not illustrated yet: run ~/bin/lyfe-illustrator-setup once as lyfe (about 21 GB; see the README)."
+fi
 cp "$STAGE/lyfe-backup.service" "$STAGE/lyfe-backup.timer" ~/.config/systemd/user/
 systemctl --user daemon-reload
 if BACKUP_MISSING=$(~/bin/lyfe-backup ready); then

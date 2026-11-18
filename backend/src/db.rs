@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::routines::breath;
 use crate::routines::food::{self, Detail, Figures, Label, PhotoDetail, Quantity, Slot};
+use crate::routines::illustration;
 use crate::routines::photo::{self, Oil};
 use crate::routines::product::{self, Origin, Product};
 use crate::routines::gym::Activity;
@@ -642,7 +643,8 @@ pub async fn remove_food_entry(pool: &PgPool, id: Uuid) -> sqlx::Result<bool> {
 const ENTRY_COLUMNS: &str = "e.id, e.eaten_at, e.slot, e.meal_id, e.name, e.servings, e.kcal, e.protein_dg, e.source,
     e.figures, e.note, e.oil_asked, e.oil, e.typed, e.estimate_problem, e.barcode, e.grams, e.part_of, e.position,
     e.kcal_per_100g, e.protein_per_100g, e.kcal_estimated, e.protein_dg_estimated,
-    exists (select 1 from food_photos p where p.entry_id = e.id) as has_photo";
+    exists (select 1 from food_photos p where p.entry_id = e.id) as has_photo,
+    exists (select 1 from food_photos p where p.entry_id = e.id and p.illustration is not null) as illustrated";
 
 fn read_entry(
     r: &sqlx::postgres::PgRow,
@@ -660,6 +662,7 @@ fn read_entry(
         "photo" => Detail::Photo(PhotoDetail {
             note: r.get::<Option<String>, _>("note").unwrap_or_default(),
             has_photo: r.get("has_photo"),
+            illustrated: r.get("illustrated"),
             items: items.remove(&id).unwrap_or_default(),
             oil_asked: r.get("oil_asked"),
             oil: r.get::<Option<&str>, _>("oil").and_then(Oil::parse),
@@ -1072,6 +1075,108 @@ pub async fn food_photo(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<Vec<u8>>
     sqlx::query_scalar(
         "select p.jpeg from food_photos p join food_entries e on e.id = p.entry_id
          where p.entry_id = $1 and e.removed_at is null",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+// --- Illustrations --------------------------------------------------------
+
+/// A meal photo waiting to be drawn.
+#[derive(Debug, Clone)]
+pub struct PendingIllustration {
+    pub id: Uuid,
+    pub note: String,
+    pub jpeg: Vec<u8>,
+    pub tries: i32,
+}
+
+/// The photo waiting longest whose turn has come. Only photos on a day are
+/// drawn: not taken back, and, as a part, in a meal that has arrived. A
+/// photo still being estimated waits for its figures, which matter more,
+/// so the two models are not loaded on the shared machine at once for it.
+pub async fn next_pending_illustration(pool: &PgPool) -> sqlx::Result<Option<PendingIllustration>> {
+    let row = sqlx::query(
+        "select e.id, e.note, p.jpeg, p.illustration_tries
+         from food_photos p join food_entries e on e.id = p.entry_id
+         where p.illustration_due_at <= now() and e.removed_at is null and e.figures <> 'estimating'
+           and (e.part_of is null
+                or exists (select 1 from food_entries m where m.id = e.part_of and m.removed_at is null))
+         order by p.illustration_due_at, e.id
+         limit 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| PendingIllustration {
+        id: r.get("id"),
+        note: r.get::<Option<String>, _>("note").unwrap_or_default(),
+        jpeg: r.get("jpeg"),
+        tries: r.get("illustration_tries"),
+    }))
+}
+
+/// Attaches a meal's illustration. Returns false when it already had one.
+pub async fn record_illustration(pool: &PgPool, id: Uuid, png: &[u8]) -> sqlx::Result<bool> {
+    let result = sqlx::query(
+        "update food_photos set
+            illustration = $2, illustrated_at = now(), illustration_due_at = null, illustration_problem = null
+         where entry_id = $1 and illustration is null",
+    )
+    .bind(id)
+    .bind(png)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// A picture the model could not draw. It is tried again after `retry_in`,
+/// and after `illustration::MAX_TRIES` failures not at all. Returns true
+/// when it has been given up on.
+pub async fn record_illustration_problem(
+    pool: &PgPool,
+    id: Uuid,
+    problem: &str,
+    retry_in: chrono::Duration,
+) -> sqlx::Result<bool> {
+    let gave_up: Option<bool> = sqlx::query_scalar(
+        "update food_photos set
+            illustration_problem = $2,
+            illustration_tries = illustration_tries + 1,
+            illustration_due_at = case when illustration_tries + 1 >= $4 then null
+                                       else now() + make_interval(secs => $3) end
+         where entry_id = $1 and illustration is null
+         returning illustration_due_at is null",
+    )
+    .bind(id)
+    .bind(problem)
+    .bind(retry_in.num_seconds() as f64)
+    .bind(illustration::MAX_TRIES)
+    .fetch_optional(pool)
+    .await?;
+    Ok(gave_up.unwrap_or(false))
+}
+
+/// Puts off every photo whose turn has come, when the Spark cannot draw
+/// any of them now: too little memory, or the model would not load. No
+/// picture is blamed for it.
+pub async fn put_off_illustrations(pool: &PgPool, problem: &str, retry_in: chrono::Duration) -> sqlx::Result<u64> {
+    let result = sqlx::query(
+        "update food_photos set illustration_problem = $1, illustration_due_at = now() + make_interval(secs => $2)
+         where illustration_due_at <= now()",
+    )
+    .bind(problem)
+    .bind(retry_in.num_seconds() as f64)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// The illustration of a meal not taken back, once drawn.
+pub async fn food_illustration(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<Vec<u8>>> {
+    sqlx::query_scalar(
+        "select p.illustration from food_photos p join food_entries e on e.id = p.entry_id
+         where p.entry_id = $1 and e.removed_at is null and p.illustration is not null",
     )
     .bind(id)
     .fetch_optional(pool)

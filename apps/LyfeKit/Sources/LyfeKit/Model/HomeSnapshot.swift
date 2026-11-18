@@ -487,6 +487,13 @@ public struct FoodDay: Codable, Equatable, Sendable {
         public var isKnown: Bool { (figures ?? .known) == .known }
         /// What carries figures: the parts of a built meal, else the meal.
         public var counted: [Entry] { from == .built ? (parts ?? []) : [self] }
+        /// The meal whose illustration stands for this one: a photo meal
+        /// once drawn, or for a built meal the first of its photos drawn.
+        /// Nil while there is none, and then the photo, if any, is shown.
+        public var illustrationID: UUID? {
+            if from == .built { return parts?.lazy.compactMap(\.illustrationID).first }
+            return from == .photo && photo?.illustrated == true ? id : nil
+        }
 
         /// As something that goes into a saved meal, once its figures are
         /// known: weighed where it was, whole otherwise, and an estimate
@@ -562,10 +569,14 @@ public struct FoodDay: Codable, Equatable, Sendable {
         public var typed: Bool
         /// Why there is no estimate yet, worded by the backend.
         public var problem: String?
+        /// Whether the photo has been drawn as a Poster illustration, which
+        /// is then shown in its place. Missing in answers from before
+        /// illustrations, and for a photo not drawn yet.
+        public var illustrated: Bool?
 
         public init(
             note: String, hasPhoto: Bool, items: [EstimateItem], oilAsked: Bool, oil: Oil?, oilCounted: Oil,
-            oilKcal: Int, typed: Bool, problem: String?
+            oilKcal: Int, typed: Bool, problem: String?, illustrated: Bool? = nil
         ) {
             self.note = note
             self.hasPhoto = hasPhoto
@@ -576,6 +587,7 @@ public struct FoodDay: Codable, Equatable, Sendable {
             self.oilKcal = oilKcal
             self.typed = typed
             self.problem = problem
+            self.illustrated = illustrated
         }
     }
 

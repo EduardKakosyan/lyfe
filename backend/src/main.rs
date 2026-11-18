@@ -8,9 +8,10 @@ use clap::{Parser, Subcommand};
 
 use lyfe_server::api::{self, AppState};
 use lyfe_server::auth::{self, SignInThrottle};
-use lyfe_server::config::{DatabaseConfig, GarminConfig, PhotoConfig, ServeConfig};
+use lyfe_server::config::{DatabaseConfig, GarminConfig, IllustrationConfig, PhotoConfig, ServeConfig};
 use lyfe_server::db;
 use lyfe_server::estimator::Estimator;
+use lyfe_server::illustrator::Illustrator;
 use lyfe_server::garmin::sync::{parse_activity, Syncer};
 use lyfe_server::garmin::GarminClient;
 use lyfe_server::push::apns::{Alert, ApnsClient};
@@ -67,6 +68,20 @@ enum Command {
         #[arg(long, default_value = "")]
         note: String,
     },
+    /// Draw one meal photo as a Poster illustration with the image model and
+    /// write it out. Stores nothing; use it to check the illustrator works.
+    IllustrationCheck {
+        #[command(flatten)]
+        illustration: IllustrationConfig,
+        /// A JPEG of the meal.
+        jpeg: std::path::PathBuf,
+        /// The one line that goes with it.
+        #[arg(long, default_value = "")]
+        note: String,
+        /// Where to write the illustration (a PNG).
+        #[arg(long, default_value = "illustration.png")]
+        out: std::path::PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -86,6 +101,9 @@ async fn main() -> anyhow::Result<()> {
         Command::GarminCheck { garmin, days } => garmin_check(garmin, days).await,
         Command::ImportFoodDb { database } => import_food_db(database).await,
         Command::PhotoCheck { photo, jpeg, note } => photo_check(photo, jpeg, note).await,
+        Command::IllustrationCheck { illustration, jpeg, note, out } => {
+            illustration_check(illustration, jpeg, note, out).await
+        }
     }
 }
 
@@ -182,7 +200,11 @@ async fn serve(config: ServeConfig) -> anyhow::Result<()> {
     };
 
     let estimator_wake = Arc::new(tokio::sync::Notify::new());
-    let estimator = Arc::new(Estimator::new(pool.clone(), config.photo.estimator_settings(), estimator_wake.clone())?);
+    let illustrator_wake = Arc::new(tokio::sync::Notify::new());
+    let estimator = Arc::new(
+        Estimator::new(pool.clone(), config.photo.estimator_settings(), estimator_wake.clone())?
+            .waking(illustrator_wake.clone()),
+    );
     match &estimator.settings().ollama_url {
         Some(url) => tracing::info!(
             ollama = %url,
@@ -195,6 +217,22 @@ async fn serve(config: ServeConfig) -> anyhow::Result<()> {
     }
     tokio::spawn(estimator.run_forever());
 
+    let illustrator =
+        Arc::new(Illustrator::new(pool.clone(), config.illustration.illustrator_settings(), illustrator_wake.clone()));
+    match &illustrator.settings().program {
+        Some(program) if std::path::Path::new(&program[0]).exists() => tracing::info!(
+            program = %program[0],
+            min_free_gb = illustrator.settings().min_free_gb,
+            "meal photos are illustrated on this machine"
+        ),
+        Some(program) => tracing::warn!(
+            program = %program[0],
+            "the illustrator is not installed (see lyfe-illustrator-setup); meals keep their photos until it is"
+        ),
+        None => tracing::warn!("LYFE_ILLUSTRATOR is off; meals keep their photos"),
+    }
+    tokio::spawn(illustrator.run_forever());
+
     let state = AppState {
         pool,
         syncer,
@@ -206,6 +244,7 @@ async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         push_ready,
         estimate_range_pct: config.photo.photo_range_percent,
         estimator_wake,
+        illustrator_wake,
         now: Arc::new(Utc::now),
     };
     let listener = tokio::net::TcpListener::bind(config.listen_addr)
@@ -446,6 +485,40 @@ async fn photo_check(config: PhotoConfig, jpeg: Option<std::path::PathBuf>, note
         amount.kcal,
         amount.protein_g(),
         if estimate.oil_asked { ", with some oil counted: it would ask about oil" } else { "" }
+    );
+    Ok(())
+}
+
+async fn illustration_check(
+    config: IllustrationConfig,
+    jpeg: std::path::PathBuf,
+    note: String,
+    out: std::path::PathBuf,
+) -> anyhow::Result<()> {
+    let settings = config.illustrator_settings();
+    if settings.program.is_none() {
+        bail!("LYFE_ILLUSTRATOR is off");
+    }
+    let jpeg = std::fs::read(&jpeg).context("could not read the photo")?;
+    if !photo::is_jpeg(&jpeg) {
+        bail!("the photo must be a JPEG");
+    }
+    if let Some(free_gb) = lyfe_server::estimator::free_memory_gb(&settings.meminfo)
+        && free_gb < f64::from(settings.min_free_gb)
+    {
+        bail!("only {free_gb:.0} GB of memory are free, and the illustrator needs {}", settings.min_free_gb);
+    }
+    // No database: nothing is stored.
+    let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://unused")?;
+    let illustrator = Illustrator::new(pool, settings, Arc::new(tokio::sync::Notify::new()));
+    let (png, loading, drawing) = illustrator.check(&note, jpeg).await.map_err(anyhow::Error::msg)?;
+    std::fs::write(&out, &png).with_context(|| format!("could not write {}", out.display()))?;
+    println!(
+        "Loaded in {:.1} s, drew in {:.1} s. Wrote {} ({} kB).",
+        loading.as_secs_f64(),
+        drawing.as_secs_f64(),
+        out.display(),
+        png.len() / 1024
     );
     Ok(())
 }

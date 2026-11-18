@@ -121,6 +121,7 @@ public final class AppModel {
     private let food: FoodStore
     private let captures: CaptureStore
     private let drafts: DraftStore
+    private let illustrations: IllustrationStore
     private var isSendingFood = false
     private let ownerCheck: any OwnerCheck
     private let makeCues: @MainActor () -> any BreathCues
@@ -138,6 +139,7 @@ public final class AppModel {
         food: FoodStore,
         captures: CaptureStore? = nil,
         drafts: DraftStore? = nil,
+        illustrations: IllustrationStore? = nil,
         transport: any HTTPTransport,
         deviceName: String,
         defaultServerAddress: String = "",
@@ -158,6 +160,10 @@ public final class AppModel {
         self.drafts =
             drafts
             ?? DraftStore(directory: FileManager.default.temporaryDirectory.appending(path: "lyfe-\(UUID().uuidString)"))
+        self.illustrations =
+            illustrations
+            ?? IllustrationStore(
+                directory: FileManager.default.temporaryDirectory.appending(path: "lyfe-\(UUID().uuidString)"))
         self.ownerCheck = ownerCheck
         makeCues = cues
         self.transport = transport
@@ -211,6 +217,7 @@ public final class AppModel {
             food: .standard(),
             captures: .standard(),
             drafts: .standard(),
+            illustrations: .standard(),
             transport: TailnetTransport.live(),
             deviceName: deviceName,
             defaultServerAddress: defaultServerAddress,
@@ -1195,6 +1202,17 @@ public final class AppModel {
         if let local = captures.photo(id) { return local }
         guard phase == .signedIn, let api, let token else { return nil }
         return try? await api.foodPhoto(token: token, id: id)
+    }
+
+    /// A meal's photo drawn as a Poster illustration: the copy on this
+    /// phone, else the backend's, kept here once fetched. Nil while it has
+    /// not been drawn, or cannot be fetched now.
+    public func mealIllustration(_ id: UUID) async -> Data? {
+        if let kept = illustrations.illustration(id) { return kept }
+        guard phase == .signedIn, let api, let token else { return nil }
+        guard let png = try? await api.foodIllustration(token: token, id: id) else { return nil }
+        illustrations.keep(png, for: id)
+        return png
     }
 
     /// Makes a change to food that needs the backend now, and shows the

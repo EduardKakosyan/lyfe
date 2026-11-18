@@ -2,16 +2,16 @@
 
 A private app that keeps three routines going: gym, breath training and food logging. What it is and why is in `CONTEXT.md`, `docs/adr/` and `docs/build-plan.md`.
 
-Built so far: steps 1 to 6 of the build plan. A strength session recorded on the watch shows up as a filled square on the Home screen, with nothing entered in lyfe. The gym band shows the streak in weeks, with recovery after a missed week, and the backend can prompt the phone when a streak needs sessions. A breath session runs in the app, one tap per hold, and the backend sets the next table from it. A morning prompt takes your weight typed into the notification itself, and Progress shows the seven-day average as a line. A meal you weighed once is logged with one tap, the Food screen shows the day against your calorie and protein targets, and the fuel band counts the days logged in a row. Any other meal is built from parts and logged as one meal: packets scanned by their barcodes, photos with one line each, which a model on the Spark estimates, and foods typed by hand, with the total kept on screen as parts are added. A built meal can be saved for one tap next time. The day keeps what was measured apart from what was estimated. lyfe asks for Face ID each time it is opened.
+Built so far: steps 1 to 7 of the build plan. A strength session recorded on the watch shows up as a filled square on the Home screen, with nothing entered in lyfe. The gym band shows the streak in weeks, with recovery after a missed week, and the backend can prompt the phone when a streak needs sessions. A breath session runs in the app, one tap per hold, and the backend sets the next table from it. A morning prompt takes your weight typed into the notification itself, and Progress shows the seven-day average as a line. A meal you weighed once is logged with one tap, the Food screen shows the day against your calorie and protein targets, and the fuel band counts the days logged in a row. Any other meal is built from parts and logged as one meal: packets scanned by their barcodes, photos with one line each, which a model on the Spark estimates, and foods typed by hand, with the total kept on screen as parts are added. A built meal can be saved for one tap next time. The day keeps what was measured apart from what was estimated. Each meal photo is then redrawn on the Spark as a pictogram in the app's five colours, shown in the photo's place once it is ready. lyfe asks for Face ID each time it is opened.
 
 ## Layout
 
 | Folder | What it is |
 |---|---|
-| `backend/` | The Rust backend: API, sign-in, Garmin poller, gym, breath, weight, food and streak rules, photo estimates, the barcode food database, notifications. The single authority for what counts. |
+| `backend/` | The Rust backend: API, sign-in, Garmin poller, gym, breath, weight, food and streak rules, photo estimates, meal illustrations, the barcode food database, notifications. The single authority for what counts. |
 | `apps/LyfeKit/` | Swift package shared by the iPhone app and the later Mac app: API client, local storage, app model, breath timer, weigh-ins, food log, the meal builder, photo and barcode capture, Poster screens. |
 | `apps/Lyfe/` | The iPhone app target. It only launches LyfeKit. |
-| `deploy/spark/` | Scripts and service files for running the backend on the Spark. |
+| `deploy/spark/` | Scripts and service files for running the backend on the Spark, and the meal illustrator (`lyfe-illustrate.py`). |
 
 ## How the pieces connect
 
@@ -23,13 +23,14 @@ flowchart LR
     phone[iPhone app] -- HTTPS over Tailscale, lyfe sign-in --> server
     server -- prompts --> apple[Apple push service] --> phone
     server -- photo meals, on loopback --> ollama[Ollama on the Spark: gemma4:31b]
+    server -- meal photos, over a pipe --> illustrator[lyfe-illustrate: FLUX.2 klein 4B, started when needed]
 ```
 
 - The backend listens on loopback only. `tailscale serve` publishes it to the tailnet over HTTPS; nothing is reachable from the public internet.
 - The tailnet and the Spark are shared, so the backend has its own sign-in: one password, and one revocable token per device. Only a hash of each is stored.
 - PostgreSQL runs under the `lyfe` account on a Unix socket in a folder only that account can open. It has no network port.
 - The Garmin key stays in a file on the Spark. It is never in this repository, in settings, or in logs.
-- Meal photos go only to the Spark's own Ollama, on loopback. Nothing about food leaves the Spark except in the encrypted backup.
+- Meal photos go only to the Spark's own Ollama, on loopback, and to the illustrator, a program lyfe-server starts itself under the `lyfe` account, which reads its model from disk and never goes to the network. Nothing about food leaves the Spark except in the encrypted backup.
 - When the phone cannot reach the backend it shows the last week it saw, marked offline with its age.
 - The app does not depend on the phone using Tailscale's DNS. The Spark's name also has a public answer, because other services on it are published to the internet, and a phone that looks the name up outside Tailscale gets that one, where port 8444 is closed. So when the system's answer for a `.ts.net` name is not a tailnet address, the app asks Tailscale's resolver (100.100.100.100) itself and connects to that address, still requiring the certificate to match the name (`apps/LyfeKit/Sources/LyfeKit/Net/TailnetTransport.swift`).
 
@@ -128,6 +129,18 @@ A photo and one line saying what it was: one part of a meal, or all of it. A vis
 
 `lyfe-server photo-check <photo.jpg> --note "<one line>"` asks the model about one photo and prints its answer, storing nothing. On a real plate it answered in about 20 seconds with the model loading. `LYFE_OLLAMA_URL=off` switches estimates off; photo meals are then typed in by hand. The photos are kept in the database, so they are in the backup.
 
+## Meal illustrations
+
+Each meal photo is redrawn as a pictogram in the Poster colours, as decided in ADR 0005. The prompt and how answers are read are `backend/src/routines/illustration.rs`; the running is `backend/src/illustrator.rs`; the drawing is `deploy/spark/lyfe-illustrate.py`.
+
+- **What it is.** FLUX.2 klein 4B redraws the photo, with its one line in a fixed prompt: a minimal screen-print poster, a few bold shapes, flat red-orange, cobalt, yellow, black and off-white, on a plain off-white background. The result is snapped to exactly the five Poster colours, with no dithering, and kept as a small PNG (about 10 kB) next to the photo. The same photo is always drawn the same way. Food comes out in the wrong colours and mixed dishes come out abstract; that is part of the look.
+- **It never holds anything up.** The meal is logged and counted without it. It is drawn after the photo's estimate, so the two models are not loaded for it at once; until it comes, and if it never does, the photo is shown as before.
+- **Where it shows.** On a photo's estimate, the drawing takes the photo's place; tap it (PHOTO, top right) to see the photo, and again for the drawing. On Food and on a logged meal, a meal with a drawn photo shows it small beside its figure; a meal built from parts shows its first drawn photo. A photo sent ahead for a meal still being built is drawn once the meal is logged. A meal described without a photo has nothing to draw. Drawings are fetched once and kept on the phone, since they never change.
+- **When the Spark is busy.** The illustrator is a program lyfe-server starts itself, only when a photo is waiting and at least 24 GB of memory are free (`LYFE_ILLUSTRATION_MIN_FREE_GB`). It loads the model (about 110 seconds), draws every photo waiting (about 7 seconds each, about 17 GB of GPU memory), and is let go three minutes after the last (`LYFE_ILLUSTRATION_KEEP_ALIVE_SECONDS`): it exits and its memory goes back. Short of memory, it tries again every five minutes; not set up, every half hour; a model that would not load, every ten minutes. None of that counts against a photo. A photo that fails to draw three times is left as a photo.
+- **Earlier meals.** Photos logged before step 7 are drawn too, oldest first, the first time the illustrator runs.
+
+`lyfe-server illustration-check <photo.jpg> --note "<one line>" --out meal.png` draws one photo and writes it out, storing nothing. `LYFE_ILLUSTRATOR=off` switches illustrations off; meals then keep their photos. The drawings are kept in the database, so they are in the backup.
+
 ## Barcodes
 
 Packaged food is logged from its label: a barcode and the grams eaten. Label figures are measured, not estimated. The rules are `backend/src/routines/product.rs`.
@@ -202,7 +215,7 @@ cargo run -- serve
 
 Without `LYFE_GARMIN_KEY_FILE` the server runs and imports nothing. `lyfe-server garmin-check` asks Garmin for recent activities and prints counts only, to confirm a key file works.
 
-Photo meals need a model to estimate them. On this Mac, use the stand-in, which answers every photo with rice and chicken: `python3 -I backend/tests/ollama_stand_in.py 11499` and `LYFE_OLLAMA_URL=http://127.0.0.1:11499`. To try the real model instead, forward the Spark's Ollama (`ssh -L 11435:127.0.0.1:11434 <spark>`) and use `LYFE_OLLAMA_URL=http://127.0.0.1:11435`; it then loads on the Spark. For barcodes, `gunzip -c <export>.csv.gz | lyfe-server import-food-db` reads an Open Food Facts export, or any part of one with its header line.
+Photo meals need a model to estimate them. On this Mac, use the stand-in, which answers every photo with rice and chicken: `python3 -I backend/tests/ollama_stand_in.py 11499` and `LYFE_OLLAMA_URL=http://127.0.0.1:11499`. To try the real model instead, forward the Spark's Ollama (`ssh -L 11435:127.0.0.1:11434 <spark>`) and use `LYFE_OLLAMA_URL=http://127.0.0.1:11435`; it then loads on the Spark. Meal illustrations need the image model, which does not run on this Mac; the stand-in answers every photo with the same plate in the five colours: `LYFE_ILLUSTRATOR=$PWD/backend/tests/illustrator_stand_in.py` (the tests use it too; it is stdlib Python). For barcodes, `gunzip -c <export>.csv.gz | lyfe-server import-food-db` reads an Open Food Facts export, or any part of one with its header line.
 
 ## Working on the app
 
@@ -227,9 +240,9 @@ xcrun devicectl device process launch --console --terminate-existing \
 
 It prints what the system and Tailscale each answer for the server's name and whether the backend replied, then quits.
 
-A debug build launched with `LYFE_DEBUG_GALLERY` set shows the gym and breath bands in every streak state with made-up numbers (`LYFE_DEBUG_GALLERY=3` skips the first three). `LYFE_DEBUG_BREATH` set to `ready`, `leadin`, `hold`, `beaten`, `recover`, `done` or `offline` shows that breath screen. `LYFE_DEBUG_PROGRESS` set to `full`, `new`, `empty`, `entry` or `kg` shows Progress or the weight entry with made-up weights. `LYFE_DEBUG_FOOD` set to `day`, `morning`, `done`, `over`, `recovering`, `offline`, `empty`, `editor`, `new` or `targets` shows the Food screen, the meal editor or the targets entry with made-up meals; set to `mixed`, `builder`, `building`, `logged`, `photo`, `estimate`, `estimating`, `failed`, `scan`, `product`, `notfound` or `label` it shows the builder, photo and barcode screens. `LYFE_DEBUG_OPEN` set to `food`, `meal`, `build`, `targets`, `photo`, `scan` or `progress` opens that screen of the real app once it has signed in; with `LYFE_DEBUG_FOOD_TAP` set as well it first logs the meal the Food screen's bar offers, and with `LYFE_DEBUG_FOOD_PHOTO` set to a line it logs a made-up plate as a photo meal and opens its estimate, or with `build` adds it to the meal being built, so use either against a local backend. `LYFE_DEBUG_UNLOCKED` opens lyfe without Face ID, `LYFE_DEBUG_LOCKED` keeps it on the lock screen, and `LYFE_DEBUG_LOCKED=open` lets the lock open by itself each time, for trying it in the simulator. `LYFE_DEBUG_BREATH_RUN=12` runs the next session by itself with 12-second holds; it plays the tones and records the session, so use it against a local backend with the sound down.
+A debug build launched with `LYFE_DEBUG_GALLERY` set shows the gym and breath bands in every streak state with made-up numbers (`LYFE_DEBUG_GALLERY=3` skips the first three). `LYFE_DEBUG_BREATH` set to `ready`, `leadin`, `hold`, `beaten`, `recover`, `done` or `offline` shows that breath screen. `LYFE_DEBUG_PROGRESS` set to `full`, `new`, `empty`, `entry` or `kg` shows Progress or the weight entry with made-up weights. `LYFE_DEBUG_FOOD` set to `day`, `morning`, `done`, `over`, `recovering`, `offline`, `empty`, `editor`, `new` or `targets` shows the Food screen, the meal editor or the targets entry with made-up meals; set to `mixed`, `builder`, `building`, `logged`, `photo`, `estimate`, `estimating`, `failed`, `scan`, `product`, `notfound` or `label` it shows the builder, photo and barcode screens; set to `drawn`, `drawnday` or `drawnmeal` it shows an estimate, the day or a logged meal with their photos drawn as illustrations. `LYFE_DEBUG_OPEN` set to `food`, `meal`, `build`, `targets`, `photo`, `scan` or `progress` opens that screen of the real app once it has signed in; with `LYFE_DEBUG_FOOD_TAP` set as well it first logs the meal the Food screen's bar offers, and with `LYFE_DEBUG_FOOD_PHOTO` set to a line it logs a made-up plate as a photo meal and opens its estimate, or with `build` adds it to the meal being built, so use either against a local backend. `LYFE_DEBUG_UNLOCKED` opens lyfe without Face ID, `LYFE_DEBUG_LOCKED` keeps it on the lock screen, and `LYFE_DEBUG_LOCKED=open` lets the lock open by itself each time, for trying it in the simulator. `LYFE_DEBUG_BREATH_RUN=12` runs the next session by itself with 12-second holds; it plays the tones and records the session, so use it against a local backend with the sound down.
 
-The tests that need a real server are skipped unless told where one is: `LYFE_LIVE_SERVER=<name>:8444@<tailnet address> swift test`. `LYFE_LOCAL_SERVER=http://127.0.0.1:8787 LYFE_LOCAL_PASSWORD=<password> swift test --no-parallel` runs the app's client against a backend on this machine; it records a breath session, saves and removes a meal, sets food targets, logs entries, a photo meal and a barcode, builds a meal from parts and saves it, and types a label, so give that backend a scratch database and the stand-in model (above). `--no-parallel` keeps the checks from logging into each other's day.
+The tests that need a real server are skipped unless told where one is: `LYFE_LIVE_SERVER=<name>:8444@<tailnet address> swift test`. `LYFE_LOCAL_SERVER=http://127.0.0.1:8787 LYFE_LOCAL_PASSWORD=<password> swift test --no-parallel` runs the app's client against a backend on this machine; it records a breath session, saves and removes a meal, sets food targets, logs entries, a photo meal and a barcode, builds a meal from parts and saves it, waits for a photo's illustration, and types a label, so give that backend a scratch database, the stand-in model and the stand-in illustrator (above). `--no-parallel` keeps the checks from logging into each other's day.
 
 ## Running on the Spark
 
@@ -249,13 +262,13 @@ Then, and again for every new version (no sudo):
 deploy/spark/install.sh
 ```
 
-After the first install, set the password as the script tells you. The app's server address is then `<spark-name>.<tailnet>.ts.net:8444`. For barcodes, fetch the food database once (`~/bin/lyfe-food-db` as `lyfe`, see Barcodes). Photo meals need gemma4:31b in the Spark's Ollama, which is shared: `ollama pull gemma4:31b` by whoever runs it, if `photo-check` says it is missing.
+After the first install, set the password as the script tells you. The app's server address is then `<spark-name>.<tailnet>.ts.net:8444`. For barcodes, fetch the food database once (`~/bin/lyfe-food-db` as `lyfe`, see Barcodes). Photo meals need gemma4:31b in the Spark's Ollama, which is shared: `ollama pull gemma4:31b` by whoever runs it, if `photo-check` says it is missing. Meal illustrations need the illustrator set up once, as `lyfe` (no sudo): `~/bin/lyfe-illustrator-setup`. It makes a Python of its own in `~/illustrator` with pinned versions of PyTorch and diffusers (about 6 GB), downloads FLUX.2 klein 4B at a pinned revision (about 15 GB; Apache 2.0, not gated), checks the GPU can be used from the account, and says how to try it with `illustration-check`. Until it has run, meals keep their photos, and `install.sh` says so.
 
 ## Backup
 
 Every night the Spark sends an encrypted copy of the whole database to a private bucket in Supabase Storage (`deploy/spark/lyfe-backup`, started by `lyfe-backup.timer` at 03:30 by the Spark's own clock, which need not be your time zone, or when the Spark is next up if it was off). Until it is set up, the database on the Spark is the only copy, and `install.sh` says so each time it runs.
 
-- **What leaves the Spark.** One file a night, `lyfe-<date and time>.dump.gpg`: a `pg_dump` of the database, meal photos included and the downloaded food database left out, encrypted on the Spark with AES-256 under a passphrase only you hold. Supabase stores a file it cannot read. After each upload the script reads the bucket's listing and fails unless the file is there at its full size.
+- **What leaves the Spark.** One file a night, `lyfe-<date and time>.dump.gpg`: a `pg_dump` of the database, meal photos and their illustrations included and the downloaded food database left out, encrypted on the Spark with AES-256 under a passphrase only you hold. Supabase stores a file it cannot read. After each upload the script reads the bucket's listing and fails unless the file is there at its full size.
 - **What it does not do yet.** Old backups are never deleted. A failed night shows only in the Spark's log (`journalctl --user -u lyfe-backup`); nothing tells the phone.
 
 Set it up once:

@@ -75,6 +75,8 @@ public struct RootView: View {
                 }
             }
         }
+        // Rows show a meal's illustration once drawn, fetched once.
+        .environment(\.mealIllustration, IllustrationSource { [model] id in await model.mealIllustration(id) })
         // The Poster palette is fixed; it does not follow dark mode. The
         // lock is ink, so the clock and battery over it are drawn light.
         .preferredColorScheme(model.isLocked ? .dark : .light)
@@ -114,7 +116,8 @@ struct FoodFlowView: View {
             if let entry = model.home?.food?.entry(id) {
                 EstimateView(
                     entry: entry, inMeal: model.home?.food?.entries.contains { $0.id == id } != true,
-                    loadPhoto: { await model.mealPhoto(id) }, onCorrect: { await model.correctEstimate(id, $0) },
+                    loadPhoto: { await model.mealPhoto(id) }, loadIllustration: { await model.mealIllustration(id) },
+                    onCorrect: { await model.correctEstimate(id, $0) },
                     onReload: { await model.reloadHome() }, onTakeBack: { await model.takeBackMeal(id) },
                     onClose: { model.closeFoodFlow() })
             } else if let capture = model.unsentCaptures.first(where: { $0.id == id }) {
