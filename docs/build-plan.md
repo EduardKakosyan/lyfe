@@ -1,6 +1,6 @@
 # lyfe first version: build plan
 
-Status: written 2026-11-17, updated 2026-11-18. Steps 1 and 2 are built and running on the Spark and the phone, with notifications switched on (the Apple push key is on the Spark; see the README). Step 3 is built and tested on this Mac, in the simulator against a local backend, but not yet installed on the Spark or the phone, so its check on the real phone (a session in airplane mode, counted once after reconnecting) and the locked-screen behaviour are still to do. Steps 4 to 9 are not started. It turns the decisions in `discovery.md` and ADRs 0001 to 0005 into an order of work.
+Status: written 2026-11-17, updated 2026-11-18. Steps 1 and 2 are built and running on the Spark and the phone, with notifications switched on (the Apple push key is on the Spark; see the README). Step 3 is built and installed on the Spark and the phone. It was tested on this Mac, in the simulator against a local backend; its check on the real phone (a session in airplane mode, counted once after reconnecting) and the locked-screen behaviour are still to do. Steps 4 to 9 are not started. It turns the decisions in `discovery.md` and ADRs 0001 to 0005 into an order of work.
 
 ## What the first version is
 
