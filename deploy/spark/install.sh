@@ -50,7 +50,8 @@ fi
 echo "== Copying to $LYFE_SSH"
 ssh "${SSH_OPTS[@]}" "$LYFE_SSH" 'mkdir -p ~/bin ~/.config/lyfe ~/.config/systemd/user ~/.cache/lyfe-install && chmod 700 ~/.config/lyfe'
 scp -q "${SSH_OPTS[@]}" "$BINARY" "$LYFE_SSH:.cache/lyfe-install/lyfe-server"
-scp -q "${SSH_OPTS[@]}" lyfe-postgres.service lyfe-server.service lyfe.env.template "$LYFE_SSH:.cache/lyfe-install/"
+scp -q "${SSH_OPTS[@]}" lyfe-postgres.service lyfe-server.service lyfe.env.template \
+    lyfe-backup lyfe-backup.service lyfe-backup.timer backup.env.template "$LYFE_SSH:.cache/lyfe-install/"
 
 echo "== Installing"
 ssh "${SSH_OPTS[@]}" "$LYFE_SSH" "TIMEZONE='$TIMEZONE' bash -s" <<'REMOTE'
@@ -91,6 +92,24 @@ install -m 755 "$STAGE/lyfe-server" ~/bin/lyfe-server.new
 mv ~/bin/lyfe-server.new ~/bin/lyfe-server
 systemctl --user enable lyfe-server.service
 systemctl --user restart lyfe-server.service
+
+# The nightly backup. Its settings file is written once, never overwritten,
+# and the timer is switched on only once those settings are complete.
+if [ ! -e ~/.config/lyfe/backup.env ]; then
+    sed -e "s|@HOME@|$HOME|" "$STAGE/backup.env.template" > ~/.config/lyfe/backup.env
+    chmod 600 ~/.config/lyfe/backup.env
+fi
+install -m 755 "$STAGE/lyfe-backup" ~/bin/lyfe-backup
+cp "$STAGE/lyfe-backup.service" "$STAGE/lyfe-backup.timer" ~/.config/systemd/user/
+systemctl --user daemon-reload
+if BACKUP_MISSING=$(~/bin/lyfe-backup ready); then
+    systemctl --user enable --now lyfe-backup.timer
+    echo "The nightly backup is on. Last run: $(systemctl --user show lyfe-backup.service -p ExecMainExitTimestamp --value | grep . || echo never)."
+else
+    systemctl --user disable --now lyfe-backup.timer >/dev/null 2>&1 || true
+    echo "NO BACKUP YET: the database on this machine is the only copy. Still to do (see the README):"
+    echo "$BACKUP_MISSING" | sed 's/^/  - /'
+fi
 rm -rf "$STAGE"
 
 for attempt in 1 2 3 4 5 6 7 8 9 10; do

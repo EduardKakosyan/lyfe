@@ -1,0 +1,12 @@
+# Runs the backup every night. If the Spark was off at the time, it runs
+# when the Spark is next up.
+[Unit]
+Description=lyfe backup, nightly
+
+[Timer]
+OnCalendar=*-*-* 03:30
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

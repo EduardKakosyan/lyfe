@@ -200,4 +200,36 @@ deploy/spark/install.sh
 
 After the first install, set the password as the script tells you. The app's server address is then `<spark-name>.<tailnet>.ts.net:8444`.
 
-There is no backup yet: the database on the Spark is the only copy.
+## Backup
+
+Every night the Spark sends an encrypted copy of the whole database to a private bucket in Supabase Storage (`deploy/spark/lyfe-backup`, started at 03:30 by `lyfe-backup.timer`, or when the Spark is next up if it was off). Until it is set up, the database on the Spark is the only copy, and `install.sh` says so each time it runs.
+
+- **What leaves the Spark.** One file a night, `lyfe-<date and time>.dump.gpg`: a `pg_dump` of the database, encrypted on the Spark with AES-256 under a passphrase only you hold. Supabase stores a file it cannot read. After each upload the script reads the bucket's listing and fails unless the file is there at its full size.
+- **What it does not do yet.** Old backups are never deleted. A failed night shows only in the Spark's log (`journalctl --user -u lyfe-backup`); nothing tells the phone.
+
+Set it up once:
+
+1. In Supabase, pick the project. An S3 access key reaches every bucket in its project and ignores row-level security, and it will sit on a shared machine, so use a project that holds nothing else you would mind exposing; a project of its own is safest.
+2. In that project, create a private bucket (Storage > New bucket, not public), and an S3 access key (in the Storage settings, under S3). The same place shows the endpoint and region.
+3. On the Spark, as `lyfe`, put the access key in `~/.config/lyfe/backup-s3-key` (the key ID on line 1, the secret on line 2) and make a passphrase:
+
+   ```sh
+   umask 077
+   nano ~/.config/lyfe/backup-s3-key
+   openssl rand -base64 32 > ~/.config/lyfe/backup-passphrase
+   cat ~/.config/lyfe/backup-passphrase   # copy this into your password manager
+   ```
+
+   Without the passphrase no backup can be read, so a copy has to exist somewhere other than the Spark.
+4. In `~/.config/lyfe/backup.env` on the Spark, fill in `LYFE_BACKUP_S3_ENDPOINT`, `LYFE_BACKUP_S3_REGION` and `LYFE_BACKUP_BUCKET`.
+5. Run `~/bin/lyfe-backup` once and check it says "Backed up", then `deploy/spark/install.sh` (with `SKIP_BUILD=1` if nothing else changed), which switches the nightly timer on.
+
+To get a backup back, on any machine with the settings and the passphrase:
+
+```sh
+~/bin/lyfe-backup list                                   # names and sizes, oldest first
+~/bin/lyfe-backup fetch lyfe-<date and time>.dump.gpg lyfe.dump
+createdb lyfe_restored && pg_restore --no-owner --dbname=lyfe_restored lyfe.dump
+```
+
+Try that once after setting it up: a backup that has never been restored is not yet a backup.
