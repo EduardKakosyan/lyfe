@@ -22,6 +22,21 @@ public enum Poster {
     public static let margin: CGFloat = 18
 }
 
+extension Poster {
+    /// Text for a giant figure, set tighter than the font spaces it. The
+    /// squeeze goes between characters only: after the last one it would
+    /// make the text narrower than its ink, and the edge of the last
+    /// character would be cut off.
+    static func tight(_ text: String, by kern: CGFloat) -> AttributedString {
+        var string = AttributedString(text)
+        string.kern = kern
+        if let last = string.characters.indices.last {
+            string[last...].kern = 0
+        }
+        return string
+    }
+}
+
 extension Text {
     /// Small tracked capitals: every label that is not the number.
     func posterLabel() -> some View {

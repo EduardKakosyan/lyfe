@@ -88,6 +88,19 @@ import Testing
 }
 
 @Suite struct PosterTextTests {
+    @Test func aGiantFigureIsSqueezedBetweenCharactersButNotAfterTheLast() {
+        // Squeezing after the last character makes the text narrower than
+        // its ink, and the right edge of that character is cut off.
+        for text in ["0", "12", "4:00"] {
+            let figure = Poster.tight(text, by: -8)
+            let kerns = figure.runs.flatMap { run in
+                Array(repeating: run.kern ?? 0, count: figure[run.range].characters.count)
+            }
+            #expect(kerns == Array(repeating: -8, count: text.count - 1) + [0], "\(text)")
+        }
+        #expect(String(Poster.tight("", by: -8).characters).isEmpty)
+    }
+
     @Test func agoLabels() {
         let now = Date(timeIntervalSince1970: 1_795_014_000)
         #expect(agoLabel(from: now.addingTimeInterval(-5), to: now) == "JUST NOW")

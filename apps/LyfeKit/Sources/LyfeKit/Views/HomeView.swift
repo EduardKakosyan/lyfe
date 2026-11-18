@@ -244,12 +244,11 @@ struct RoutineBand: View {
                 }
             }
             .overlay(alignment: .bottomTrailing) {
-                Text("\(numeral)")
+                Text(Poster.tight("\(numeral)", by: numeral > 9 ? -8 : -10))
                     .font(.system(size: numeral > 9 ? 150 : 190, weight: .heavy))
-                    .kerning(numeral > 9 ? -8 : -10)
                     .contentTransition(.numericText())
                     .fixedSize()
-                    .padding(.trailing, numeral > 9 ? 14 : 22)
+                    .padding(.trailing, 12)
                     .offset(y: numeral > 9 ? 36 : 46)
                     .accessibilityHidden(true)
             }

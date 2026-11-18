@@ -17,9 +17,8 @@ public struct SignInView: View {
     public var body: some View {
         VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 0) {
-                Text("LYFE")
+                Text(Poster.tight("LYFE", by: -5))
                     .font(.system(size: 96, weight: .heavy))
-                    .tracking(-5)
                     .padding(.top, 24)
                 Text("Sign in to your server").posterLabel()
                     .padding(.bottom, 22)

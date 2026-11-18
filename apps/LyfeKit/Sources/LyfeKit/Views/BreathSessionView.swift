@@ -207,9 +207,8 @@ struct BreathGiant: View {
     let text: String
 
     var body: some View {
-        Text(text)
+        Text(Poster.tight(text, by: -8))
             .font(.system(size: 150, weight: .heavy))
-            .kerning(-8)
             .monospacedDigit()
             .lineLimit(1)
             .minimumScaleFactor(0.5)
