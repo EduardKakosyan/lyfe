@@ -8,6 +8,7 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::routines::breath;
+use crate::routines::food::{self, Slot};
 use crate::routines::gym::Activity;
 use crate::routines::weight::{self, Unit};
 
@@ -414,6 +415,227 @@ pub async fn weigh_ins(pool: &PgPool, timezone: chrono_tz::Tz) -> sqlx::Result<V
                 measured_local: measured_at.with_timezone(&timezone).naive_local(),
                 grams: r.get::<i32, _>("grams") as u32,
             }
+        })
+        .collect())
+}
+
+// --- Food ----------------------------------------------------------------
+
+/// A slot read back from the database, where only the four names can be.
+fn stored_slot(text: &str) -> Slot {
+    Slot::parse(text).unwrap_or(Slot::Snack)
+}
+
+/// Stores a saved meal with its ingredients, replacing the recipe when the
+/// meal is already stored. Saving a meal that was removed brings it back.
+pub async fn upsert_saved_meal(pool: &PgPool, meal: &food::SavedMeal) -> sqlx::Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "insert into saved_meals (id, name, slot, portions) values ($1, $2, $3, $4)
+         on conflict (id) do update set
+            name = excluded.name, slot = excluded.slot, portions = excluded.portions,
+            updated_at = now(), archived_at = null",
+    )
+    .bind(meal.id)
+    .bind(&meal.name)
+    .bind(meal.slot.as_str())
+    .bind(meal.portions as i32)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("delete from saved_meal_ingredients where meal_id = $1")
+        .bind(meal.id)
+        .execute(&mut *tx)
+        .await?;
+    let positions: Vec<i32> = (1..=meal.ingredients.len() as i32).collect();
+    let names: Vec<&str> = meal.ingredients.iter().map(|i| i.name.as_str()).collect();
+    let grams: Vec<f64> = meal.ingredients.iter().map(|i| i.grams).collect();
+    let kcal: Vec<f64> = meal.ingredients.iter().map(|i| i.kcal_per_100g).collect();
+    let protein: Vec<f64> = meal.ingredients.iter().map(|i| i.protein_per_100g).collect();
+    sqlx::query(
+        "insert into saved_meal_ingredients (meal_id, position, name, grams, kcal_per_100g, protein_per_100g)
+         select $1, * from unnest($2::integer[], $3::text[], $4::double precision[], $5::double precision[],
+                                  $6::double precision[])",
+    )
+    .bind(meal.id)
+    .bind(&positions)
+    .bind(&names)
+    .bind(&grams)
+    .bind(&kcal)
+    .bind(&protein)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await
+}
+
+/// Takes a saved meal out of use. Entries logged from it stay. Returns
+/// false when no meal in use has this id.
+pub async fn archive_saved_meal(pool: &PgPool, id: Uuid) -> sqlx::Result<bool> {
+    let result = sqlx::query("update saved_meals set archived_at = now() where id = $1 and archived_at is null")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Saved meals with their ingredients in the order typed: those in use,
+/// or with `id` the one meal with that id whether in use or not.
+async fn saved_meals_where(pool: &PgPool, id: Option<Uuid>) -> sqlx::Result<Vec<food::SavedMeal>> {
+    let rows = sqlx::query(
+        "select m.id, m.name, m.slot, m.portions,
+                coalesce(array_agg(i.name order by i.position) filter (where i.position is not null), '{}') as names,
+                coalesce(array_agg(i.grams order by i.position) filter (where i.position is not null), '{}') as grams,
+                coalesce(array_agg(i.kcal_per_100g order by i.position) filter (where i.position is not null), '{}') as kcal,
+                coalesce(array_agg(i.protein_per_100g order by i.position) filter (where i.position is not null), '{}') as protein
+         from saved_meals m
+         left join saved_meal_ingredients i on i.meal_id = m.id
+         where case when $1::uuid is null then m.archived_at is null else m.id = $1 end
+         group by m.id
+         order by m.created_at, m.id",
+    )
+    .bind(id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let names: Vec<String> = r.get("names");
+            let grams: Vec<f64> = r.get("grams");
+            let kcal: Vec<f64> = r.get("kcal");
+            let protein: Vec<f64> = r.get("protein");
+            food::SavedMeal {
+                id: r.get("id"),
+                name: r.get("name"),
+                slot: stored_slot(r.get("slot")),
+                portions: r.get::<i32, _>("portions") as u32,
+                ingredients: names
+                    .into_iter()
+                    .zip(grams)
+                    .zip(kcal.into_iter().zip(protein))
+                    .map(|((name, grams), (kcal_per_100g, protein_per_100g))| food::Ingredient {
+                        name,
+                        grams,
+                        kcal_per_100g,
+                        protein_per_100g,
+                    })
+                    .collect(),
+            }
+        })
+        .collect())
+}
+
+/// The saved meals in use.
+pub async fn saved_meals(pool: &PgPool) -> sqlx::Result<Vec<food::SavedMeal>> {
+    saved_meals_where(pool, None).await
+}
+
+/// One saved meal, in use or not: a meal tapped on a phone that was
+/// offline can arrive after the meal was removed.
+pub async fn saved_meal(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<food::SavedMeal>> {
+    Ok(saved_meals_where(pool, Some(id)).await?.into_iter().next())
+}
+
+/// A logged meal as it is stored: the recipe's name and figures as they
+/// stood when it arrived.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredFoodEntry {
+    pub id: Uuid,
+    pub eaten_at: DateTime<Utc>,
+    pub slot: Slot,
+    pub meal_id: Option<Uuid>,
+    pub name: String,
+    pub servings: f64,
+    pub amount: food::Amount,
+}
+
+/// Stores a logged meal. Returns false, and changes nothing, when an entry
+/// with this id is already stored, taken back or not.
+pub async fn insert_food_entry(pool: &PgPool, entry: &StoredFoodEntry, device_session_id: i64) -> sqlx::Result<bool> {
+    let result = sqlx::query(
+        "insert into food_entries (id, eaten_at, slot, meal_id, name, servings, kcal, protein_dg, device_session_id)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         on conflict (id) do nothing",
+    )
+    .bind(entry.id)
+    .bind(entry.eaten_at)
+    .bind(entry.slot.as_str())
+    .bind(entry.meal_id)
+    .bind(&entry.name)
+    .bind(entry.servings)
+    .bind(entry.amount.kcal as i32)
+    .bind(entry.amount.protein_dg as i32)
+    .bind(device_session_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Takes a logged meal back. Returns false when no entry with this id was
+/// counted.
+pub async fn remove_food_entry(pool: &PgPool, id: Uuid) -> sqlx::Result<bool> {
+    let result = sqlx::query("update food_entries set removed_at = now() where id = $1 and removed_at is null")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Every logged meal not taken back, oldest first, with its time read in
+/// the owner's time zone.
+pub async fn food_entries(pool: &PgPool, timezone: chrono_tz::Tz) -> sqlx::Result<Vec<food::Entry>> {
+    let rows = sqlx::query(
+        "select id, eaten_at, slot, meal_id, name, servings, kcal, protein_dg from food_entries
+         where removed_at is null
+         order by eaten_at, id",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let eaten_at: DateTime<Utc> = r.get("eaten_at");
+            food::Entry {
+                id: r.get("id"),
+                eaten_local: eaten_at.with_timezone(&timezone).naive_local(),
+                slot: stored_slot(r.get("slot")),
+                meal_id: r.get("meal_id"),
+                name: r.get("name"),
+                servings: r.get("servings"),
+                amount: food::Amount {
+                    kcal: r.get::<i32, _>("kcal") as u32,
+                    protein_dg: r.get::<i32, _>("protein_dg") as u32,
+                },
+            }
+        })
+        .collect())
+}
+
+/// Sets the targets from a day on. Setting them again the same day
+/// replaces that day's.
+pub async fn set_food_target(pool: &PgPool, target: &food::Target) -> sqlx::Result<()> {
+    sqlx::query(
+        "insert into food_targets (effective_on, kcal, protein_g) values ($1, $2, $3)
+         on conflict (effective_on) do update set
+            kcal = excluded.kcal, protein_g = excluded.protein_g, set_at = now()",
+    )
+    .bind(target.since)
+    .bind(target.kcal as i32)
+    .bind(target.protein_g as i32)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Every target ever set, oldest first.
+pub async fn food_targets(pool: &PgPool) -> sqlx::Result<Vec<food::Target>> {
+    let rows = sqlx::query("select effective_on, kcal, protein_g from food_targets order by effective_on")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| food::Target {
+            since: r.get("effective_on"),
+            kcal: r.get::<i32, _>("kcal") as u32,
+            protein_g: r.get::<i32, _>("protein_g") as u32,
         })
         .collect())
 }

@@ -25,6 +25,7 @@ struct LyfeApp: App {
                         await reportConnectionFromEnvironment()
                         await signInFromEnvironment()
                         await runBreathFromEnvironment()
+                        await openFromEnvironment()
                     }
                 #endif
         }
@@ -48,6 +49,8 @@ struct LyfeApp: App {
                 BreathGallery(screen: screen)
             } else if let screen = ProcessInfo.processInfo.environment["LYFE_DEBUG_PROGRESS"] {
                 ProgressGallery(screen: screen)
+            } else if let screen = ProcessInfo.processInfo.environment["LYFE_DEBUG_FOOD"] {
+                FoodGallery(screen: screen)
             } else {
                 RootView(model: model)
             }
@@ -105,6 +108,30 @@ struct LyfeApp: App {
                     session.tap()
                 }
                 try? await Task.sleep(for: .milliseconds(100))
+            }
+        }
+
+        /// With LYFE_DEBUG_OPEN set to `food`, `meal`, `targets` or
+        /// `progress`, a signed-in development build opens that screen by
+        /// itself once Home has arrived. With LYFE_DEBUG_FOOD_TAP set as
+        /// well it first logs the meal the Food screen's bar offers, as
+        /// one tap would; use that against a local backend, since the
+        /// meal is recorded.
+        private func openFromEnvironment() async {
+            let environment = ProcessInfo.processInfo.environment
+            guard let screen = environment["LYFE_DEBUG_OPEN"] else { return }
+            for _ in 0..<100 where model.home?.food == nil {
+                try? await Task.sleep(for: .milliseconds(200))
+            }
+            if environment["LYFE_DEBUG_FOOD_TAP"] != nil, let meal = model.nextMeal {
+                await model.logMeal(meal)
+            }
+            switch screen {
+            case "food": model.openFood()
+            case "meal": model.openMealEditor(model.home?.food?.meals.first)
+            case "targets": model.openTargets()
+            case "progress": model.openProgress()
+            default: break
             }
         }
 

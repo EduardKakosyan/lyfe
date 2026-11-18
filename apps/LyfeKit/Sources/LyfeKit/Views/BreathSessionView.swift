@@ -307,6 +307,9 @@ struct BreathBar: View {
                 Text(big)
                     .font(.system(size: 30, weight: .heavy))
                     .tracking(-0.9)
+                    // A long meal name is set smaller rather than wrapped.
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.6)
             }
             Spacer()
             Text(mark).font(.system(size: 32, weight: .heavy))

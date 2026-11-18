@@ -48,10 +48,21 @@ public final class AppModel {
     /// Set when the backend would not take a weight that was typed.
     public private(set) var weighInProblem: String?
 
+    /// Meals tapped on this phone that the backend has not confirmed yet,
+    /// oldest first.
+    public private(set) var unsentFood: [MealTap]
+    /// Set when the backend would not take a meal that was tapped.
+    public private(set) var foodProblem: String?
+    /// The saved meal being typed or changed, while the editor is on screen.
+    public private(set) var mealDraft: MealDraft?
+    /// True while the targets entry is on screen.
+    public private(set) var isEnteringTargets = false
+
     /// The screens other than Home, for a signed-in owner.
     public enum Screen: Equatable, Sendable {
         case home
         case progress
+        case food
     }
 
     /// True while lyfe is waiting for Face ID. Set when it is opened and
@@ -77,6 +88,8 @@ public final class AppModel {
     private let breath: BreathStore
     private let weighIns: WeighInStore
     private var isSendingWeighIns = false
+    private let food: FoodStore
+    private var isSendingFood = false
     private let ownerCheck: any OwnerCheck
     private let makeCues: @MainActor () -> any BreathCues
     private var isSendingBreath = false
@@ -90,6 +103,7 @@ public final class AppModel {
         cache: HomeCache,
         breath: BreathStore,
         weighIns: WeighInStore,
+        food: FoodStore,
         transport: any HTTPTransport,
         deviceName: String,
         defaultServerAddress: String = "",
@@ -102,6 +116,7 @@ public final class AppModel {
         self.cache = cache
         self.breath = breath
         self.weighIns = weighIns
+        self.food = food
         self.ownerCheck = ownerCheck
         makeCues = cues
         self.transport = transport
@@ -120,6 +135,7 @@ public final class AppModel {
         homeFetchedAt = hasSession ? cached?.fetchedAt : nil
         unsentBreath = breath.outbox().map(\.id)
         unsentWeighIns = weighIns.outbox().map(\.id)
+        unsentFood = food.outbox()
         pickUpBreathSession()
         lock()
     }
@@ -134,6 +150,7 @@ public final class AppModel {
             cache: .standard(),
             breath: .standard(),
             weighIns: .standard(),
+            food: .standard(),
             transport: TailnetTransport.live(),
             deviceName: deviceName,
             defaultServerAddress: defaultServerAddress,
@@ -275,6 +292,9 @@ public final class AppModel {
         refreshProblem = nil
         breathProblem = nil
         weighInProblem = nil
+        foodProblem = nil
+        mealDraft = nil
+        isEnteringTargets = false
         screen = .home
         isEnteringWeight = false
         isLocked = false
@@ -292,6 +312,7 @@ public final class AppModel {
         await sendPushToken()
         await sendUnsentBreath()
         await sendUnsentWeighIns()
+        await sendUnsentFood()
         guard phase == .signedIn else { return }
         do {
             try await loadHome(api, token)
@@ -511,5 +532,190 @@ public final class AppModel {
     private func confirmedWeighIn(_ id: UUID) {
         weighIns.remove(id)
         unsentWeighIns.removeAll { $0 == id }
+    }
+
+    // MARK: Food
+
+    public func openFood() {
+        screen = .food
+    }
+
+    public func closeFood() {
+        mealDraft = nil
+        isEnteringTargets = false
+        screen = .home
+    }
+
+    /// The saved meal the Food screen's bar offers: the one for the next
+    /// main meal still open today. Nil when there is nothing to tap.
+    public var nextMeal: SavedMeal? {
+        guard let food = home?.food, case .log(let meal) = FoodText.bar(food, unsent: unsentFood).action else {
+            return nil
+        }
+        return meal
+    }
+
+    /// Logs a saved meal: one tap, one portion unless another is chosen.
+    /// The tap is kept on this phone before anything is sent, then sent at
+    /// once; with no connection it waits for the next refresh and still
+    /// counts for the day it was tapped on.
+    @discardableResult
+    public func logMeal(_ meal: SavedMeal, servings: Double = 1) async -> MealLogOutcome {
+        let tap = MealTap(eatenAt: now(), meal: meal, servings: servings)
+        food.enqueue(tap)
+        unsentFood.append(tap)
+        let refused = await sendUnsentFood()
+        if refused.contains(tap.id) { return .refused }
+        return unsentFood.contains { $0.id == tap.id } ? .saved : .sent
+    }
+
+    /// Sends every tap the backend has not confirmed, oldest first, and
+    /// shows the state it answers with. Each carries its own id, so one
+    /// that was received but whose answer was lost is not logged twice.
+    /// Returns the ones the backend refused, which are dropped: sending
+    /// them again would never work.
+    @discardableResult
+    public func sendUnsentFood() async -> Set<UUID> {
+        guard phase == .signedIn, !isSendingFood, let api, let token else { return [] }
+        isSendingFood = true
+        defer { isSendingFood = false }
+        var refused: Set<UUID> = []
+        var tried: Set<UUID> = []
+        // Read again each time round: a meal tapped while another is on
+        // its way goes out in the same pass.
+        while let tap = food.outbox().first(where: { !tried.contains($0.id) }) {
+            tried.insert(tap.id)
+            do {
+                show(try await api.recordFoodEntry(token: token, tap: tap))
+                confirmedFood(tap.id)
+                foodProblem = nil
+            } catch LyfeAPIError.unreadableResponse {
+                // The backend took it; only its answer could not be read.
+                confirmedFood(tap.id)
+                refreshProblem = "The server's answer could not be read. The app may be older than the server."
+            } catch LyfeAPIError.unauthorized {
+                forgetSession()
+                break
+            } catch LyfeAPIError.unreachable(let why) {
+                isOffline = true
+                offlineReason = why
+                break
+            } catch LyfeAPIError.server(let status) where (400..<500).contains(status) {
+                confirmedFood(tap.id)
+                refused.insert(tap.id)
+                foodProblem = "The server would not log \(tap.name) (\(status))."
+            } catch LyfeAPIError.server(let status) {
+                foodProblem = "The server could not log a meal just now (\(status)). It stays on this phone."
+                break
+            } catch {
+                break
+            }
+        }
+        return refused
+    }
+
+    private func confirmedFood(_ id: UUID) {
+        food.remove(id)
+        unsentFood.removeAll { $0.id == id }
+    }
+
+    /// Takes a logged meal back, for a tap that was a slip. One still
+    /// waiting on this phone is simply dropped; one the backend has needs
+    /// a connection. Returns what went wrong, or nil.
+    @discardableResult
+    public func takeBackMeal(_ id: UUID) async -> String? {
+        if unsentFood.contains(where: { $0.id == id }) {
+            confirmedFood(id)
+            return nil
+        }
+        return await changeFood("take that back") { api, token in
+            try await api.removeFoodEntry(token: token, id: id)
+        }
+    }
+
+    /// Opens the meal editor on a new meal, or on a saved one to change.
+    public func openMealEditor(_ meal: SavedMeal? = nil) {
+        screen = .food
+        isEnteringTargets = false
+        mealDraft = meal.map { MealDraft(editing: $0) } ?? MealDraft()
+    }
+
+    public func closeMealEditor() {
+        mealDraft = nil
+    }
+
+    /// Saves the meal being typed and closes the editor. Needs a
+    /// connection: a recipe is set up at home, not captured on the move.
+    /// Returns what went wrong, or nil.
+    @discardableResult
+    public func saveMeal(_ draft: MealDraft) async -> String? {
+        if let missing = draft.missing { return missing + "." }
+        let problem = await changeFood("save the meal") { api, token in
+            try await api.saveMeal(token: token, draft: draft)
+        }
+        if problem == nil { mealDraft = nil }
+        return problem
+    }
+
+    /// Takes a saved meal out of the list and closes the editor. What was
+    /// logged from it stays. Returns what went wrong, or nil.
+    @discardableResult
+    public func removeMeal(_ id: UUID) async -> String? {
+        let problem = await changeFood("remove the meal") { api, token in
+            try await api.removeMeal(token: token, id: id)
+        }
+        if problem == nil { mealDraft = nil }
+        return problem
+    }
+
+    public func openTargets() {
+        screen = .food
+        mealDraft = nil
+        isEnteringTargets = true
+    }
+
+    public func closeTargets() {
+        isEnteringTargets = false
+    }
+
+    /// Sets the calorie and protein targets from today on and closes the
+    /// entry. Only the owner sets them. Returns what went wrong, or nil.
+    @discardableResult
+    public func setFoodTargets(_ targets: FoodTargets) async -> String? {
+        let problem = await changeFood("set the targets") { api, token in
+            try await api.setFoodTargets(token: token, targets: targets)
+        }
+        if problem == nil { isEnteringTargets = false }
+        return problem
+    }
+
+    /// Makes a change to food that needs the backend now, and shows the
+    /// state it answers with. `what` finishes "Could not …". Returns what
+    /// went wrong in words for the owner, or nil.
+    private func changeFood(
+        _ what: String, _ change: (LyfeAPI, String) async throws -> HomeSnapshot
+    ) async -> String? {
+        guard phase == .signedIn, let api, let token else { return "Sign in first." }
+        do {
+            show(try await change(api, token))
+            return nil
+        } catch LyfeAPIError.unreadableResponse {
+            // The backend made the change; only its answer could not be read.
+            refreshProblem = "The server's answer could not be read. The app may be older than the server."
+            return nil
+        } catch LyfeAPIError.unauthorized {
+            forgetSession()
+            return "Signed out."
+        } catch LyfeAPIError.unreachable(let why) {
+            isOffline = true
+            offlineReason = why
+            return "Could not \(what): can't reach the server (\(why))."
+        } catch LyfeAPIError.server(let status) where (400..<500).contains(status) {
+            return "The server would not \(what) (\(status))."
+        } catch LyfeAPIError.server(let status) {
+            return "Could not \(what): the server answered with an error (\(status))."
+        } catch {
+            return "Could not \(what)."
+        }
     }
 }

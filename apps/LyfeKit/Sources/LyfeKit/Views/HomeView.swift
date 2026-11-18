@@ -2,7 +2,7 @@ import SwiftUI
 
 /// Home: the week, one band per routine, and the black bar with the next
 /// thing to do. The gym fills itself in from the watch; the breath band
-/// opens the next session.
+/// opens the next session; the fuel band opens the Food screen.
 public struct HomeView: View {
     let model: AppModel
     @State private var confirmingSignOut = false
@@ -50,6 +50,20 @@ public struct HomeView: View {
                                 PosterRule()
                             }
                         }
+                        if let food = home.food {
+                            Button {
+                                model.openFood()
+                            } label: {
+                                VStack(spacing: 0) {
+                                    FuelBand(food: food)
+                                    PosterRule()
+                                    StripRow(left: FoodText.homeLine(food), right: "Log →")
+                                    PosterRule()
+                                }
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityHint("Opens Food")
+                        }
                         SessionRows(home: home)
                         Button {
                             model.openProgress()
@@ -92,6 +106,11 @@ public struct HomeView: View {
             notices.append(problem)
         } else if !model.unsentWeighIns.isEmpty {
             notices.append(WeightText.unsent(model.unsentWeighIns.count))
+        }
+        if let problem = model.foodProblem {
+            notices.append(problem)
+        } else if !model.unsentFood.isEmpty {
+            notices.append(FoodText.unsent(model.unsentFood.count))
         }
         return notices
     }
@@ -229,7 +248,8 @@ struct NoticeRow: View {
 }
 
 /// A routine's band: the streak as a giant numeral, this week's sessions
-/// as squares, and stripes while the streak is in recovery.
+/// (or, for food, the last days) as squares, and stripes while the streak
+/// is in recovery.
 struct RoutineBand: View {
     var name: String
     var colour: Color
@@ -240,8 +260,8 @@ struct RoutineBand: View {
     var numeral: Int
     var recovering: Bool
     var lines: (headline: String, detail: String?)
-    var target: Int
-    var done: Int
+    /// One square per session the week needs, or per day shown.
+    var squares: [MarkState]
     var spoken: String
 
     private static let height: CGFloat = 150
@@ -273,8 +293,8 @@ struct RoutineBand: View {
                         Text(detail).posterLabel()
                     }
                     HStack(spacing: 4) {
-                        ForEach(0..<max(target, done), id: \.self) { index in
-                            PosterSquare(state: index < done ? .solid : .outline)
+                        ForEach(Array(squares.enumerated()), id: \.offset) { _, state in
+                            PosterSquare(state: state)
                         }
                     }
                     .padding(.top, 6)
@@ -286,7 +306,7 @@ struct RoutineBand: View {
             }
             .clipped()
             .foregroundStyle(ink)
-            .animation(.snappy, value: done)
+            .animation(.snappy, value: squares)
             .animation(.snappy, value: numeral)
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(spoken)
@@ -304,7 +324,7 @@ struct GymBand: View {
             // The streak once the backend sends one; this week's count before that.
             numeral: gym.streak?.weeks ?? gym.done,
             recovering: gym.streak?.state == .recovering,
-            lines: HomeText.gymLines(for: home), target: gym.target, done: gym.done,
+            lines: HomeText.gymLines(for: home), squares: HomeText.squares(done: gym.done, target: gym.target),
             spoken: HomeText.gymSpoken(for: home))
     }
 }
@@ -318,8 +338,22 @@ struct BreathBand: View {
         RoutineBand(
             name: "Breath", colour: Poster.blue, shade: Poster.blueShade, ink: Poster.paper,
             numeral: breath.streak.weeks, recovering: breath.streak.state == .recovering,
-            lines: HomeText.weekLines(for: breath.streak, home: home), target: breath.target, done: breath.done,
+            lines: HomeText.weekLines(for: breath.streak, home: home),
+            squares: HomeText.squares(done: breath.done, target: breath.target),
             spoken: HomeText.spoken("Breath", streak: breath.streak, done: breath.done, target: breath.target))
+    }
+}
+
+/// The fuel band, in yellow: days logged in a row, and the last seven
+/// days as squares, today last.
+struct FuelBand: View {
+    let food: FoodDay
+
+    var body: some View {
+        RoutineBand(
+            name: "Fuel", colour: Poster.yellow, shade: Poster.yellowShade, ink: Poster.ink,
+            numeral: food.streak.days, recovering: food.streak.state == .recovering,
+            lines: FoodText.bandLines(food), squares: FoodText.squares(food.streak), spoken: FoodText.bandSpoken(food))
     }
 }
 
@@ -459,6 +493,12 @@ enum HomeText {
     /// "strength_training" becomes "STRENGTH TRAINING".
     static func typeLabel(_ typeKey: String) -> String {
         typeKey.replacingOccurrences(of: "_", with: " ").uppercased()
+    }
+
+    /// A weekly band's squares: one per session the week needs, the done
+    /// ones solid, and more when the week went past its target.
+    static func squares(done: Int, target: Int) -> [MarkState] {
+        (0..<max(target, done)).map { $0 < done ? .solid : .outline }
     }
 
     static func weeksInARow(_ weeks: Int) -> String {

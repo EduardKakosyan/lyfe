@@ -7,6 +7,7 @@ use clap::Args;
 
 use crate::push::apns::Environment;
 use crate::routines::breath::BreathRules;
+use crate::routines::food::FoodSettings;
 use crate::routines::gym::GymRules;
 use crate::routines::weight::{Unit, WeightSettings};
 
@@ -136,6 +137,12 @@ pub struct ServeConfig {
     /// (`06:30`), or `off` for none.
     #[arg(long, env = "LYFE_WEIGH_IN_AT", default_value = "06:30", value_parser = parse_prompt_at)]
     pub weigh_in_at: PromptAt,
+
+    /// From this time of the owner's day a logging streak with nothing
+    /// logged yet is prompted for (`12:00`), or `off` for no prompt. It is
+    /// also held to the hours prompts are sent between.
+    #[arg(long, env = "LYFE_FOOD_PROMPT_AT", default_value = "12:00", value_parser = parse_prompt_at)]
+    pub food_prompt_at: PromptAt,
 }
 
 /// A time of day for a prompt, or none.
@@ -168,6 +175,10 @@ impl ServeConfig {
 
     pub fn weight_settings(&self) -> WeightSettings {
         WeightSettings { unit: self.weight_unit, prompt_at: self.weigh_in_at.0 }
+    }
+
+    pub fn food_settings(&self) -> FoodSettings {
+        FoodSettings { prompt_at: self.food_prompt_at.0 }
     }
 
     pub fn gym_rules(&self) -> GymRules {

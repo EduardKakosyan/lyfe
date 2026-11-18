@@ -10,6 +10,10 @@
 //! The morning weigh-in is separate: one prompt at the owner's set time,
 //! whose reply field takes the weight. It is not a streak, so it never
 //! comes twice in a day and never comes once a weight is in.
+//!
+//! Food logging is a streak by the day, so its prompt is by the day too:
+//! once, from a set time on, when a streak is alive and nothing has been
+//! logged yet today.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,6 +25,7 @@ use super::apns::{Alert, ApnsClient, Environment, PushError};
 use crate::db::{self, PushTarget};
 use crate::garmin::sync::Syncer;
 use crate::routines::breath;
+use crate::routines::food::{self, FoodSettings};
 use crate::routines::gym::{self, GymRules};
 use crate::routines::weekly::{self, Prompt, Week, Wording};
 use crate::routines::weight::{self, WeightSettings};
@@ -46,6 +51,8 @@ pub struct Notifier {
     pub until_hour: u32,
     /// When the weigh-in prompt goes out, and the unit it asks for.
     pub weight: WeightSettings,
+    /// From when in the day an unlogged day is prompted for.
+    pub food: FoodSettings,
 }
 
 /// What one look at the clock led to.
@@ -143,6 +150,45 @@ impl Notifier {
             return Ok(Outcome::Undelivered);
         }
         db::record_notification(&self.pool, WEIGH_IN_KIND, today, &alert.title, &alert.body).await?;
+        Ok(Outcome::Sent { title: alert.title, body: alert.body, devices })
+    }
+
+    /// Sends the food-logging prompt: once a day, from its set time until
+    /// the daytime window closes, when a logging streak is alive and today
+    /// has nothing logged. A meal still waiting on the phone to be sent is
+    /// not known here, so it can be prompted for.
+    pub async fn food(&self, now: DateTime<Utc>) -> sqlx::Result<Outcome> {
+        let Some(at) = self.food.prompt_at else {
+            return Ok(Outcome::Quiet);
+        };
+        let local = now.with_timezone(&self.timezone);
+        if local.hour() < self.from_hour || local.hour() >= self.until_hour || local.time() < at {
+            return Ok(Outcome::Quiet);
+        }
+        let targets = db::push_targets(&self.pool).await?;
+        if targets.is_empty() {
+            return Ok(Outcome::NoDevices);
+        }
+        let today = local.date_naive();
+        let entries = db::food_entries(&self.pool, self.timezone).await?;
+        let Some(prompt) = food::prompt(&food::streak(today, &food::logged_days(&entries))) else {
+            return Ok(Outcome::NothingDue);
+        };
+        if db::notification_sent(&self.pool, food::PROMPT_KIND, today).await? {
+            return Ok(Outcome::AlreadySent);
+        }
+        let alert = Alert {
+            title: prompt.title(),
+            body: prompt.body(),
+            collapse_id: food::PROMPT_KIND.to_string(),
+            expires_at: self.window_end(today, now),
+            category: Some(food::PROMPT_CATEGORY.to_string()),
+        };
+        let devices = self.deliver(&targets, &alert, now).await;
+        if devices == 0 {
+            return Ok(Outcome::Undelivered);
+        }
+        db::record_notification(&self.pool, food::PROMPT_KIND, today, &alert.title, &alert.body).await?;
         Ok(Outcome::Sent { title: alert.title, body: alert.body, devices })
     }
 
@@ -255,6 +301,12 @@ impl Notifier {
                 Ok(Outcome::Undelivered) => tracing::warn!("the weigh-in prompt was due but reached no device"),
                 Ok(_) => {}
                 Err(error) => tracing::error!(%error, "could not check for the weigh-in prompt"),
+            }
+            match self.food(now).await {
+                Ok(Outcome::Sent { devices, .. }) => tracing::info!(devices, "food-logging prompt sent"),
+                Ok(Outcome::Undelivered) => tracing::warn!("the food-logging prompt was due but reached no device"),
+                Ok(_) => {}
+                Err(error) => tracing::error!(%error, "could not check for the food-logging prompt"),
             }
             match self.tick(now).await {
                 Ok(Outcome::Sent { title, devices, .. }) => {

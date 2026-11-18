@@ -112,6 +112,7 @@ fn notifier(config: &ServeConfig, pool: &sqlx::PgPool, syncer: Arc<Syncer>) -> a
         from_hour: push.notify_from_hour,
         until_hour: push.notify_until_hour,
         weight: config.weight_settings(),
+        food: config.food_settings(),
     }))
 }
 
@@ -141,6 +142,7 @@ async fn serve(config: ServeConfig) -> anyhow::Result<()> {
                     from_hour = notifier.from_hour,
                     until_hour = notifier.until_hour,
                     weigh_in_at = ?notifier.weight.prompt_at.map(|at| at.format("%H:%M").to_string()),
+                    food_prompt_at = ?notifier.food.prompt_at.map(|at| at.format("%H:%M").to_string()),
                     "notifications are on"
                 );
                 tokio::spawn(Arc::new(notifier).run_forever(Duration::from_secs(300)));

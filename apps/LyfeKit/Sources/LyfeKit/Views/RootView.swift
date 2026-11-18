@@ -2,8 +2,9 @@ import SwiftUI
 
 /// The whole app: sign-in until there is a session, then Home, with the
 /// breath session taking the whole screen while one is open. Progress and
-/// the weight entry open from Home or from the morning prompt. All of it
-/// is behind Face ID each time lyfe is opened.
+/// the weight entry open from Home or from the morning prompt; Food, with
+/// its meal editor and targets entry, from Home or from the logging
+/// prompt. All of it is behind Face ID each time lyfe is opened.
 public struct RootView: View {
     let model: AppModel
     @Environment(\.scenePhase) private var scenePhase
@@ -28,6 +29,22 @@ public struct RootView: View {
                         WeighInView(
                             unit: model.weightUnit, latest: model.home?.weight?.latest, today: today,
                             onSave: { await model.recordWeight($0) }, onClose: { model.closeWeighIn() })
+                    } else if let draft = model.mealDraft {
+                        MealEditorView(
+                            start: draft, onSave: { await model.saveMeal($0) }, onRemove: { await model.removeMeal($0) },
+                            onClose: { model.closeMealEditor() }
+                        )
+                        .id(draft.id)
+                    } else if model.isEnteringTargets, let food = model.home?.food {
+                        FoodTargetsView(
+                            current: food.target, today: food.day, onSave: { await model.setFoodTargets($0) },
+                            onClose: { model.closeTargets() })
+                    } else if model.screen == .food, let food = model.home?.food {
+                        FoodScreen(
+                            food: food, unsent: model.unsentFood, problem: model.foodProblem,
+                            onBack: { model.closeFood() }, onLog: { await model.logMeal($0, servings: $1) },
+                            onTakeBack: { await model.takeBackMeal($0) }, onEditMeal: { model.openMealEditor($0) },
+                            onTargets: { model.openTargets() })
                     } else if model.screen == .progress, let home = model.home {
                         ProgressScreen(
                             weight: home.weight, today: home.today, unsent: model.unsentWeighIns.count,

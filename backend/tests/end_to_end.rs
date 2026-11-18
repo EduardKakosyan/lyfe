@@ -725,6 +725,7 @@ fn notifier(h: &Harness, apple: &MockServer) -> Notifier {
         from_hour: 7,
         until_hour: 18,
         weight: h.state.weight,
+        food: lyfe_server::routines::food::FoodSettings::default(),
     }
 }
 
@@ -1521,4 +1522,427 @@ async fn the_weigh_in_prompt_and_streak_prompts_do_not_crowd_each_other_out(pool
         Outcome::Sent { title, .. } if title == "Gym: 2 more by Sunday"
     ));
     assert_eq!(notifier.weigh_in(at("2026-11-21T11:00:00Z")).await.unwrap(), Outcome::AlreadySent);
+}
+
+// --- Food ----------------------------------------------------------------
+
+fn food_id(n: u32) -> String {
+    format!("00000000-0000-4000-9000-{n:012}")
+}
+
+/// The usual breakfast as weighed: 542 kcal and 43.1 g of protein.
+fn breakfast_recipe() -> Value {
+    json!({
+        "name": "Usual breakfast", "slot": "breakfast", "portions": 1,
+        "ingredients": [
+            {"name": "Oats", "grams": 80, "kcal_per_100g": 379, "protein_per_100g": 13.2},
+            {"name": "Milk 2%", "grams": 250, "kcal_per_100g": 50.4, "protein_per_100g": 3.4},
+            {"name": "Whey", "grams": 30, "kcal_per_100g": 377, "protein_per_100g": 80},
+        ],
+    })
+}
+
+/// A pot that makes five lunches of 561 kcal and 49 g of protein.
+fn lunch_recipe() -> Value {
+    json!({
+        "name": "Batch lunch", "slot": "lunch", "portions": 5,
+        "ingredients": [
+            {"name": "Chicken thigh", "grams": 900, "kcal_per_100g": 177, "protein_per_100g": 24},
+            {"name": "Rice, dry", "grams": 300, "kcal_per_100g": 360, "protein_per_100g": 7},
+            {"name": "Olive oil", "grams": 15, "kcal_per_100g": 884, "protein_per_100g": 0},
+            {"name": "Frozen vegetables", "grams": 400, "kcal_per_100g": 0, "protein_per_100g": 2},
+        ],
+    })
+}
+
+impl Harness {
+    async fn put(&self, uri: &str, token: Option<&str>, body: Value) -> (StatusCode, Value) {
+        let mut builder = Request::put(uri).header("Content-Type", "application/json");
+        if let Some(token) = token {
+            builder = builder.header("Authorization", format!("Bearer {token}"));
+        }
+        self.request(builder.body(Body::from(body.to_string())).unwrap()).await
+    }
+
+    async fn delete(&self, uri: &str, token: Option<&str>) -> (StatusCode, Value) {
+        let mut builder = Request::delete(uri);
+        if let Some(token) = token {
+            builder = builder.header("Authorization", format!("Bearer {token}"));
+        }
+        self.request(builder.body(Body::empty()).unwrap()).await
+    }
+
+    /// Saves meal number `n` and answers with Home.
+    async fn save_meal(&self, token: &str, n: u32, recipe: Value) -> Value {
+        let (status, home) = self.put(&format!("/v1/food/meals/{}", food_id(n)), Some(token), recipe).await;
+        assert_eq!(status, StatusCode::OK, "{home}");
+        home
+    }
+
+    /// Logs one tap on meal number `meal` and answers with Home.
+    async fn log_meal(&self, token: &str, entry: u32, meal: u32, eaten_at: &str) -> Value {
+        let body = json!({"id": food_id(entry), "eaten_at": eaten_at, "meal_id": food_id(meal)});
+        let (status, home) = self.post("/v1/food/entries", Some(token), Some(body)).await;
+        assert_eq!(status, StatusCode::OK, "{home}");
+        home
+    }
+}
+
+async fn food_entry_count(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("select count(*) from food_entries").fetch_one(pool).await.unwrap()
+}
+
+/// The states of the seven days Home shows, oldest first.
+fn day_states(home: &Value) -> Vec<String> {
+    home["food"]["streak"]["last_days"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|day| day["state"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_meal_weighed_once_is_logged_with_one_tap(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+
+    let (status, home) = h.get("/v1/home", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    let food = &home["food"];
+    assert_eq!(food["day"], "2026-11-17");
+    assert_eq!(food["target"], Value::Null);
+    assert_eq!((&food["kcal"], &food["protein_g"]), (&json!(0), &json!(0.0)));
+    assert_eq!(food["open_slots"], json!(["breakfast", "lunch", "dinner"]));
+    assert_eq!((&food["entries"], &food["meals"]), (&json!([]), &json!([])));
+    assert_eq!(food["streak"]["state"], "not_started");
+
+    let (status, _) = h.put(&format!("/v1/food/meals/{}", food_id(1)), None, breakfast_recipe()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Defining the meal answers with what one portion comes to.
+    let home = h.save_meal(&token, 1, breakfast_recipe()).await;
+    let meal = &home["food"]["meals"][0];
+    assert_eq!(meal["id"], food_id(1));
+    assert_eq!((&meal["name"], &meal["slot"], &meal["portions"]), (&json!("Usual breakfast"), &json!("breakfast"), &json!(1)));
+    assert_eq!((&meal["kcal"], &meal["protein_g"]), (&json!(542), &json!(43.1)));
+    assert_eq!(
+        meal["ingredients"][0],
+        json!({"name": "Oats", "grams": 80.0, "kcal_per_100g": 379.0, "protein_per_100g": 13.2})
+    );
+    assert_eq!(meal["ingredients"].as_array().unwrap().len(), 3);
+    // A batch is shared between its portions.
+    let home = h.save_meal(&token, 2, lunch_recipe()).await;
+    assert_eq!((&home["food"]["meals"][1]["kcal"], &home["food"]["meals"][1]["protein_g"]), (&json!(561), &json!(49.0)));
+
+    let tap = json!({"id": food_id(11), "eaten_at": "2026-11-17T11:05:00Z", "meal_id": food_id(1)});
+    let (status, _) = h.post("/v1/food/entries", None, Some(tap)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(food_entry_count(&h.state.pool).await, 0);
+
+    // 07:05 in San Juan: one tap, and the answer is Home as it now stands.
+    let home = h.log_meal(&token, 11, 1, "2026-11-17T11:05:00Z").await;
+    let food = &home["food"];
+    assert_eq!(
+        food["entries"],
+        json!([{"id": food_id(11), "slot": "breakfast", "name": "Usual breakfast", "meal_id": food_id(1),
+                "servings": 1.0, "kcal": 542, "protein_g": 43.1}])
+    );
+    assert_eq!((&food["kcal"], &food["protein_g"]), (&json!(542), &json!(43.1)));
+    // Lunch and dinner are unknown, not zero.
+    assert_eq!(food["open_slots"], json!(["lunch", "dinner"]));
+    assert_eq!((&food["streak"]["days"], &food["streak"]["state"]), (&json!(1), &json!("kept")));
+    assert_eq!(food["streak"]["logged_today"], true);
+    assert_eq!(home["gym"]["target"], 4);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_tap_sent_twice_is_logged_once_and_a_slip_can_be_taken_back(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    h.save_meal(&token, 1, breakfast_recipe()).await;
+
+    h.log_meal(&token, 11, 1, "2026-11-17T11:05:00Z").await;
+    let home = h.log_meal(&token, 11, 1, "2026-11-17T11:05:00Z").await;
+    assert_eq!(food_entry_count(&h.state.pool).await, 1);
+    assert_eq!(home["food"]["kcal"], 542);
+
+    let entry = format!("/v1/food/entries/{}", food_id(11));
+    let (status, _) = h.delete(&entry, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, home) = h.delete(&entry, Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!((&home["food"]["kcal"], &home["food"]["entries"]), (&json!(0), &json!([])));
+    assert_eq!(home["food"]["streak"]["state"], "not_started");
+
+    // Taking it back twice changes nothing, and neither does the first
+    // tap arriving again late.
+    let (status, _) = h.delete(&entry, Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    let home = h.log_meal(&token, 11, 1, "2026-11-17T11:05:00Z").await;
+    assert_eq!(home["food"]["entries"], json!([]));
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn the_day_is_held_to_the_targets_the_owner_set(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    h.save_meal(&token, 1, breakfast_recipe()).await;
+    h.save_meal(&token, 2, lunch_recipe()).await;
+
+    let (status, _) = h.put("/v1/food/targets", None, json!({"kcal": 2500, "protein_g": 170})).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, home) = h.put("/v1/food/targets", Some(&token), json!({"kcal": 2500, "protein_g": 170})).await;
+    assert_eq!(status, StatusCode::OK, "{home}");
+    assert_eq!(home["food"]["target"], json!({"since": "2026-11-17", "kcal": 2500, "protein_g": 170}));
+    assert_eq!((&home["food"]["kcal_left"], &home["food"]["protein_left_g"]), (&json!(2500), &json!(170.0)));
+
+    h.log_meal(&token, 11, 1, "2026-11-17T11:05:00Z").await;
+    let home = h.log_meal(&token, 12, 2, "2026-11-17T14:30:00Z").await;
+    assert_eq!((&home["food"]["kcal"], &home["food"]["protein_g"]), (&json!(1103), &json!(92.1)));
+    assert_eq!((&home["food"]["kcal_left"], &home["food"]["protein_left_g"]), (&json!(1397), &json!(77.9)));
+
+    // Four more portions of lunch: over on both, shown as less than nothing left.
+    let four = json!({"id": food_id(13), "eaten_at": "2026-11-17T14:40:00Z", "meal_id": food_id(2), "servings": 4});
+    let (status, home) = h.post("/v1/food/entries", Some(&token), Some(four)).await;
+    assert_eq!(status, StatusCode::OK, "{home}");
+    assert_eq!((&home["food"]["kcal_left"], &home["food"]["protein_left_g"]), (&json!(-847), &json!(-118.1)));
+
+    // Set again the same day: the new figures replace that day's.
+    let (_, home) = h.put("/v1/food/targets", Some(&token), json!({"kcal": 2300, "protein_g": 175})).await;
+    assert_eq!(home["food"]["target"], json!({"since": "2026-11-17", "kcal": 2300, "protein_g": 175}));
+    let stored: i64 = sqlx::query_scalar("select count(*) from food_targets").fetch_one(&h.state.pool).await.unwrap();
+    assert_eq!(stored, 1);
+
+    for (body, why) in [
+        (json!({"kcal": 250, "protein_g": 170}), "a digit short"),
+        (json!({"kcal": 25000, "protein_g": 170}), "a digit too many"),
+        (json!({"kcal": 2500, "protein_g": 1700}), "protein with a digit too many"),
+    ] {
+        let (status, body) = h.put("/v1/food/targets", Some(&token), body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{why}: {body}");
+    }
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_target_change_does_not_rewrite_earlier_days(pool: PgPool) {
+    let mut h = harness(pool).await;
+    let token = h.signed_in().await;
+    h.put("/v1/food/targets", Some(&token), json!({"kcal": 2500, "protein_g": 170})).await;
+
+    // A week later the owner lowers it.
+    let later = at("2026-11-24T15:00:00Z");
+    h.state.now = Arc::new(move || later);
+    let (_, home) = h.put("/v1/food/targets", Some(&token), json!({"kcal": 2300, "protein_g": 175})).await;
+    assert_eq!(home["food"]["target"], json!({"since": "2026-11-24", "kcal": 2300, "protein_g": 175}));
+
+    // Looked at as of the Friday before, the day is held to the old target.
+    let before = at("2026-11-20T15:00:00Z");
+    h.state.now = Arc::new(move || before);
+    let (_, home) = h.get("/v1/home", Some(&token)).await;
+    assert_eq!(home["food"]["target"], json!({"since": "2026-11-17", "kcal": 2500, "protein_g": 170}));
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn changing_a_recipe_does_not_rewrite_what_was_logged(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    h.save_meal(&token, 2, lunch_recipe()).await;
+    h.log_meal(&token, 11, 2, "2026-11-17T14:30:00Z").await;
+
+    // Next week's pot: same meal, new weights and a new name.
+    let mut recipe = lunch_recipe();
+    recipe["name"] = json!("Batch lunch wk 48");
+    recipe["ingredients"][0]["grams"] = json!(1000);
+    let home = h.save_meal(&token, 2, recipe).await;
+    let meals = home["food"]["meals"].as_array().unwrap();
+    assert_eq!(meals.len(), 1);
+    assert_eq!((&meals[0]["name"], &meals[0]["kcal"], &meals[0]["protein_g"]), (&json!("Batch lunch wk 48"), &json!(597), &json!(53.8)));
+    assert_eq!(meals[0]["ingredients"].as_array().unwrap().len(), 4);
+    assert_eq!((&home["food"]["entries"][0]["name"], &home["food"]["entries"][0]["kcal"]), (&json!("Batch lunch"), &json!(561)));
+
+    // A second helping from the new pot carries the new figures.
+    let home = h.log_meal(&token, 12, 2, "2026-11-17T14:50:00Z").await;
+    assert_eq!(home["food"]["entries"][1]["kcal"], 597);
+    assert_eq!(home["food"]["kcal"], 561 + 597);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_removed_meal_leaves_the_list_and_what_was_eaten_stays(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    h.save_meal(&token, 1, breakfast_recipe()).await;
+    h.log_meal(&token, 11, 1, "2026-11-17T11:05:00Z").await;
+
+    let meal = format!("/v1/food/meals/{}", food_id(1));
+    let (status, _) = h.delete(&meal, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, home) = h.delete(&meal, Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(home["food"]["meals"], json!([]));
+    assert_eq!(home["food"]["kcal"], 542);
+
+    // Tapped on a phone that was offline before the meal was removed: it
+    // was eaten, so it is logged.
+    let home = h.log_meal(&token, 12, 1, "2026-11-17T13:00:00Z").await;
+    assert_eq!(home["food"]["kcal"], 1084);
+    assert_eq!(home["food"]["meals"], json!([]));
+
+    // Saving it again brings it back.
+    let home = h.save_meal(&token, 1, breakfast_recipe()).await;
+    assert_eq!(home["food"]["meals"].as_array().unwrap().len(), 1);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_logged_meal_belongs_to_the_owners_day(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    h.save_meal(&token, 1, breakfast_recipe()).await;
+
+    // 23:30 on Monday in San Juan, already Tuesday in UTC.
+    let home = h.log_meal(&token, 11, 1, "2026-11-17T03:30:00Z").await;
+    assert_eq!((&home["food"]["kcal"], &home["food"]["entries"]), (&json!(0), &json!([])));
+    assert_eq!(home["food"]["open_slots"], json!(["breakfast", "lunch", "dinner"]));
+    // Monday counts; Tuesday is still open.
+    assert_eq!((&home["food"]["streak"]["days"], &home["food"]["streak"]["state"]), (&json!(1), &json!("on_track")));
+    assert_eq!(home["food"]["streak"]["logged_today"], false);
+    assert_eq!(day_states(&home), ["before", "before", "before", "before", "before", "kept", "open"]);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn logged_days_build_a_streak_with_the_same_recovery_rule(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    h.save_meal(&token, 1, breakfast_recipe()).await;
+
+    // Logged on the 10th to the 13th and the 15th; the 14th and 16th missed.
+    for (n, day) in [10, 11, 12, 13, 15].into_iter().enumerate() {
+        h.log_meal(&token, 20 + n as u32, 1, &format!("2026-11-{day}T11:05:00Z")).await;
+    }
+    let (_, home) = h.get("/v1/home", Some(&token)).await;
+    let streak = &home["food"]["streak"];
+    assert_eq!((&streak["days"], &streak["state"], &streak["previous_best"]), (&json!(5), &json!("recovering"), &json!(0)));
+    assert_eq!(day_states(&home), ["kept", "kept", "kept", "recovered", "kept", "awaiting_recovery", "open"]);
+    assert_eq!(streak["last_days"][0]["date"], "2026-11-11");
+
+    // One meal today recovers Monday. Nothing is made up for it.
+    let home = h.log_meal(&token, 30, 1, "2026-11-17T11:05:00Z").await;
+    assert_eq!((&home["food"]["streak"]["days"], &home["food"]["streak"]["state"]), (&json!(6), &json!("kept")));
+    assert_eq!(day_states(&home)[5..], ["recovered", "kept"]);
+
+    // Taken back, and with Sunday's taken back too, two days in a row are
+    // missed: the streak has ended and its length is kept as the best.
+    h.delete(&format!("/v1/food/entries/{}", food_id(30)), Some(&token)).await;
+    let (_, home) = h.delete(&format!("/v1/food/entries/{}", food_id(24)), Some(&token)).await;
+    let streak = &home["food"]["streak"];
+    assert_eq!((&streak["days"], &streak["state"], &streak["previous_best"]), (&json!(0), &json!("not_started"), &json!(4)));
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn food_that_makes_no_sense_is_refused(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    h.save_meal(&token, 1, breakfast_recipe()).await;
+
+    let with = |key: &str, value: Value| {
+        let mut recipe = breakfast_recipe();
+        recipe[key] = value;
+        recipe
+    };
+    let mut slipped = breakfast_recipe();
+    slipped["ingredients"][0]["kcal_per_100g"] = json!(3790);
+    for (recipe, why) in [
+        (with("slot", json!("brunch")), "an unknown slot"),
+        (with("name", json!("   ")), "no name"),
+        (with("portions", json!(0)), "no portions"),
+        (with("ingredients", json!([])), "no ingredients"),
+        (slipped, "a slipped decimal point"),
+    ] {
+        let (status, body) = h.put(&format!("/v1/food/meals/{}", food_id(9)), Some(&token), recipe).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{why}: {body}");
+    }
+    let (_, home) = h.get("/v1/home", Some(&token)).await;
+    assert_eq!(home["food"]["meals"].as_array().unwrap().len(), 1);
+
+    for (body, why) in [
+        (json!({"id": food_id(11), "eaten_at": "2026-11-17T11:05:00Z", "meal_id": food_id(7)}), "no such meal"),
+        (json!({"id": food_id(11), "eaten_at": "2026-11-17T11:05:00Z", "meal_id": food_id(1), "servings": 0}), "nothing eaten"),
+        (json!({"id": food_id(11), "eaten_at": "2026-11-17T11:05:00Z", "meal_id": food_id(1), "servings": 40}), "forty portions"),
+        (json!({"id": food_id(11), "eaten_at": "2026-11-19T11:05:00Z", "meal_id": food_id(1)}), "in the future"),
+    ] {
+        let (status, body) = h.post("/v1/food/entries", Some(&token), Some(body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{why}: {body}");
+    }
+    assert_eq!(food_entry_count(&h.state.pool).await, 0);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_live_streak_with_nothing_logged_by_noon_is_prompted_for_once(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    register_device(&h, &token).await;
+    h.save_meal(&token, 1, breakfast_recipe()).await;
+    let apple = MockServer::start().await;
+    apple_answers(&apple, "dev", 200, None).await;
+    let notifier = notifier(&h, &apple);
+
+    // No streak is alive: nothing to keep, nothing sent.
+    assert_eq!(notifier.food(at("2026-11-17T16:00:00Z")).await.unwrap(), Outcome::NothingDue);
+
+    // Logged Sunday and Monday; on Tuesday the morning is left alone...
+    h.log_meal(&token, 11, 1, "2026-11-15T11:05:00Z").await;
+    h.log_meal(&token, 12, 1, "2026-11-16T11:05:00Z").await;
+    assert_eq!(notifier.food(at("2026-11-17T15:59:00Z")).await.unwrap(), Outcome::Quiet);
+    // ...and at noon in San Juan, with nothing logged, it prompts once.
+    assert_eq!(
+        notifier.food(at("2026-11-17T16:00:00Z")).await.unwrap(),
+        Outcome::Sent {
+            title: "Fuel: nothing logged today".into(),
+            body: "Log one meal to keep your 2-day streak.".into(),
+            devices: 1,
+        }
+    );
+    assert_eq!(notifier.food(at("2026-11-17T17:00:00Z")).await.unwrap(), Outcome::AlreadySent);
+    let requests = apple.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].headers.get("apns-collapse-id").unwrap(), "food_log_today");
+    // Dropped if not delivered by 18:00, and tapping it opens the Food screen.
+    assert_eq!(
+        requests[0].headers.get("apns-expiration").unwrap().to_str().unwrap(),
+        at("2026-11-17T22:00:00Z").timestamp().to_string()
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["aps"]["category"], "FOOD_LOG");
+    // Never at night.
+    assert_eq!(notifier.food(at("2026-11-17T23:00:00Z")).await.unwrap(), Outcome::Quiet);
+
+    // Tuesday stayed empty, so Wednesday is the day that recovers it.
+    assert_eq!(
+        notifier.food(at("2026-11-18T16:00:00Z")).await.unwrap(),
+        Outcome::Sent {
+            title: "Fuel: yesterday was missed".into(),
+            body: "One meal logged today recovers your 2-day streak. Nothing to make up.".into(),
+            devices: 1,
+        }
+    );
+
+    // Once the day is logged there is nothing left to prompt for.
+    h.log_meal(&token, 13, 1, "2026-11-18T14:00:00Z").await;
+    assert_eq!(notifier.food(at("2026-11-18T17:00:00Z")).await.unwrap(), Outcome::NothingDue);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn the_food_prompt_can_be_switched_off(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    register_device(&h, &token).await;
+    h.save_meal(&token, 1, breakfast_recipe()).await;
+    h.log_meal(&token, 11, 1, "2026-11-16T11:05:00Z").await;
+    let apple = MockServer::start().await;
+    apple_answers(&apple, "dev", 200, None).await;
+    let mut notifier = notifier(&h, &apple);
+    notifier.food.prompt_at = None;
+
+    assert_eq!(notifier.food(at("2026-11-17T16:00:00Z")).await.unwrap(), Outcome::Quiet);
+    assert!(apple.received_requests().await.unwrap().is_empty());
 }

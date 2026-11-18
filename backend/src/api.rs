@@ -4,11 +4,11 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::{FromRequestParts, State};
+use axum::extract::{FromRequestParts, Path, State};
 use axum::http::request::Parts;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,7 @@ use crate::auth::{self, SignInThrottle};
 use crate::db;
 use crate::garmin::sync::{Syncer, SOURCE as GARMIN};
 use crate::routines::breath::{self, BreathRules};
+use crate::routines::food::{self, FoodDay, Slot};
 use crate::routines::gym::{self, GymRules, GymSession, GymStreak, Week};
 use crate::routines::weekly::WeekStreak;
 use crate::routines::weight::{self, Unit, WeightSettings, WeightTrend};
@@ -53,6 +54,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/home", get(home))
         .route("/v1/breath/sessions", post(record_breath_session))
         .route("/v1/weigh-ins", post(record_weigh_in))
+        .route("/v1/food/entries", post(record_food_entry))
+        .route("/v1/food/entries/{id}", delete(remove_food_entry))
+        .route("/v1/food/meals/{id}", put(save_meal).delete(remove_meal))
+        .route("/v1/food/targets", put(set_food_targets))
         .with_state(state)
 }
 
@@ -226,6 +231,7 @@ struct HomeResponse {
     gym: GymWeek,
     breath: BreathWeek,
     weight: WeightTrend,
+    food: FoodDay,
     sources: Sources,
     notifications: Notifications,
 }
@@ -340,6 +346,12 @@ async fn home_now(state: &AppState) -> Result<HomeResponse, ApiError> {
         },
         breath: breath_week(state, today).await?,
         weight: weight::trend(&state.weight, today, &db::weigh_ins(&state.pool, state.timezone).await?),
+        food: food::day(
+            today,
+            &db::saved_meals(&state.pool).await?,
+            &db::food_entries(&state.pool, state.timezone).await?,
+            &db::food_targets(&state.pool).await?,
+        ),
         sources: Sources { garmin: garmin_status(state).await? },
         notifications: Notifications { server_ready: state.push_ready },
     })
@@ -469,6 +481,149 @@ async fn record_weigh_in(
         // The weight itself is not logged; it is the owner's.
         tracing::info!(id = %weigh_in.id, "weigh-in recorded");
     }
+    Ok(Json(home_now(&state).await?))
+}
+
+// --- Food ----------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct FoodEntryRequest {
+    /// Made on the phone when the meal is tapped. Sending the same entry
+    /// again changes nothing.
+    id: Uuid,
+    eaten_at: DateTime<Utc>,
+    /// The saved meal that was eaten.
+    meal_id: Uuid,
+    /// Portions of it; one when left out.
+    servings: Option<f64>,
+}
+
+/// Logs a saved meal tapped on the phone and answers with Home as it now
+/// stands: the day against its targets, and the logging streak. The name
+/// and figures are taken from the recipe as it stands now and kept with
+/// the entry.
+async fn record_food_entry(
+    State(state): State<AppState>,
+    device: Device,
+    Json(request): Json<FoodEntryRequest>,
+) -> Result<Json<HomeResponse>, ApiError> {
+    let servings = request.servings.unwrap_or(1.0);
+    if !food::servings_make_sense(servings) {
+        return Err(ApiError::BadRequest("servings must be above 0 and at most 10"));
+    }
+    if request.eaten_at > (state.now)() + chrono::Duration::days(1) {
+        return Err(ApiError::BadRequest("eaten_at is in the future"));
+    }
+    // A meal removed since it was tapped is still logged: it was eaten.
+    let meal = db::saved_meal(&state.pool, request.meal_id)
+        .await?
+        .ok_or(ApiError::BadRequest("no saved meal has this meal_id"))?;
+    let entry = db::StoredFoodEntry {
+        id: request.id,
+        eaten_at: request.eaten_at,
+        slot: meal.slot,
+        meal_id: Some(meal.id),
+        name: meal.name.clone(),
+        servings,
+        amount: meal.amount(servings),
+    };
+    if db::insert_food_entry(&state.pool, &entry, device.session_id).await? {
+        // What was eaten is not logged; it is the owner's.
+        tracing::info!(id = %entry.id, "food entry recorded");
+    }
+    Ok(Json(home_now(&state).await?))
+}
+
+/// Takes a logged meal back, for a tap that was a slip. Taking back an
+/// entry that is already gone changes nothing.
+async fn remove_food_entry(
+    State(state): State<AppState>,
+    _device: Device,
+    Path(id): Path<Uuid>,
+) -> Result<Json<HomeResponse>, ApiError> {
+    if db::remove_food_entry(&state.pool, id).await? {
+        tracing::info!(%id, "food entry taken back");
+    }
+    Ok(Json(home_now(&state).await?))
+}
+
+#[derive(Deserialize)]
+struct MealRequest {
+    name: String,
+    /// "breakfast", "lunch", "dinner" or "snack".
+    slot: String,
+    /// Portions the weighed recipe makes.
+    portions: u32,
+    ingredients: Vec<IngredientRequest>,
+}
+
+#[derive(Deserialize)]
+struct IngredientRequest {
+    name: String,
+    /// As weighed.
+    grams: f64,
+    /// From the label.
+    kcal_per_100g: f64,
+    protein_per_100g: f64,
+}
+
+/// Stores a saved meal under the id the phone made for it, replacing the
+/// recipe when it is already stored. Entries already logged keep the
+/// figures they were logged with.
+async fn save_meal(
+    State(state): State<AppState>,
+    _device: Device,
+    Path(id): Path<Uuid>,
+    Json(request): Json<MealRequest>,
+) -> Result<Json<HomeResponse>, ApiError> {
+    let slot = Slot::parse(&request.slot).ok_or(ApiError::BadRequest("slot must be breakfast, lunch, dinner or snack"))?;
+    let ingredients = request
+        .ingredients
+        .into_iter()
+        .map(|i| food::Ingredient {
+            name: i.name,
+            grams: i.grams,
+            kcal_per_100g: i.kcal_per_100g,
+            protein_per_100g: i.protein_per_100g,
+        })
+        .collect();
+    let meal = food::SavedMeal::new(id, &request.name, slot, request.portions, ingredients).map_err(ApiError::BadRequest)?;
+    db::upsert_saved_meal(&state.pool, &meal).await?;
+    tracing::info!(%id, ingredients = meal.ingredients.len(), "saved meal stored");
+    Ok(Json(home_now(&state).await?))
+}
+
+/// Takes a saved meal out of the list. What was logged from it stays.
+async fn remove_meal(
+    State(state): State<AppState>,
+    _device: Device,
+    Path(id): Path<Uuid>,
+) -> Result<Json<HomeResponse>, ApiError> {
+    if db::archive_saved_meal(&state.pool, id).await? {
+        tracing::info!(%id, "saved meal removed");
+    }
+    Ok(Json(home_now(&state).await?))
+}
+
+#[derive(Deserialize)]
+struct FoodTargetsRequest {
+    kcal: u32,
+    protein_g: u32,
+}
+
+/// Sets the calorie and protein targets from today on. Earlier days keep
+/// the target they were held to. Only the owner sets these; lyfe never
+/// changes a target by itself.
+async fn set_food_targets(
+    State(state): State<AppState>,
+    _device: Device,
+    Json(request): Json<FoodTargetsRequest>,
+) -> Result<Json<HomeResponse>, ApiError> {
+    let today = (state.now)().with_timezone(&state.timezone).date_naive();
+    let target = food::Target::new(today, request.kcal, request.protein_g).map_err(ApiError::BadRequest)?;
+    db::set_food_target(&state.pool, &target).await?;
+    // The figures are not logged; they are the owner's.
+    tracing::info!("food targets set");
     Ok(Json(home_now(&state).await?))
 }
 

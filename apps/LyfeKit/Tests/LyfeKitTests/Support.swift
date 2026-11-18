@@ -159,12 +159,89 @@ enum Fixture {
             """#
     }
 
+    static let breakfastID = UUID(uuidString: "00000000-0000-4000-9000-000000000001")!
+    static let lunchID = UUID(uuidString: "00000000-0000-4000-9000-000000000002")!
+
+    /// Food in exactly the shape the backend sends, on Tuesday 17 November.
+    /// `logged` names the saved meals eaten today ("breakfast", "lunch"),
+    /// each one portion. `lastDays` is one letter per day shown, today
+    /// last: K kept, R recovered, A awaiting recovery, M missed, O open,
+    /// B before the first log.
+    static func food(
+        logged: [String] = [], meals: Bool = true, target: Bool = true, days: Int = 0, state: String = "not_started",
+        lastDays: String = "BBBBBBO", previousBest: Int = 0
+    ) -> String {
+        let recipes: [(key: String, id: UUID, name: String, kcal: Int, protein: Double, json: String)] = [
+            (
+                "breakfast", breakfastID, "Usual breakfast", 542, 43.1,
+                """
+                {"id": "00000000-0000-4000-9000-000000000001", "name": "Usual breakfast", "slot": "breakfast",
+                 "portions": 1, "kcal": 542, "protein_g": 43.1,
+                 "ingredients": [
+                   {"name": "Oats", "grams": 80.0, "kcal_per_100g": 379.0, "protein_per_100g": 13.2},
+                   {"name": "Milk 2%", "grams": 250.0, "kcal_per_100g": 50.4, "protein_per_100g": 3.4},
+                   {"name": "Whey", "grams": 30.0, "kcal_per_100g": 377.0, "protein_per_100g": 80.0}]}
+                """
+            ),
+            (
+                "lunch", lunchID, "Batch lunch", 561, 49.0,
+                """
+                {"id": "00000000-0000-4000-9000-000000000002", "name": "Batch lunch", "slot": "lunch",
+                 "portions": 5, "kcal": 561, "protein_g": 49.0,
+                 "ingredients": [
+                   {"name": "Chicken thigh", "grams": 900.0, "kcal_per_100g": 177.0, "protein_per_100g": 24.0},
+                   {"name": "Rice, dry", "grams": 300.0, "kcal_per_100g": 360.0, "protein_per_100g": 7.0}]}
+                """
+            ),
+        ]
+        let eaten = recipes.filter { logged.contains($0.key) }
+        let entries = eaten.enumerated().map { index, meal in
+            """
+            {"id": "00000000-0000-4000-8000-00000000010\(index + 1)", "slot": "\(meal.key)", "name": "\(meal.name)",
+             "meal_id": "\(meal.id.uuidString.lowercased())", "servings": 1.0, "kcal": \(meal.kcal), "protein_g": \(meal.protein)}
+            """
+        }
+        let kcal = eaten.reduce(0) { $0 + $1.kcal }
+        let protein = (eaten.reduce(0) { $0 + $1.protein } * 10).rounded() / 10
+        let open = ["breakfast", "lunch", "dinner"].filter { !logged.contains($0) }.map { "\"\($0)\"" }
+        let states: [Character: String] = [
+            "K": "kept", "R": "recovered", "A": "awaiting_recovery", "M": "missed", "O": "open", "B": "before",
+        ]
+        let marks = lastDays.enumerated().map { index, letter in
+            #"{"date": "2026-11-\#(11 + index)", "state": "\#(states[letter]!)"}"#
+        }
+        let left = target ? "\(2500 - kcal)" : "null"
+        let proteinLeft = target ? "\(((170 - protein) * 10).rounded() / 10)" : "null"
+        return """
+            {"day": "2026-11-17",
+             "target": \(target ? #"{"since": "2026-11-02", "kcal": 2500, "protein_g": 170}"# : "null"),
+             "kcal": \(kcal), "protein_g": \(protein), "kcal_left": \(left), "protein_left_g": \(proteinLeft),
+             "open_slots": [\(open.joined(separator: ","))],
+             "entries": [\(entries.joined(separator: ","))],
+             "meals": [\(meals ? recipes.map(\.json).joined(separator: ",") : "")],
+             "streak": {"days": \(days), "state": "\(state)", "previous_best": \(previousBest),
+                        "logged_today": \(lastDays.last == "K"), "last_days": [\(marks.joined(separator: ","))]}}
+            """
+    }
+
+    /// The same, read the way the app reads it.
+    static func foodDay(
+        logged: [String] = [], meals: Bool = true, target: Bool = true, days: Int = 0, state: String = "not_started",
+        lastDays: String = "BBBBBBO", previousBest: Int = 0
+    ) -> FoodDay {
+        let json = food(
+            logged: logged, meals: meals, target: target, days: days, state: state, lastDays: lastDays,
+            previousBest: previousBest)
+        return try! JSONDecoder.lyfe.decode(FoodDay.self, from: Data(json.utf8))
+    }
+
     static func home(
         done: Int = 1, sources: String = Fixture.sources(), streak: String? = nil, today: String = "2026-11-17",
-        serverReady: Bool? = nil, breath: String? = nil, weight: String? = nil
+        serverReady: Bool? = nil, breath: String? = nil, weight: String? = nil, food: String? = nil
     ) -> String {
         let breathJSON =
             (breath.map { ", \"breath\": \($0)" } ?? "") + (weight.map { ", \"weight\": \($0)" } ?? "")
+            + (food.map { ", \"food\": \($0)" } ?? "")
         let streakJSON = streak.map { ", \"streak\": \($0)" } ?? ""
         let notifications = serverReady.map { ", \"notifications\": {\"server_ready\": \($0)}" } ?? ""
         let all = [
@@ -213,6 +290,7 @@ struct World {
     let cache = HomeCache(directory: Fixture.temporaryDirectory())
     let breath = BreathStore(directory: Fixture.temporaryDirectory())
     let weighIns = WeighInStore(directory: Fixture.temporaryDirectory())
+    let food = FoodStore(directory: Fixture.temporaryDirectory())
     let clock = Date(timeIntervalSince1970: 1_795_000_000)
     /// The time the app sees; starts at `clock` and can be moved on.
     let time: TestClock
@@ -231,7 +309,7 @@ struct World {
     func launch(transport: (any HTTPTransport)? = nil, ownerCheck: any OwnerCheck = NoOwnerCheck()) -> AppModel {
         let time = time
         return AppModel(
-            tokens: tokens, addresses: addresses, cache: cache, breath: breath, weighIns: weighIns,
+            tokens: tokens, addresses: addresses, cache: cache, breath: breath, weighIns: weighIns, food: food,
             transport: transport ?? backend,
             deviceName: "Test iPhone", ownerCheck: ownerCheck, now: { time.now })
     }

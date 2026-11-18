@@ -99,6 +99,74 @@ public struct LyfeAPI: Sendable {
         return try await call("POST", "v1/weigh-ins", token: token, body: body, timeout: 12)
     }
 
+    /// Hands the backend one tap on a saved meal. It answers with Home as
+    /// it now stands. Sending the same tap again changes nothing.
+    public func recordFoodEntry(token: String, tap: MealTap) async throws -> HomeSnapshot {
+        struct Body: Encodable {
+            var id: UUID
+            var eatenAt: Date
+            var mealId: UUID
+            var servings: Double
+        }
+        let body = try JSONEncoder.lyfe.encode(
+            Body(id: tap.id, eatenAt: tap.eatenAt, mealId: tap.mealId, servings: tap.servings))
+        return try await call("POST", "v1/food/entries", token: token, body: body, timeout: 15)
+    }
+
+    /// Takes a logged meal back. Doing it twice changes nothing.
+    public func removeFoodEntry(token: String, id: UUID) async throws -> HomeSnapshot {
+        try await call("DELETE", "v1/food/entries/\(id.uuidString.lowercased())", token: token, body: nil, timeout: 15)
+    }
+
+    /// Stores a saved meal under its id, replacing the recipe when the
+    /// meal is already stored.
+    public func saveMeal(token: String, draft: MealDraft) async throws -> HomeSnapshot {
+        struct Item: Encodable {
+            var name: String
+            var grams: Double
+            var kcalPer100g: Double
+            var proteinPer100g: Double
+
+            // Spelled out: the encoder would not put the underscore
+            // before the digits.
+            enum CodingKeys: String, CodingKey {
+                case name, grams
+                case kcalPer100g = "kcal_per_100g"
+                case proteinPer100g = "protein_per_100g"
+            }
+        }
+        struct Body: Encodable {
+            var name: String
+            var slot: MealSlot
+            var portions: Int
+            var ingredients: [Item]
+        }
+        let items = draft.ingredients.map {
+            Item(name: $0.name, grams: $0.grams, kcalPer100g: $0.kcalPer100g, proteinPer100g: $0.proteinPer100g)
+        }
+        let body = try JSONEncoder.lyfe.encode(
+            Body(
+                name: draft.name.trimmingCharacters(in: .whitespacesAndNewlines), slot: draft.slot,
+                portions: draft.portions, ingredients: items))
+        return try await call(
+            "PUT", "v1/food/meals/\(draft.id.uuidString.lowercased())", token: token, body: body, timeout: 15)
+    }
+
+    /// Takes a saved meal out of the list. What was logged from it stays.
+    public func removeMeal(token: String, id: UUID) async throws -> HomeSnapshot {
+        try await call("DELETE", "v1/food/meals/\(id.uuidString.lowercased())", token: token, body: nil, timeout: 15)
+    }
+
+    /// Sets the calorie and protein targets from today on.
+    public func setFoodTargets(token: String, targets: FoodTargets) async throws -> HomeSnapshot {
+        struct Body: Encodable {
+            var kcal: Int
+            var proteinG: Int
+        }
+        let body = try JSONEncoder.lyfe.encode(Body(kcal: targets.kcal, proteinG: targets.proteinG))
+        return try await call("PUT", "v1/food/targets", token: token, body: body, timeout: 15)
+    }
+
     /// Asks the backend to check Garmin now. Can take as long as Garmin does.
     public func sync(token: String) async throws -> Sources {
         try await call("POST", "v1/sync", token: token, body: nil, timeout: 45)

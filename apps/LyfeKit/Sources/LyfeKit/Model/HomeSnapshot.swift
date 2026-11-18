@@ -11,6 +11,8 @@ public struct HomeSnapshot: Codable, Equatable, Sendable {
     public var breath: BreathWeek?
     /// Missing in answers cached before weigh-ins existed.
     public var weight: WeightTrend?
+    /// Missing in answers cached before food logging existed.
+    public var food: FoodDay?
     public var sources: Sources
     /// Missing in answers cached before notifications existed.
     public var notifications: Notifications?
@@ -192,6 +194,184 @@ public struct WeightTrend: Codable, Equatable, Sendable {
         self.change = change
         self.changePct = changePct
         self.days = days
+    }
+}
+
+/// The part of the day a meal is logged under.
+public enum MealSlot: String, Codable, Sendable, CaseIterable {
+    case breakfast, lunch, dinner, snack
+}
+
+/// One thing that went into a recipe: its weight, and the figures from
+/// its label.
+public struct Ingredient: Codable, Equatable, Sendable {
+    public var name: String
+    public var grams: Double
+    public var kcalPer100g: Double
+    public var proteinPer100g: Double
+
+    // Spelled the way the decoder turns "kcal_per_100g" into a name: it
+    // capitalises the letter after the digits.
+    enum CodingKeys: String, CodingKey {
+        case name, grams
+        case kcalPer100g = "kcalPer100G"
+        case proteinPer100g = "proteinPer100G"
+    }
+
+    public init(name: String, grams: Double, kcalPer100g: Double, proteinPer100g: Double) {
+        self.name = name
+        self.grams = grams
+        self.kcalPer100g = kcalPer100g
+        self.proteinPer100g = proteinPer100g
+    }
+}
+
+/// A meal the owner eats repeatedly, weighed once. The backend works out
+/// what one portion comes to.
+public struct SavedMeal: Codable, Equatable, Sendable, Identifiable {
+    public var id: UUID
+    public var name: String
+    public var slot: MealSlot
+    /// Portions the weighed recipe makes.
+    public var portions: Int
+    /// One portion.
+    public var kcal: Int
+    public var proteinG: Double
+    public var ingredients: [Ingredient]
+
+    public init(
+        id: UUID, name: String, slot: MealSlot, portions: Int, kcal: Int, proteinG: Double, ingredients: [Ingredient]
+    ) {
+        self.id = id
+        self.name = name
+        self.slot = slot
+        self.portions = portions
+        self.kcal = kcal
+        self.proteinG = proteinG
+        self.ingredients = ingredients
+    }
+}
+
+/// Food as the backend worked it out: what is logged today against the
+/// targets, the saved meals, and the logging streak.
+public struct FoodDay: Codable, Equatable, Sendable {
+    public var day: CalendarDay
+    /// What the day is held to; nil until the owner has set targets.
+    public var target: Target?
+    /// Everything logged today. Not the day's intake unless every meal
+    /// was logged: see `openSlots`.
+    public var kcal: Int
+    public var proteinG: Double
+    /// The target minus what is logged; negative once over.
+    public var kcalLeft: Int?
+    public var proteinLeftG: Double?
+    /// Main meals with nothing logged: unknown, not zero.
+    public var openSlots: [MealSlot]
+    /// Today's entries, by slot and then in the order logged.
+    public var entries: [Entry]
+    /// The saved meals, by slot, the one logged most recently first.
+    public var meals: [SavedMeal]
+    public var streak: DayStreak
+
+    public struct Target: Codable, Equatable, Sendable {
+        /// The day it took effect.
+        public var since: CalendarDay
+        public var kcal: Int
+        public var proteinG: Int
+
+        public init(since: CalendarDay, kcal: Int, proteinG: Int) {
+            self.since = since
+            self.kcal = kcal
+            self.proteinG = proteinG
+        }
+    }
+
+    /// One logged meal.
+    public struct Entry: Codable, Equatable, Sendable, Identifiable {
+        public var id: UUID
+        public var slot: MealSlot
+        public var name: String
+        /// The saved meal it was logged from.
+        public var mealId: UUID?
+        public var servings: Double
+        public var kcal: Int
+        public var proteinG: Double
+
+        public init(
+            id: UUID, slot: MealSlot, name: String, mealId: UUID?, servings: Double, kcal: Int, proteinG: Double
+        ) {
+            self.id = id
+            self.slot = slot
+            self.name = name
+            self.mealId = mealId
+            self.servings = servings
+            self.kcal = kcal
+            self.proteinG = proteinG
+        }
+    }
+
+    /// The logging streak, by the day, as the backend counts it.
+    public struct DayStreak: Codable, Equatable, Sendable {
+        /// Days in a row with something logged, counting today once it has.
+        public var days: Int
+        public var state: HomeSnapshot.WeekStreak.State
+        /// The longest streak that has ended; zero when none has.
+        public var previousBest: Int
+        public var loggedToday: Bool
+        /// The last seven days, oldest first, today last.
+        public var lastDays: [DayMark]
+
+        public init(
+            days: Int, state: HomeSnapshot.WeekStreak.State, previousBest: Int, loggedToday: Bool, lastDays: [DayMark]
+        ) {
+            self.days = days
+            self.state = state
+            self.previousBest = previousBest
+            self.loggedToday = loggedToday
+            self.lastDays = lastDays
+        }
+    }
+
+    public struct DayMark: Codable, Equatable, Sendable, Identifiable {
+        public var date: CalendarDay
+        public var state: DayState
+
+        public var id: CalendarDay { date }
+
+        public init(date: CalendarDay, state: DayState) {
+            self.date = date
+            self.state = state
+        }
+    }
+
+    public enum DayState: String, Codable, Sendable {
+        /// Something was logged.
+        case kept
+        /// Nothing was logged, and the next day recovered it.
+        case recovered
+        /// Yesterday, with nothing logged; today decides whether it is recovered.
+        case awaitingRecovery = "awaiting_recovery"
+        case missed
+        /// Today, with nothing logged yet.
+        case open
+        /// Before the first meal was ever logged.
+        case before
+    }
+
+    public init(
+        day: CalendarDay, target: Target?, kcal: Int, proteinG: Double, kcalLeft: Int?, proteinLeftG: Double?,
+        openSlots: [MealSlot], entries: [Entry], meals: [SavedMeal], streak: DayStreak
+    ) {
+        self.day = day
+        self.target = target
+        self.kcal = kcal
+        self.proteinG = proteinG
+        self.kcalLeft = kcalLeft
+        self.proteinLeftG = proteinLeftG
+        self.openSlots = openSlots
+        self.entries = entries
+        self.meals = meals
+        self.streak = streak
     }
 }
 

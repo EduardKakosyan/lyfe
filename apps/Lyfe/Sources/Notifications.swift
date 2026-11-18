@@ -3,7 +3,8 @@ import UIKit
 import UserNotifications
 
 /// Owns the app's model, receives the device token Apple issues for
-/// notifications, and answers the morning weigh-in prompt. The backend
+/// notifications, answers the morning weigh-in prompt, and opens the Food
+/// screen when the logging prompt is tapped. The backend
 /// decides what is sent; this says where to send it and takes the replies.
 ///
 /// The model lives here rather than in a SwiftUI view, because a weight
@@ -82,7 +83,14 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
     nonisolated func userNotificationCenter(
         _ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse
     ) async {
-        guard response.notification.request.content.categoryIdentifier == WeighInPrompt.category else { return }
+        let category = response.notification.request.content.categoryIdentifier
+        let opened = response.actionIdentifier == UNNotificationDefaultActionIdentifier
+        if category == FoodPrompt.category, opened {
+            // One tap from here to the saved meal.
+            await MainActor.run { model.openFood() }
+            return
+        }
+        guard category == WeighInPrompt.category else { return }
         let typed = (response as? UNTextInputNotificationResponse)?.userText
         let tapped = response.actionIdentifier == UNNotificationDefaultActionIdentifier
         await answerWeighIn(typed: typed, tapped: tapped)
