@@ -153,7 +153,20 @@ impl Columns {
         let number = |index: Option<usize>| index.and_then(field).and_then(|f| f.parse::<f64>().ok());
 
         let code = normalize_code(field(self.code)?)?;
-        let name: String = field(self.name)?.chars().take(MAX_NAME_CHARS).collect();
+        // Some names carry NUL and other control characters, which the
+        // database refuses; they are dropped, and a name left empty skips
+        // the line.
+        let name: String = field(self.name)?
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect::<String>()
+            .trim()
+            .chars()
+            .take(MAX_NAME_CHARS)
+            .collect();
+        if name.is_empty() {
+            return None;
+        }
         // Some lines give only kilojoules.
         let kcal = number(self.kcal).or_else(|| number(self.kj).map(|kj| kj / 4.184))?;
         let protein = number(Some(self.protein))?;
@@ -259,6 +272,15 @@ mod tests {
         assert_eq!(columns.product("0055577105019\t\tOats\t40\t37\t\t60"), None);
         // A line cut short.
         assert_eq!(columns.product("0055577105019"), None);
+        // A name that is nothing but control characters.
+        assert_eq!(columns.product("0055577105019\t\t\u{0}\u{1}\t40\t379\t\t13.2"), None);
+    }
+
+    #[test]
+    fn control_characters_are_dropped_from_a_name() {
+        let columns = Columns::from_header(HEADER).unwrap();
+        let oats = columns.product("0055577105019\t\tLarge\u{0} flake oats\u{7f}\t40\t379\t\t13.2").unwrap();
+        assert_eq!(oats.name, "Large flake oats");
     }
 
     #[test]
