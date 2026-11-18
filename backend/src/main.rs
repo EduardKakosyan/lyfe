@@ -8,13 +8,15 @@ use clap::{Parser, Subcommand};
 
 use lyfe_server::api::{self, AppState};
 use lyfe_server::auth::{self, SignInThrottle};
-use lyfe_server::config::{DatabaseConfig, GarminConfig, ServeConfig};
+use lyfe_server::config::{DatabaseConfig, GarminConfig, PhotoConfig, ServeConfig};
 use lyfe_server::db;
+use lyfe_server::estimator::Estimator;
 use lyfe_server::garmin::sync::{parse_activity, Syncer};
 use lyfe_server::garmin::GarminClient;
 use lyfe_server::push::apns::{Alert, ApnsClient};
 use lyfe_server::push::notifier::Notifier;
 use lyfe_server::routines::gym::{self, Week};
+use lyfe_server::routines::{photo, product};
 use lyfe_server::routines::streak::{Mark, State};
 
 #[derive(Parser)]
@@ -47,6 +49,24 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         days: i64,
     },
+    /// Read the Open Food Facts export (tab separated, unzipped) from
+    /// standard input and make it the food database barcodes are looked up
+    /// in, replacing the last one.
+    ImportFoodDb {
+        #[command(flatten)]
+        database: DatabaseConfig,
+    },
+    /// Ask the vision model to estimate one meal photo and print what it
+    /// answers. Stores nothing; use it to check the model works.
+    PhotoCheck {
+        #[command(flatten)]
+        photo: PhotoConfig,
+        /// A JPEG of the meal.
+        jpeg: Option<std::path::PathBuf>,
+        /// The one line that goes with it.
+        #[arg(long, default_value = "")]
+        note: String,
+    },
 }
 
 #[tokio::main]
@@ -64,6 +84,8 @@ async fn main() -> anyhow::Result<()> {
         Command::GymWeeks(config) => gym_weeks(*config).await,
         Command::PushTest(config) => push_test(*config).await,
         Command::GarminCheck { garmin, days } => garmin_check(garmin, days).await,
+        Command::ImportFoodDb { database } => import_food_db(database).await,
+        Command::PhotoCheck { photo, jpeg, note } => photo_check(photo, jpeg, note).await,
     }
 }
 
@@ -159,6 +181,20 @@ async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         }
     };
 
+    let estimator_wake = Arc::new(tokio::sync::Notify::new());
+    let estimator = Arc::new(Estimator::new(pool.clone(), config.photo.estimator_settings(), estimator_wake.clone())?);
+    match &estimator.settings().ollama_url {
+        Some(url) => tracing::info!(
+            ollama = %url,
+            model = %estimator.settings().model,
+            context = estimator.settings().context,
+            min_free_gb = estimator.settings().min_free_gb,
+            "photo meals are estimated on this machine"
+        ),
+        None => tracing::warn!("LYFE_OLLAMA_URL is off; photo meals are not estimated and are typed in by hand"),
+    }
+    tokio::spawn(estimator.run_forever());
+
     let state = AppState {
         pool,
         syncer,
@@ -168,6 +204,8 @@ async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         breath_rules: Arc::new(config.breath_rules()),
         weight: config.weight_settings(),
         push_ready,
+        estimate_range_pct: config.photo.photo_range_percent,
+        estimator_wake,
         now: Arc::new(Utc::now),
     };
     let listener = tokio::net::TcpListener::bind(config.listen_addr)
@@ -345,5 +383,69 @@ async fn garmin_check(config: GarminConfig, days: i64) -> anyhow::Result<()> {
     for ((year, week), count) in by_week {
         println!("  {year} week {week}: {count} activities");
     }
+    Ok(())
+}
+
+async fn import_food_db(database: DatabaseConfig) -> anyhow::Result<()> {
+    let pool = db::connect(&database.database_url)
+        .await
+        .context("could not open the database")?;
+    let mut lines = std::io::stdin().lock().lines();
+    let header = lines.next().context("nothing came in on standard input")??;
+    let columns = product::Columns::from_header(&header).map_err(anyhow::Error::msg)?;
+    let mut import = db::ProductImport::begin(&pool).await?;
+    let (mut read, mut skipped) = (0u64, 0u64);
+    let mut batch = Vec::with_capacity(5_000);
+    for line in lines {
+        // A line that is not text is skipped like any other unusable line.
+        let Ok(line) = line else {
+            skipped += 1;
+            continue;
+        };
+        read += 1;
+        match columns.product(&line) {
+            Some(found) => batch.push(found),
+            None => skipped += 1,
+        }
+        if batch.len() == 5_000 {
+            import.add(&batch).await?;
+            batch.clear();
+        }
+        if read % 500_000 == 0 {
+            eprintln!("  {read} lines read, {} products so far", import.stored + batch.len() as u64);
+        }
+    }
+    import.add(&batch).await?;
+    let stored = import.finish().await?;
+    println!("Food database replaced: {stored} products from {read} lines ({skipped} without a name, energy or protein).");
+    Ok(())
+}
+
+async fn photo_check(config: PhotoConfig, jpeg: Option<std::path::PathBuf>, note: String) -> anyhow::Result<()> {
+    let settings = config.estimator_settings();
+    if settings.ollama_url.is_none() {
+        bail!("LYFE_OLLAMA_URL is off");
+    }
+    let jpeg = jpeg.map(std::fs::read).transpose().context("could not read the photo")?;
+    if jpeg.is_none() && note.trim().is_empty() {
+        bail!("give a photo, a --note, or both");
+    }
+    // No database: nothing is stored.
+    let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://unused")?;
+    let estimator = Estimator::new(pool, settings, Arc::new(tokio::sync::Notify::new()))?;
+    let started = std::time::Instant::now();
+    let estimate = estimator.ask(&note, jpeg).await.map_err(anyhow::Error::msg)?;
+    println!("Answered in {:.1} s.", started.elapsed().as_secs_f64());
+    for item in &estimate.items {
+        println!("  {:<30} {:>6.0} g {:>6.0} kcal {:>6.1} g protein", item.name, item.grams, item.kcal_seen, item.protein_g_seen);
+    }
+    let amount = photo::amount(&estimate.items, estimate.oil_asked, None);
+    let (low, high) = photo::range(amount.kcal, config.photo_range_percent);
+    println!(
+        "Total {} kcal ({low} to {high}), {:.1} g protein{}.",
+        amount.kcal,
+        amount.protein_g(),
+        if estimate.oil_asked { ", with some oil counted: it would ask about oil" } else { "" }
+    );
     Ok(())
 }

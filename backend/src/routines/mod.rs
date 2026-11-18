@@ -1,6 +1,8 @@
 pub mod breath;
 pub mod food;
 pub mod gym;
+pub mod photo;
+pub mod product;
 pub mod streak;
 pub mod weekly;
 pub mod weight;

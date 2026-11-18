@@ -87,6 +87,8 @@ async fn harness_at(pool: PgPool, now: &str, with_key: bool) -> Harness {
             ..Default::default()
         },
         push_ready: false,
+        estimate_range_pct: 35,
+        estimator_wake: Arc::new(tokio::sync::Notify::new()),
         now: Arc::new(move || now),
     };
     Harness { state, garmin, _key_dir: key_dir }
@@ -1646,7 +1648,8 @@ async fn a_meal_weighed_once_is_logged_with_one_tap(pool: PgPool) {
     assert_eq!(
         food["entries"],
         json!([{"id": food_id(11), "slot": "breakfast", "name": "Usual breakfast", "meal_id": food_id(1),
-                "servings": 1.0, "kcal": 542, "protein_g": 43.1}])
+                "servings": 1.0, "kcal": 542, "protein_g": 43.1, "source": "saved", "figures": "known",
+                "estimated": false}])
     );
     assert_eq!((&food["kcal"], &food["protein_g"]), (&json!(542), &json!(43.1)));
     // Lunch and dinner are unknown, not zero.
@@ -1945,4 +1948,463 @@ async fn the_food_prompt_can_be_switched_off(pool: PgPool) {
 
     assert_eq!(notifier.food(at("2026-11-17T16:00:00Z")).await.unwrap(), Outcome::Quiet);
     assert!(apple.received_requests().await.unwrap().is_empty());
+}
+
+// --- Photo and barcode meals ----------------------------------------------
+
+/// The start of a JPEG, which is all the backend checks a photo for.
+const JPEG: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0xFF, 0xD9];
+
+fn jpeg_base64() -> String {
+    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, JPEG)
+}
+
+/// A stand-in for the Spark's Ollama, and an estimator that asks it, on a
+/// machine with `free_gb` of memory free.
+struct Model {
+    server: MockServer,
+    estimator: lyfe_server::estimator::Estimator,
+    _dir: tempdir::Dir,
+}
+
+impl Model {
+    async fn start(h: &Harness, free_gb: u64) -> Model {
+        let server = MockServer::start().await;
+        let dir = tempdir::Dir::new();
+        let meminfo = dir.0.join("meminfo");
+        std::fs::write(&meminfo, format!("MemTotal: 128000000 kB\nMemAvailable: {} kB\n", free_gb * 1024 * 1024)).unwrap();
+        let settings = lyfe_server::estimator::EstimatorSettings {
+            ollama_url: Some(server.uri()),
+            meminfo,
+            ..Default::default()
+        };
+        let estimator =
+            lyfe_server::estimator::Estimator::new(h.state.pool.clone(), settings, h.state.estimator_wake.clone()).unwrap();
+        Model { server, estimator, _dir: dir }
+    }
+
+    /// Ollama with nothing loaded, answering every chat with `content`.
+    async fn answers(&self, content: &str) {
+        self.server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/api/ps"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": []})))
+            .mount(&self.server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "gemma4:31b", "done": true,
+                "message": {"role": "assistant", "content": content},
+            })))
+            .mount(&self.server)
+            .await;
+    }
+
+    async fn estimate(&self) -> lyfe_server::estimator::Outcome {
+        self.estimator.estimate_next().await.unwrap()
+    }
+
+    /// The chats Ollama was sent.
+    async fn chats(&self) -> Vec<Value> {
+        self.server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.url.path() == "/api/chat")
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect()
+    }
+}
+
+/// Rice and chicken, judged fried: 458 kcal and 33 g before any oil.
+const STIR_FRY: &str = r#"{"items": [{"name": "Rice", "grams": 200, "kcal": 260, "protein_g": 5.4},
+                                      {"name": "Chicken", "grams": 120, "kcal": 198, "protein_g": 27.6}],
+                           "fried_sauced_or_restaurant": true}"#;
+
+impl Harness {
+    async fn log_photo(&self, token: &str, entry: u32, eaten_at: &str, slot: &str, note: &str) -> Value {
+        let body = json!({"id": food_id(entry), "eaten_at": eaten_at, "slot": slot, "note": note,
+                          "photo_jpeg": jpeg_base64()});
+        let (status, home) = self.post("/v1/food/photo-entries", Some(token), Some(body)).await;
+        assert_eq!(status, StatusCode::OK, "{home}");
+        home
+    }
+
+    async fn correct(&self, token: &str, entry: u32, body: Value) -> (StatusCode, Value) {
+        self.put(&format!("/v1/food/entries/{}/estimate", food_id(entry)), Some(token), body).await
+    }
+
+    async fn log_barcode(&self, token: &str, entry: u32, code: &str, grams: f64) -> (StatusCode, Value) {
+        let body = json!({"id": food_id(entry), "eaten_at": "2026-11-17T14:00:00Z", "slot": "snack",
+                          "code": code, "grams": grams});
+        self.post("/v1/food/barcode-entries", Some(token), Some(body)).await
+    }
+
+    /// The food database with a protein bar and oats in it.
+    async fn import_products(&self) {
+        let columns = lyfe_server::routines::product::Columns::from_header(
+            "code\tproduct_name\tserving_quantity\tenergy-kcal_100g\tproteins_100g",
+        )
+        .unwrap();
+        let products: Vec<_> = ["96385074\tProtein bar\t60\t350\t33", "0055577105019\tLarge flake oats\t40\t379\t13.2"]
+            .iter()
+            .map(|line| columns.product(line).unwrap())
+            .collect();
+        let mut import = db::ProductImport::begin(&self.state.pool).await.unwrap();
+        import.add(&products).await.unwrap();
+        assert_eq!(import.finish().await.unwrap(), 2);
+    }
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_photo_meal_counts_at_once_and_its_estimate_follows(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    let model = Model::start(&h, 72).await;
+    model.answers(STIR_FRY).await;
+
+    // 19:00 in San Juan. Logged before the model has seen it.
+    let home = h.log_photo(&token, 21, "2026-11-17T23:00:00Z", "dinner", " stir fry, rice, some oil ").await;
+    let food = &home["food"];
+    let dinner = &food["entries"][0];
+    assert_eq!((&dinner["source"], &dinner["figures"], &dinner["estimated"]), (&json!("photo"), &json!("estimating"), &json!(true)));
+    assert_eq!((&dinner["name"], &dinner["kcal"]), (&json!("stir fry, rice, some oil"), &json!(0)));
+    assert_eq!(dinner["photo"]["note"], "stir fry, rice, some oil");
+    assert_eq!(dinner["photo"]["has_photo"], true);
+    // Unknown, not zero: dinner is logged, but nothing is added to the day.
+    assert_eq!((&food["kcal"], &food["unknown"]), (&json!(0), &json!(1)));
+    assert_eq!(food["open_slots"], json!(["breakfast", "lunch"]));
+    assert_eq!(food["streak"]["state"], "kept");
+
+    assert_eq!(model.estimate().await, lyfe_server::estimator::Outcome::Estimated);
+    assert_eq!(model.estimate().await, lyfe_server::estimator::Outcome::Idle);
+
+    // The model was asked with the photo and the line, its context capped,
+    // reasoning off, and to let go of its memory soon after.
+    let chats = model.chats().await;
+    assert_eq!(chats.len(), 1);
+    let chat = &chats[0];
+    assert_eq!((&chat["model"], &chat["think"], &chat["stream"]), (&json!("gemma4:31b"), &json!(false), &json!(false)));
+    assert_eq!((&chat["options"]["num_ctx"], &chat["keep_alive"]), (&json!(8192), &json!("120s")));
+    assert_eq!(chat["messages"][0]["images"], json!([jpeg_base64()]));
+    assert!(chat["messages"][0]["content"].as_str().unwrap().contains("\"stir fry, rice, some oil\""));
+    assert_eq!(chat["format"]["required"], json!(["items", "fried_sauced_or_restaurant"]));
+
+    let (_, home) = h.get("/v1/home", Some(&token)).await;
+    let food = &home["food"];
+    let dinner = &food["entries"][0];
+    assert_eq!(dinner["figures"], "known");
+    // 458 kcal seen, and some oil counted until the owner says.
+    assert_eq!((&dinner["kcal"], &dinner["protein_g"]), (&json!(578), &json!(33.0)));
+    assert_eq!((&dinner["kcal_low"], &dinner["kcal_high"]), (&json!(380), &json!(780)));
+    let photo = &dinner["photo"];
+    assert_eq!((&photo["oil_asked"], &photo["oil"], &photo["oil_counted"], &photo["oil_kcal"]), (&json!(true), &Value::Null, &json!("some"), &json!(120)));
+    assert_eq!(
+        photo["items"],
+        json!([{"name": "Rice", "grams": 200.0, "grams_seen": 200.0, "kcal": 260, "protein_g": 5.4},
+               {"name": "Chicken", "grams": 120.0, "grams_seen": 120.0, "kcal": 198, "protein_g": 27.6}])
+    );
+    assert_eq!((&food["kcal"], &food["kcal_estimated"], &food["kcal_measured"]), (&json!(578), &json!(578), &json!(0)));
+    assert_eq!((&food["kcal_low"], &food["kcal_high"], &food["unknown"]), (&json!(380), &json!(780), &json!(0)));
+    assert_eq!(food["estimate_range_pct"], 35);
+
+    // The photo can be read back.
+    let response = api::router(h.state.clone())
+        .oneshot(
+            Request::get(format!("/v1/food/entries/{}/photo", food_id(21)))
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "image/jpeg");
+    assert_eq!(response.into_body().collect().await.unwrap().to_bytes().as_ref(), JPEG);
+    let (status, _) = h.get(&format!("/v1/food/entries/{}/photo", food_id(21)), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_photo_meal_sent_twice_is_logged_and_estimated_once(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    let model = Model::start(&h, 72).await;
+    model.answers(STIR_FRY).await;
+
+    h.log_photo(&token, 21, "2026-11-17T23:00:00Z", "dinner", "stir fry").await;
+    h.log_photo(&token, 21, "2026-11-17T23:00:00Z", "dinner", "stir fry").await;
+    assert_eq!(food_entry_count(&h.state.pool).await, 1);
+    model.estimate().await;
+    // Arriving again after the estimate changes nothing either.
+    let home = h.log_photo(&token, 21, "2026-11-17T23:00:00Z", "dinner", "stir fry").await;
+    assert_eq!(home["food"]["entries"][0]["kcal"], 578);
+    assert_eq!(model.estimate().await, lyfe_server::estimator::Outcome::Idle);
+    assert_eq!(model.chats().await.len(), 1);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn the_owner_corrects_a_portion_and_answers_the_oil_question(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    let model = Model::start(&h, 72).await;
+    model.answers(STIR_FRY).await;
+    h.log_photo(&token, 21, "2026-11-17T23:00:00Z", "dinner", "stir fry").await;
+    model.estimate().await;
+
+    // More rice than the model judged, and a lot of oil.
+    let (status, home) = h.correct(&token, 21, json!({"grams": [300, 120], "oil": "a_lot"})).await;
+    assert_eq!(status, StatusCode::OK, "{home}");
+    let dinner = &home["food"]["entries"][0];
+    assert_eq!((&dinner["kcal"], &dinner["protein_g"]), (&json!(390 + 198 + 360), &json!(35.7)));
+    assert_eq!(dinner["photo"]["items"][0], json!({"name": "Rice", "grams": 300.0, "grams_seen": 200.0, "kcal": 390, "protein_g": 8.1}));
+    assert_eq!((&dinner["photo"]["oil"], &dinner["photo"]["oil_kcal"]), (&json!("a_lot"), &json!(360)));
+    // Still an estimate, with its range.
+    assert_eq!((&dinner["estimated"], &dinner["kcal_low"]), (&json!(true), &json!(620)));
+
+    // The oil alone, later.
+    let (_, home) = h.correct(&token, 21, json!({"oil": "none"})).await;
+    assert_eq!(home["food"]["entries"][0]["kcal"], 588);
+
+    // Figures typed instead, from a menu; then back to the model's.
+    let (_, home) = h.correct(&token, 21, json!({"kcal": 650, "protein_g": 41.5})).await;
+    let dinner = &home["food"]["entries"][0];
+    assert_eq!((&dinner["kcal"], &dinner["protein_g"], &dinner["photo"]["typed"]), (&json!(650), &json!(41.5), &json!(true)));
+    assert_eq!(dinner.get("kcal_low"), None);
+    let (_, home) = h.correct(&token, 21, json!({"grams": [200, 120]})).await;
+    assert_eq!((&home["food"]["entries"][0]["kcal"], &home["food"]["entries"][0]["photo"]["typed"]), (&json!(458), &json!(false)));
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_meal_the_model_cannot_estimate_is_left_for_the_owner_to_type(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    let model = Model::start(&h, 72).await;
+    model.answers("It looks like about 600 calories.").await;
+    h.log_photo(&token, 21, "2026-11-17T16:30:00Z", "lunch", "pho").await;
+
+    use lyfe_server::estimator::Outcome;
+    assert!(matches!(model.estimate().await, Outcome::Deferred(_)));
+    // A retry falls due a few seconds later; bring it forward.
+    let due = || sqlx::query("update food_entries set estimate_due_at = now()").execute(&h.state.pool);
+    due().await.unwrap();
+    assert!(matches!(model.estimate().await, Outcome::Deferred(_)));
+    due().await.unwrap();
+    assert!(matches!(model.estimate().await, Outcome::GaveUp(_)));
+    assert_eq!(model.estimate().await, Outcome::Idle);
+
+    let (_, home) = h.get("/v1/home", Some(&token)).await;
+    let lunch = &home["food"]["entries"][0];
+    assert_eq!((&lunch["figures"], &home["food"]["unknown"]), (&json!("failed"), &json!(1)));
+    assert!(lunch["photo"]["problem"].as_str().unwrap().contains("could not be used"), "{lunch}");
+
+    // Grams cannot be corrected with nothing seen; the figures can be typed.
+    let (status, _) = h.correct(&token, 21, json!({"grams": []})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, home) = h.correct(&token, 21, json!({"kcal": 520, "protein_g": 35})).await;
+    assert_eq!(status, StatusCode::OK);
+    let lunch = &home["food"]["entries"][0];
+    assert_eq!((&lunch["figures"], &lunch["kcal"], &lunch["photo"]["problem"]), (&json!("known"), &json!(520), &Value::Null));
+    assert_eq!((&home["food"]["kcal_estimated"], &home["food"]["unknown"]), (&json!(520), &json!(0)));
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_busy_or_unreachable_spark_puts_the_estimate_off(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    h.log_photo(&token, 21, "2026-11-17T16:30:00Z", "lunch", "pho").await;
+    use lyfe_server::estimator::Outcome;
+
+    // 12 GB free: the model is not loaded, and nothing counts against it.
+    let busy = Model::start(&h, 12).await;
+    busy.answers(STIR_FRY).await;
+    let Outcome::Deferred(why) = busy.estimate().await else { panic!("not put off") };
+    assert!(why.contains("12 GB free"), "{why}");
+    assert!(busy.chats().await.is_empty());
+    let (_, home) = h.get("/v1/home", Some(&token)).await;
+    assert_eq!(home["food"]["entries"][0]["figures"], "estimating");
+    assert_eq!(home["food"]["entries"][0]["photo"]["problem"], json!(why));
+    // Not due again for a while.
+    assert_eq!(busy.estimate().await, Outcome::Idle);
+
+    sqlx::query("update food_entries set estimate_due_at = now()").execute(&h.state.pool).await.unwrap();
+    // Already loaded, by an earlier meal: nothing more to find room for.
+    busy.server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/api/ps"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": [{"name": "gemma4:31b"}]})))
+        .mount(&busy.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"message": {"content": STIR_FRY}})))
+        .mount(&busy.server)
+        .await;
+    assert_eq!(busy.estimate().await, Outcome::Estimated);
+
+    // Ollama not running at all: put off, never given up on.
+    h.log_photo(&token, 22, "2026-11-17T17:30:00Z", "snack", "an apple").await;
+    let gone = Model::start(&h, 72).await;
+    drop(gone.server);
+    for _ in 0..5 {
+        sqlx::query("update food_entries set estimate_due_at = now()").execute(&h.state.pool).await.unwrap();
+        let Outcome::Deferred(why) = gone.estimator.estimate_next().await.unwrap() else { panic!("given up") };
+        assert!(why.contains("could not be reached"), "{why}");
+    }
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_photo_meal_that_makes_no_sense_is_refused(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    h.save_meal(&token, 1, breakfast_recipe()).await;
+    h.log_meal(&token, 11, 1, "2026-11-17T11:05:00Z").await;
+    let photo = |changes: Value| {
+        let mut body = json!({"id": food_id(21), "eaten_at": "2026-11-17T23:00:00Z", "slot": "dinner",
+                              "note": "stir fry", "photo_jpeg": jpeg_base64()});
+        body.as_object_mut().unwrap().extend(changes.as_object().unwrap().clone());
+        body
+    };
+    let png = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"\x89PNG\r\n\x1a\nxxxx");
+    for (changes, why) in [
+        (json!({"photo_jpeg": png}), "not a JPEG"),
+        (json!({"photo_jpeg": "not base64!"}), "not base64"),
+        (json!({"photo_jpeg": null, "note": "  "}), "neither a photo nor a line"),
+        (json!({"slot": "brunch"}), "no such slot"),
+        (json!({"note": "x".repeat(141)}), "a note too long"),
+        (json!({"eaten_at": "2026-11-20T12:00:00Z"}), "in the future"),
+    ] {
+        let (status, _) = h.post("/v1/food/photo-entries", Some(&token), Some(photo(changes))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{why}");
+    }
+    let (status, _) = h.post("/v1/food/photo-entries", None, Some(photo(json!({})))).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(food_entry_count(&h.state.pool).await, 1);
+
+    // A meal described without a photo is taken.
+    let (status, home) = h.post("/v1/food/photo-entries", Some(&token), Some(photo(json!({"photo_jpeg": null})))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(home["food"]["entries"][1]["photo"]["has_photo"], false);
+
+    // Only a photo meal is corrected, and only as it makes sense.
+    let (status, _) = h.correct(&token, 11, json!({"oil": "none"})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let model = Model::start(&h, 72).await;
+    model.answers(&STIR_FRY.replace("true", "false")).await;
+    model.estimate().await;
+    for (body, why) in [
+        (json!({"oil": "some"}), "oil not asked about"),
+        (json!({"grams": [100]}), "grams for one item of two"),
+        (json!({"grams": [100, 4000]}), "4 kg of chicken"),
+        (json!({"kcal": 650}), "kcal without protein"),
+        (json!({"kcal": 9000, "protein_g": 40}), "9000 kcal"),
+    ] {
+        let (status, _) = h.correct(&token, 21, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{why}");
+    }
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_scanned_barcode_logs_the_labels_figures_as_measured(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    h.import_products().await;
+
+    let (status, product) = h.get("/v1/food/products/96385074", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        product,
+        json!({"code": "96385074", "name": "Protein bar", "kcal_per_100g": 350.0, "protein_per_100g": 33.0,
+               "serving_g": 60.0, "origin": "database"})
+    );
+    // A scanner may read the oats' EAN as its 12-digit UPC.
+    let (status, oats) = h.get("/v1/food/products/055577105019", Some(&token)).await;
+    assert_eq!((status, &oats["name"]), (StatusCode::OK, &json!("Large flake oats")));
+    let (status, _) = h.get("/v1/food/products/00000000", Some(&token)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = h.get("/v1/food/products/abc", Some(&token)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = h.get("/v1/food/products/96385074", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, home) = h.log_barcode(&token, 31, "96385074", 60.0).await;
+    assert_eq!(status, StatusCode::OK, "{home}");
+    let food = &home["food"];
+    let bar = &food["entries"][0];
+    assert_eq!((&bar["source"], &bar["figures"], &bar["estimated"]), (&json!("barcode"), &json!("known"), &json!(false)));
+    assert_eq!((&bar["name"], &bar["kcal"], &bar["protein_g"], &bar["slot"]), (&json!("Protein bar"), &json!(210), &json!(19.8), &json!("snack")));
+    assert_eq!(bar["barcode"], json!({"code": "96385074", "grams": 60.0}));
+    assert_eq!(bar.get("kcal_low"), None);
+    assert_eq!((&food["kcal_measured"], &food["kcal_estimated"]), (&json!(210), &json!(0)));
+    // Lately logged, so it can be found again without a connection.
+    assert_eq!(food["products"][0]["code"], "96385074");
+    // Sent twice, logged once.
+    h.log_barcode(&token, 31, "96385074", 60.0).await;
+    assert_eq!(food_entry_count(&h.state.pool).await, 1);
+
+    for (code, grams) in [("123", 50.0), ("96385074", 0.0), ("96385074", 3500.0)] {
+        let (status, _) = h.log_barcode(&token, 32, code, grams).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{code} {grams}");
+    }
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_code_the_database_does_not_have_waits_for_its_label(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    h.import_products().await;
+
+    // Scanned offline, say, and sent later: logged, figures unknown.
+    // 175 g: 19.25 g of protein, which rounds the same however the label arrives.
+    let (status, home) = h.log_barcode(&token, 31, "0628915423456", 175.0).await;
+    assert_eq!(status, StatusCode::OK);
+    let food = &home["food"];
+    assert_eq!((&food["entries"][0]["figures"], &food["entries"][0]["name"]), (&json!("needs_label"), &json!("Barcode 0628915423456")));
+    assert_eq!((&food["kcal"], &food["unknown"], &food["streak"]["state"]), (&json!(0), &json!(1), &json!("kept")));
+    assert_eq!(food["products"], json!([]));
+
+    // The owner types the label; the waiting meal gets its figures.
+    let label = json!({"name": "Skyr cup", "kcal_per_100g": 63, "protein_per_100g": 11, "serving_g": 175});
+    let (status, home) = h.put("/v1/food/products/628915423456", Some(&token), label.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{home}");
+    let cup = &home["food"]["entries"][0];
+    assert_eq!((&cup["figures"], &cup["name"], &cup["kcal"], &cup["protein_g"]), (&json!("known"), &json!("Skyr cup"), &json!(110), &json!(19.3)));
+    assert_eq!(home["food"]["unknown"], 0);
+    let (_, product) = h.get("/v1/food/products/0628915423456", Some(&token)).await;
+    assert_eq!((&product["name"], &product["origin"]), (&json!("Skyr cup"), &json!("label")));
+
+    // A label typed for a code the database has wins from then on, and
+    // what was logged before keeps its figures.
+    h.log_barcode(&token, 32, "96385074", 60.0).await;
+    let typed = json!({"name": "Protein bar (new recipe)", "kcal_per_100g": 400, "protein_per_100g": 33});
+    h.put("/v1/food/products/96385074", Some(&token), typed).await;
+    let (_, product) = h.get("/v1/food/products/96385074", Some(&token)).await;
+    assert_eq!((&product["name"], &product["serving_g"]), (&json!("Protein bar (new recipe)"), &Value::Null));
+    let (_, home) = h.get("/v1/home", Some(&token)).await;
+    let bar = home["food"]["entries"].as_array().unwrap().iter().find(|e| e["id"] == food_id(32)).unwrap().clone();
+    assert_eq!(bar["kcal"], 210);
+
+    let (status, _) =
+        h.put("/v1/food/products/96385074", Some(&token), json!({"name": "Bar", "kcal_per_100g": 3500, "protein_per_100g": 33})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_new_food_database_replaces_the_old_whole(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    h.import_products().await;
+    let columns = lyfe_server::routines::product::Columns::from_header("code\tproduct_name\tenergy_100g\tproteins_100g").unwrap();
+    let mut import = db::ProductImport::begin(&h.state.pool).await.unwrap();
+    // Until it is finished, lookups see the old copy.
+    import.add(&[columns.product("5449000000996\tCola\t180\t0").unwrap()]).await.unwrap();
+    let (status, _) = h.get("/v1/food/products/96385074", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(import.finish().await.unwrap(), 1);
+    let (status, _) = h.get("/v1/food/products/96385074", Some(&token)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (_, cola) = h.get("/v1/food/products/5449000000996", Some(&token)).await;
+    assert_eq!(cola["kcal_per_100g"], 43.0);
 }

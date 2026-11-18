@@ -290,7 +290,8 @@
     /// The food screens with made-up numbers: a debug build shows one when
     /// launched with LYFE_DEBUG_FOOD set to `day` (breakfast and lunch
     /// logged), `morning`, `done`, `over`, `recovering`, `offline`, `empty`
-    /// (nothing set up yet), `editor`, `new` or `targets`.
+    /// (nothing set up yet), `editor`, `new` or `targets`, or one of the
+    /// photo and barcode screens (`CaptureGallery`).
     public struct FoodGallery: View {
         var screen: String
 
@@ -330,6 +331,8 @@
         public var body: some View {
             Group {
                 switch screen {
+                case _ where CaptureGallery.screens.contains(screen):
+                    CaptureGallery(screen: screen)
                 case "editor":
                     MealEditorView(start: MealDraft(editing: Self.lunch), onSave: { _ in nil }, onRemove: { _ in nil }, onClose: {})
                 case "new":

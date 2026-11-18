@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use clap::Args;
 
+use crate::estimator::EstimatorSettings;
 use crate::push::apns::Environment;
 use crate::routines::breath::BreathRules;
 use crate::routines::food::FoodSettings;
@@ -82,6 +83,52 @@ fn parse_environment(text: &str) -> Result<Environment, String> {
 }
 
 #[derive(Debug, Clone, Args)]
+pub struct PhotoConfig {
+    /// Where the Spark's Ollama answers, which runs the vision model that
+    /// estimates photo meals, or `off` for no estimates (photo meals are
+    /// then typed in by hand).
+    #[arg(long, env = "LYFE_OLLAMA_URL", default_value = "http://127.0.0.1:11434")]
+    pub ollama_url: String,
+
+    /// The vision model that estimates photo meals.
+    #[arg(long, env = "LYFE_PHOTO_MODEL", default_value = "gemma4:31b")]
+    pub photo_model: String,
+
+    /// The context the model is loaded with, in tokens. Kept small so it
+    /// does not crowd the shared machine.
+    #[arg(long, env = "LYFE_PHOTO_CONTEXT", default_value_t = 8192, value_parser = clap::value_parser!(u32).range(2048..=131072))]
+    pub photo_context: u32,
+
+    /// The model is not loaded unless this many GB of memory are free.
+    #[arg(long, env = "LYFE_PHOTO_MIN_FREE_GB", default_value_t = 32, value_parser = clap::value_parser!(u32).range(0..=1024))]
+    pub photo_min_free_gb: u32,
+
+    /// Seconds the model stays loaded after the last photo, so meals logged
+    /// together are estimated together.
+    #[arg(long, env = "LYFE_PHOTO_KEEP_ALIVE_SECONDS", default_value_t = 120, value_parser = clap::value_parser!(u32).range(0..=3600))]
+    pub photo_keep_alive_seconds: u32,
+
+    /// How far either way a photo estimate may be, in percent, shown as its
+    /// range.
+    #[arg(long, env = "LYFE_PHOTO_RANGE_PERCENT", default_value_t = crate::routines::photo::DEFAULT_RANGE_PCT, value_parser = clap::value_parser!(u32).range(0..=100))]
+    pub photo_range_percent: u32,
+}
+
+impl PhotoConfig {
+    pub fn estimator_settings(&self) -> EstimatorSettings {
+        let url = self.ollama_url.trim();
+        EstimatorSettings {
+            ollama_url: (!url.eq_ignore_ascii_case("off") && !url.is_empty()).then(|| url.to_string()),
+            model: self.photo_model.clone(),
+            context: self.photo_context,
+            min_free_gb: self.photo_min_free_gb,
+            keep_alive_s: self.photo_keep_alive_seconds,
+            ..EstimatorSettings::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Args)]
 pub struct ServeConfig {
     #[command(flatten)]
     pub database: DatabaseConfig,
@@ -91,6 +138,9 @@ pub struct ServeConfig {
 
     #[command(flatten)]
     pub push: PushConfig,
+
+    #[command(flatten)]
+    pub photo: PhotoConfig,
 
     /// Address to listen on. Keep it on loopback and publish it to the
     /// tailnet with `tailscale serve`.

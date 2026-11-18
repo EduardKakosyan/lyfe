@@ -2,14 +2,14 @@
 
 A private app that keeps three routines going: gym, breath training and food logging. What it is and why is in `CONTEXT.md`, `docs/adr/` and `docs/build-plan.md`.
 
-Built so far: steps 1 to 5 of the build plan. A strength session recorded on the watch shows up as a filled square on the Home screen, with nothing entered in lyfe. The gym band shows the streak in weeks, with recovery after a missed week, and the backend can prompt the phone when a streak needs sessions. A breath session runs in the app, one tap per hold, and the backend sets the next table from it. A morning prompt takes your weight typed into the notification itself, and Progress shows the seven-day average as a line. A meal you weighed once is logged with one tap, the Food screen shows the day against your calorie and protein targets, and the fuel band counts the days logged in a row. lyfe asks for Face ID each time it is opened.
+Built so far: steps 1 to 6 of the build plan. A strength session recorded on the watch shows up as a filled square on the Home screen, with nothing entered in lyfe. The gym band shows the streak in weeks, with recovery after a missed week, and the backend can prompt the phone when a streak needs sessions. A breath session runs in the app, one tap per hold, and the backend sets the next table from it. A morning prompt takes your weight typed into the notification itself, and Progress shows the seven-day average as a line. A meal you weighed once is logged with one tap, the Food screen shows the day against your calorie and protein targets, and the fuel band counts the days logged in a row. Any other meal is logged with a photo and one line, which a model on the Spark estimates, or with a packet's barcode; the day keeps what was measured apart from what was estimated. lyfe asks for Face ID each time it is opened.
 
 ## Layout
 
 | Folder | What it is |
 |---|---|
-| `backend/` | The Rust backend: API, sign-in, Garmin poller, gym, breath, weight, food and streak rules, notifications. The single authority for what counts. |
-| `apps/LyfeKit/` | Swift package shared by the iPhone app and the later Mac app: API client, local storage, app model, breath timer, weigh-ins, food log, Poster screens. |
+| `backend/` | The Rust backend: API, sign-in, Garmin poller, gym, breath, weight, food and streak rules, photo estimates, the barcode food database, notifications. The single authority for what counts. |
+| `apps/LyfeKit/` | Swift package shared by the iPhone app and the later Mac app: API client, local storage, app model, breath timer, weigh-ins, food log, photo and barcode capture, Poster screens. |
 | `apps/Lyfe/` | The iPhone app target. It only launches LyfeKit. |
 | `deploy/spark/` | Scripts and service files for running the backend on the Spark. |
 
@@ -22,12 +22,14 @@ flowchart LR
     server --- db[(PostgreSQL, lyfe account only)]
     phone[iPhone app] -- HTTPS over Tailscale, lyfe sign-in --> server
     server -- prompts --> apple[Apple push service] --> phone
+    server -- photo meals, on loopback --> ollama[Ollama on the Spark: gemma4:31b]
 ```
 
 - The backend listens on loopback only. `tailscale serve` publishes it to the tailnet over HTTPS; nothing is reachable from the public internet.
 - The tailnet and the Spark are shared, so the backend has its own sign-in: one password, and one revocable token per device. Only a hash of each is stored.
 - PostgreSQL runs under the `lyfe` account on a Unix socket in a folder only that account can open. It has no network port.
 - The Garmin key stays in a file on the Spark. It is never in this repository, in settings, or in logs.
+- Meal photos go only to the Spark's own Ollama, on loopback. Nothing about food leaves the Spark except in the encrypted backup.
 - When the phone cannot reach the backend it shows the last week it saw, marked offline with its age.
 - The app does not depend on the phone using Tailscale's DNS. The Spark's name also has a public answer, because other services on it are published to the internet, and a phone that looks the name up outside Tailscale gets that one, where port 8444 is closed. So when the system's answer for a `.ts.net` name is not a tailnet address, the app asks Tailscale's resolver (100.100.100.100) itself and connects to that address, still requiring the certificate to match the name (`apps/LyfeKit/Sources/LyfeKit/Net/TailnetTransport.swift`).
 
@@ -84,18 +86,52 @@ The unit and the prompt's time are settings (`LYFE_WEIGHT_UNIT`, `lb` unless set
 
 ## Food
 
-A meal you eat repeatedly is weighed once and saved; after that logging it is one tap, and its numbers are measured rather than guessed. Anything else cannot be logged yet: photo and barcode meals are step 6. The backend decides what the numbers mean (`backend/src/routines/food.rs`).
+A meal you eat repeatedly is weighed once and saved; after that logging it is one tap, and its numbers are measured rather than guessed. Anything else is a photo and one line, or a barcode (both below). The backend decides what the numbers mean (`backend/src/routines/food.rs`).
 
 - **A saved meal.** In the app, Food > New saved meal: a name, the part of the day it belongs to (breakfast, lunch, dinner or snack), how many portions the recipe makes, and each ingredient as weighed with the kcal and protein per 100 g from its label. A batch that makes five lunches is typed as the whole pot with 5 portions. The backend works out a portion; the figure in the editor's bar is a preview of the same sum, so a slipped decimal point shows before you save. Saving needs a connection.
 - **One tap.** On the Food screen, tapping a saved meal logs one portion of it now, under its part of the day. Holding it offers half, one and a half, or two portions. The black bar always offers the saved meal for the next of breakfast, lunch and dinner that is still open, the one you logged last for it, so a weekday with three saved meals is three taps on the bar.
 - **A slip.** Tapping a logged meal takes it off the day. Changing a recipe (hold the meal, Change the recipe) does not rewrite days already logged: an entry keeps the name and figures of the recipe as it was when it arrived. A removed meal leaves the list and what was logged from it stays.
 - **Targets.** You type a calorie and a protein target (Food > Targets). The day is shown against them: the giant figure is what is logged, the bars fill toward the targets, and the line beside the heading says how much is left or how far over. A target counts from the day it is set, and earlier days keep the one they had. lyfe never changes a target by itself. The figures are yours and are not in this repository or the server log.
-- **Unknown is not zero.** A breakfast, lunch or dinner with nothing logged shows a question mark and is listed as open, so the day's figure is never read as the whole day when it is not. Snacks are extra: a day without one is not missing anything.
+- **Unknown is not zero.** A breakfast, lunch or dinner with nothing logged shows a question mark and is listed as open, so the day's figure is never read as the whole day when it is not. Snacks are extra: a day without one is not missing anything. A meal that is logged but whose figures are not known yet (a photo still being estimated, a barcode the database does not have) fills its part of the day and counts for the streak, but is left out of the total and said so above the day.
+- **Measured and estimated.** Saved meals and labels are measured; photo meals are estimated. The bars fill solid for the first and striped for the second, and once anything is estimated the line under the figure gives the estimated part and the range the day may really be in.
 - **The streak.** By the day: a day counts once anything is logged on it, whatever the numbers, so a day over target does not break it. One missed day is recovered by logging the next (shown striped), two in a row end the streak, and nothing is ever made up. The fuel band on Home shows the days in a row and the last seven days as squares, today last.
 - **Offline.** A tap is written to the phone before it is sent, with an id made on the phone and the time it was tapped, so a meal logged without a connection is sent the next time lyfe opens, counts for the day it was eaten on, and is never logged twice. Until then it shows in its part of the day marked as not counted yet. Saved meals come with the last state the phone saw, so one-tap logging works from them offline.
 - **The prompt.** When a streak is alive and nothing is logged by 12:00 in your time zone, one prompt goes out that day, worded for recovery when yesterday was missed. Tapping it opens the Food screen. Nothing is sent when today is already logged or no streak is alive. A meal still waiting on the phone to be sent is not known to the backend, so it can be prompted for.
 
 The prompt's time is a setting (`LYFE_FOOD_PROMPT_AT`, a time like `12:00` or `off`); it is also held to the hours below.
+
+## Photo meals
+
+For a meal that is not a saved one: a photo and one line saying what it was. A vision model on the Spark (gemma4:31b, in the Spark's Ollama) estimates it afterwards. The pure rules are `backend/src/routines/photo.rs`; the asking is `backend/src/estimator.rs`.
+
+- **On the phone.** Food > PHOTO opens the camera. Take the picture, type the line (*stir fry, rice, some oil*), check the part of the day, LOG IT. A meal can also be described without a photo, or a picture chosen from the library. The picture is shrunk to 1280 pixels and the location and camera details the phone writes into it are dropped before it is kept or sent.
+- **It counts at once.** The meal is logged, and counts for the streak, when it arrives. Its estimate screen opens and fills in when the model answers: seconds if the model is loaded, a couple of minutes if it has to load first. Until then the meal shows as being estimated and is not in the day's total.
+- **The estimate.** The model lists each food it sees with its grams, kcal and protein; the meal is their sum. It is shown with a range of ±35% either way, because photo estimates are that rough (`LYFE_PHOTO_RANGE_PERCENT`). The one-line description is trusted over the photo for what each food is.
+- **Correcting it.** Tap a food to change its grams (0 takes it out); its kcal and protein scale with it. Or type the meal's figures instead, from a menu that gives them; those have no range.
+- **Oil.** The model is told to leave cooking fat and sauce out of its foods and to say whether the meal is fried, sauced or from a restaurant. Only then does the screen ask HOW MUCH OIL OR SAUCE?: none adds nothing, some adds 120 kcal (a tablespoon of oil), a lot adds 360. Until it is answered the meal is counted with some, since missed cooking fat is the commonest error in photo estimates.
+- **Offline.** The meal and its photo are kept on the phone with an id made there, sent when the server can next be reached, and estimated then. It counts for the day it was eaten on and is never logged twice.
+- **When the Spark is busy.** The model is loaded only when a photo is waiting, and only when at least 32 GB of memory are free (`LYFE_PHOTO_MIN_FREE_GB`), unless it is already loaded. Its context is capped at 8,192 tokens, which keeps it to about 26 GB where Ollama's default took twice that, and it is let go two minutes after the last photo, so meals logged together are estimated together (`LYFE_PHOTO_CONTEXT`, `LYFE_PHOTO_KEEP_ALIVE_SECONDS`). Short of memory, it tries again every five minutes; with Ollama not answering, every two. The estimate screen says which.
+- **When the model gets it wrong.** An answer that is not the JSON asked for, or has figures no food could have (more than 9 kcal or more protein than grams), is not used. After three such answers lyfe stops asking and the meal waits for its figures to be typed.
+
+`lyfe-server photo-check <photo.jpg> --note "<one line>"` asks the model about one photo and prints its answer, storing nothing. On a real plate it answered in about 20 seconds with the model loading. `LYFE_OLLAMA_URL=off` switches estimates off; photo meals are then typed in by hand. The photos are kept in the database, so they are in the backup.
+
+## Barcodes
+
+Packaged food is logged from its label: a barcode and the grams eaten. Label figures are measured, not estimated. The rules are `backend/src/routines/product.rs`.
+
+- **On the phone.** Food > SCAN reads the barcode with the camera (or type the number under the bars). lyfe shows the product and its figures per 100 g; type the grams, or tap ½, 1 or 2 servings when the label states one, and LOG IT.
+- **Where the figures come from.** A downloaded copy of Open Food Facts on the Spark (below), or a label you typed. A product you have logged lately is known on the phone, so scanning it again works without a connection.
+- **Not in the database.** Type it once from the packet: its name, kcal and protein per 100 g, and the serving if it has one. It is remembered, and wins over the database's figures from then on. Meals logged earlier keep the figures they had.
+- **Offline.** A scan is kept on the phone with the grams, and looked up when it is sent. If the code turns out to be unknown, the meal is logged with a question mark and Food asks for its label; typing it fills in that meal.
+- **A UPC and its EAN** (the same digits with a 0 in front) are the same product, whichever the scanner reads.
+
+The food database is about 1.5 GB to download and is not in the backup, since it can be fetched again. To fetch it, or a newer copy, on the Spark as `lyfe`:
+
+```sh
+~/bin/lyfe-food-db
+```
+
+It downloads the export, checks it is whole, and swaps it in all at once, so a lookup meanwhile still finds the old copy. Lines without a name, energy or protein are skipped. Open Food Facts is published under the Open Database License; lyfe uses it privately and does not pass it on.
 
 ## The lock
 
@@ -153,6 +189,8 @@ cargo run -- serve
 
 Without `LYFE_GARMIN_KEY_FILE` the server runs and imports nothing. `lyfe-server garmin-check` asks Garmin for recent activities and prints counts only, to confirm a key file works.
 
+Photo meals need a model to estimate them. On this Mac, use the stand-in, which answers every photo with rice and chicken: `python3 -I backend/tests/ollama_stand_in.py 11499` and `LYFE_OLLAMA_URL=http://127.0.0.1:11499`. To try the real model instead, forward the Spark's Ollama (`ssh -L 11435:127.0.0.1:11434 <spark>`) and use `LYFE_OLLAMA_URL=http://127.0.0.1:11435`; it then loads on the Spark. For barcodes, `gunzip -c <export>.csv.gz | lyfe-server import-food-db` reads an Open Food Facts export, or any part of one with its header line.
+
 ## Working on the app
 
 Needs Xcode and `xcodegen`.
@@ -176,9 +214,9 @@ xcrun devicectl device process launch --console --terminate-existing \
 
 It prints what the system and Tailscale each answer for the server's name and whether the backend replied, then quits.
 
-A debug build launched with `LYFE_DEBUG_GALLERY` set shows the gym and breath bands in every streak state with made-up numbers (`LYFE_DEBUG_GALLERY=3` skips the first three). `LYFE_DEBUG_BREATH` set to `ready`, `leadin`, `hold`, `beaten`, `recover`, `done` or `offline` shows that breath screen. `LYFE_DEBUG_PROGRESS` set to `full`, `new`, `empty`, `entry` or `kg` shows Progress or the weight entry with made-up weights. `LYFE_DEBUG_FOOD` set to `day`, `morning`, `done`, `over`, `recovering`, `offline`, `empty`, `editor`, `new` or `targets` shows the Food screen, the meal editor or the targets entry with made-up meals. `LYFE_DEBUG_OPEN` set to `food`, `meal`, `targets` or `progress` opens that screen of the real app once it has signed in; with `LYFE_DEBUG_FOOD_TAP` set as well it first logs the meal the Food screen's bar offers, so use that against a local backend. `LYFE_DEBUG_UNLOCKED` opens lyfe without Face ID, `LYFE_DEBUG_LOCKED` keeps it on the lock screen, and `LYFE_DEBUG_LOCKED=open` lets the lock open by itself each time, for trying it in the simulator. `LYFE_DEBUG_BREATH_RUN=12` runs the next session by itself with 12-second holds; it plays the tones and records the session, so use it against a local backend with the sound down.
+A debug build launched with `LYFE_DEBUG_GALLERY` set shows the gym and breath bands in every streak state with made-up numbers (`LYFE_DEBUG_GALLERY=3` skips the first three). `LYFE_DEBUG_BREATH` set to `ready`, `leadin`, `hold`, `beaten`, `recover`, `done` or `offline` shows that breath screen. `LYFE_DEBUG_PROGRESS` set to `full`, `new`, `empty`, `entry` or `kg` shows Progress or the weight entry with made-up weights. `LYFE_DEBUG_FOOD` set to `day`, `morning`, `done`, `over`, `recovering`, `offline`, `empty`, `editor`, `new` or `targets` shows the Food screen, the meal editor or the targets entry with made-up meals; set to `mixed`, `photo`, `estimate`, `estimating`, `failed`, `scan`, `product`, `notfound` or `label` it shows the photo and barcode screens. `LYFE_DEBUG_OPEN` set to `food`, `meal`, `targets`, `photo`, `scan` or `progress` opens that screen of the real app once it has signed in; with `LYFE_DEBUG_FOOD_TAP` set as well it first logs the meal the Food screen's bar offers, and with `LYFE_DEBUG_FOOD_PHOTO` set to a line it logs a made-up plate as a photo meal and opens its estimate, so use either against a local backend. `LYFE_DEBUG_UNLOCKED` opens lyfe without Face ID, `LYFE_DEBUG_LOCKED` keeps it on the lock screen, and `LYFE_DEBUG_LOCKED=open` lets the lock open by itself each time, for trying it in the simulator. `LYFE_DEBUG_BREATH_RUN=12` runs the next session by itself with 12-second holds; it plays the tones and records the session, so use it against a local backend with the sound down.
 
-The tests that need a real server are skipped unless told where one is: `LYFE_LIVE_SERVER=<name>:8444@<tailnet address> swift test`. `LYFE_LOCAL_SERVER=http://127.0.0.1:8787 LYFE_LOCAL_PASSWORD=<password> swift test` runs the app's client against a backend on this machine; it records a breath session, saves and removes a meal, sets food targets and logs entries, so give that backend a scratch database.
+The tests that need a real server are skipped unless told where one is: `LYFE_LIVE_SERVER=<name>:8444@<tailnet address> swift test`. `LYFE_LOCAL_SERVER=http://127.0.0.1:8787 LYFE_LOCAL_PASSWORD=<password> swift test --no-parallel` runs the app's client against a backend on this machine; it records a breath session, saves and removes a meal, sets food targets, logs entries, a photo meal and a barcode, and types a label, so give that backend a scratch database and the stand-in model (above). `--no-parallel` keeps the checks from logging into each other's day.
 
 ## Running on the Spark
 
@@ -198,13 +236,13 @@ Then, and again for every new version (no sudo):
 deploy/spark/install.sh
 ```
 
-After the first install, set the password as the script tells you. The app's server address is then `<spark-name>.<tailnet>.ts.net:8444`.
+After the first install, set the password as the script tells you. The app's server address is then `<spark-name>.<tailnet>.ts.net:8444`. For barcodes, fetch the food database once (`~/bin/lyfe-food-db` as `lyfe`, see Barcodes). Photo meals need gemma4:31b in the Spark's Ollama, which is shared: `ollama pull gemma4:31b` by whoever runs it, if `photo-check` says it is missing.
 
 ## Backup
 
 Every night the Spark sends an encrypted copy of the whole database to a private bucket in Supabase Storage (`deploy/spark/lyfe-backup`, started by `lyfe-backup.timer` at 03:30 by the Spark's own clock, which need not be your time zone, or when the Spark is next up if it was off). Until it is set up, the database on the Spark is the only copy, and `install.sh` says so each time it runs.
 
-- **What leaves the Spark.** One file a night, `lyfe-<date and time>.dump.gpg`: a `pg_dump` of the database, encrypted on the Spark with AES-256 under a passphrase only you hold. Supabase stores a file it cannot read. After each upload the script reads the bucket's listing and fails unless the file is there at its full size.
+- **What leaves the Spark.** One file a night, `lyfe-<date and time>.dump.gpg`: a `pg_dump` of the database, meal photos included and the downloaded food database left out, encrypted on the Spark with AES-256 under a passphrase only you hold. Supabase stores a file it cannot read. After each upload the script reads the bucket's listing and fails unless the file is there at its full size.
 - **What it does not do yet.** Old backups are never deleted. A failed night shows only in the Spark's log (`journalctl --user -u lyfe-backup`); nothing tells the phone.
 
 Set it up once:

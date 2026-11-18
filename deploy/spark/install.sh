@@ -51,7 +51,8 @@ echo "== Copying to $LYFE_SSH"
 ssh "${SSH_OPTS[@]}" "$LYFE_SSH" 'mkdir -p ~/bin ~/.config/lyfe ~/.config/systemd/user ~/.cache/lyfe-install && chmod 700 ~/.config/lyfe'
 scp -q "${SSH_OPTS[@]}" "$BINARY" "$LYFE_SSH:.cache/lyfe-install/lyfe-server"
 scp -q "${SSH_OPTS[@]}" lyfe-postgres.service lyfe-server.service lyfe.env.template \
-    lyfe-backup lyfe-backup.service lyfe-backup.timer backup.env.template "$LYFE_SSH:.cache/lyfe-install/"
+    lyfe-backup lyfe-backup.service lyfe-backup.timer backup.env.template lyfe-food-db \
+    "$LYFE_SSH:.cache/lyfe-install/"
 
 echo "== Installing"
 ssh "${SSH_OPTS[@]}" "$LYFE_SSH" "TIMEZONE='$TIMEZONE' bash -s" <<'REMOTE'
@@ -100,6 +101,7 @@ if [ ! -e ~/.config/lyfe/backup.env ]; then
     chmod 600 ~/.config/lyfe/backup.env
 fi
 install -m 755 "$STAGE/lyfe-backup" ~/bin/lyfe-backup
+install -m 755 "$STAGE/lyfe-food-db" ~/bin/lyfe-food-db
 cp "$STAGE/lyfe-backup.service" "$STAGE/lyfe-backup.timer" ~/.config/systemd/user/
 systemctl --user daemon-reload
 if BACKUP_MISSING=$(~/bin/lyfe-backup ready); then

@@ -170,7 +170,8 @@ impl Notifier {
             return Ok(Outcome::NoDevices);
         }
         let today = local.date_naive();
-        let entries = db::food_entries(&self.pool, self.timezone).await?;
+        // Only which days have a meal matters here, not what a photo showed.
+        let entries = db::food_entries(&self.pool, self.timezone, now).await?;
         let Some(prompt) = food::prompt(&food::streak(today, &food::logged_days(&entries))) else {
             return Ok(Outcome::NothingDue);
         };

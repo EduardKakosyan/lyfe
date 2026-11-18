@@ -27,6 +27,8 @@
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
+	<key>NSCameraUsageDescription</key>
+	<string>lyfe takes a photo of a meal to estimate it, and reads the barcode on packaged food.</string>
 	<key>NSFaceIDUsageDescription</key>
 	<string>lyfe asks for Face ID each time it is opened, so only you see your routines and weight.</string>
 	<key>UIBackgroundModes</key>

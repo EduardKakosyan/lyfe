@@ -30,6 +30,18 @@ _Avoid_: Recipe (for the saved meal itself), favourite, template
 The meals logged on a day, each under a part of the day: breakfast, lunch, dinner or snack. A main meal with nothing logged is unknown, never zero, so the day's total is only what was logged.
 _Avoid_: Calorie count (for the log), diary
 
+**Photo meal**:
+A meal logged with a photo and a one-line description, whose calories and protein a model estimates afterwards. It counts for the day when it is logged; its figures join the total once estimated. The owner can correct each item's grams, say how much oil or sauce went in, or type the figures instead.
+_Avoid_: AI meal, scanned meal
+
+**Estimate**:
+A photo meal's figures as the model judged them, always shown with a range either way. Estimated figures are kept apart from measured ones: a saved meal or a label is measured, a photo meal is estimated.
+_Avoid_: Guess (in the app), approximation
+
+**Label**:
+The calories and protein per 100 g printed on packaged food, found by its barcode in the downloaded food database or typed once by the owner. A meal logged from a label is measured.
+_Avoid_: Nutrition facts (as a term in lyfe), product entry
+
 **Target**:
 The calories and protein the owner holds a day to. The owner sets it; lyfe shows each day against it and never changes it without the owner's approval. A target counts from the day it is set.
 _Avoid_: Goal, budget, limit

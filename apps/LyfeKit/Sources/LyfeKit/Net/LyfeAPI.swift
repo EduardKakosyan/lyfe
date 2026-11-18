@@ -113,6 +113,106 @@ public struct LyfeAPI: Sendable {
         return try await call("POST", "v1/food/entries", token: token, body: body, timeout: 15)
     }
 
+    /// Hands the backend a meal logged from a photo and one line. It
+    /// answers with Home as it now stands; the estimate follows later.
+    /// Sending the same meal again changes nothing.
+    public func recordPhotoEntry(token: String, capture: FoodCapture, jpeg: Data?) async throws -> HomeSnapshot {
+        guard case .photo(let note, _) = capture.kind else { throw LyfeAPIError.unreadableResponse }
+        struct Body: Encodable {
+            var id: UUID
+            var eatenAt: Date
+            var slot: MealSlot
+            var note: String
+            var photoJpeg: String?
+        }
+        let body = try JSONEncoder.lyfe.encode(
+            Body(
+                id: capture.id, eatenAt: capture.eatenAt, slot: capture.slot, note: note,
+                photoJpeg: jpeg?.base64EncodedString()))
+        // A photo takes longer to send than a tap.
+        return try await call("POST", "v1/food/photo-entries", token: token, body: body, timeout: 60)
+    }
+
+    /// Hands the backend packaged food logged by its barcode. It answers
+    /// with Home as it now stands. Sending the same meal again changes
+    /// nothing.
+    public func recordBarcodeEntry(token: String, capture: FoodCapture) async throws -> HomeSnapshot {
+        guard case .barcode(let code, let grams, _) = capture.kind else { throw LyfeAPIError.unreadableResponse }
+        struct Body: Encodable {
+            var id: UUID
+            var eatenAt: Date
+            var slot: MealSlot
+            var code: String
+            var grams: Double
+        }
+        let body = try JSONEncoder.lyfe.encode(
+            Body(id: capture.id, eatenAt: capture.eatenAt, slot: capture.slot, code: code, grams: grams))
+        return try await call("POST", "v1/food/barcode-entries", token: token, body: body, timeout: 15)
+    }
+
+    /// A change to a photo meal's estimate.
+    public enum EstimateChange: Equatable, Sendable {
+        /// The grams of each item the model saw, in order, and the oil.
+        case portions(grams: [Double]?, oil: Oil?)
+        /// Figures typed instead of the model's.
+        case typed(kcal: Int, proteinG: Double)
+    }
+
+    /// Corrects a photo meal's estimate. Answers with Home.
+    public func correctEstimate(token: String, id: UUID, change: EstimateChange) async throws -> HomeSnapshot {
+        struct Body: Encodable {
+            var grams: [Double]?
+            var oil: Oil?
+            var kcal: Int?
+            var proteinG: Double?
+        }
+        let value =
+            switch change {
+            case .portions(let grams, let oil): Body(grams: grams, oil: oil)
+            case .typed(let kcal, let protein): Body(kcal: kcal, proteinG: protein)
+            }
+        let body = try JSONEncoder.lyfe.encode(value)
+        return try await call(
+            "PUT", "v1/food/entries/\(id.uuidString.lowercased())/estimate", token: token, body: body, timeout: 15)
+    }
+
+    /// The photo of a logged meal, as it was sent.
+    public func foodPhoto(token: String, id: UUID) async throws -> Data {
+        try await perform("GET", "v1/food/entries/\(id.uuidString.lowercased())/photo", token: token, body: nil, timeout: 20)
+    }
+
+    /// The label lyfe has for a barcode, or nil when it has none.
+    public func product(token: String, code: String) async throws -> Product? {
+        do {
+            return try await call("GET", "v1/food/products/\(code)", token: token, body: nil, timeout: 15)
+        } catch LyfeAPIError.server(status: 404) {
+            return nil
+        }
+    }
+
+    /// Stores a label typed by hand for a barcode. Meals waiting for it get
+    /// their figures. Answers with Home.
+    public func setProduct(token: String, product: Product) async throws -> HomeSnapshot {
+        struct Body: Encodable {
+            var name: String
+            var kcalPer100g: Double
+            var proteinPer100g: Double
+            var servingG: Double?
+
+            enum CodingKeys: String, CodingKey {
+                case name
+                case kcalPer100g = "kcal_per_100g"
+                case proteinPer100g = "protein_per_100g"
+                case servingG = "serving_g"
+            }
+        }
+        let body = try JSONEncoder.lyfe.encode(
+            Body(
+                name: product.name, kcalPer100g: product.kcalPer100g, proteinPer100g: product.proteinPer100g,
+                servingG: product.servingG))
+        return try await call("PUT", "v1/food/products/\(product.code)", token: token, body: body, timeout: 15)
+    }
+
     /// Takes a logged meal back. Doing it twice changes nothing.
     public func removeFoodEntry(token: String, id: UUID) async throws -> HomeSnapshot {
         try await call("DELETE", "v1/food/entries/\(id.uuidString.lowercased())", token: token, body: nil, timeout: 15)

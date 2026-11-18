@@ -137,7 +137,10 @@ case "${1:-run}" in
         command -v "$PG_DUMP" >/dev/null || die "pg_dump is not installed"
 
         name="lyfe-$(date -u +%Y%m%dT%H%M%SZ).dump.gpg"
-        "$PG_DUMP" --format=custom --no-owner --dbname="$LYFE_DATABASE_URL" --file="$WORK/lyfe.dump"
+        # The downloaded food database is left out: it is large, and
+        # lyfe-food-db fetches it again. Its table is still made on restore.
+        "$PG_DUMP" --format=custom --no-owner --dbname="$LYFE_DATABASE_URL" --file="$WORK/lyfe.dump" \
+            --exclude-table-data=barcode_products --exclude-table-data=barcode_products_next
         # pg_dump has already compressed it.
         gpg_quiet --symmetric --cipher-algo AES256 --compress-algo none --output "$WORK/$name" "$WORK/lyfe.dump"
         rm -f "$WORK/lyfe.dump"

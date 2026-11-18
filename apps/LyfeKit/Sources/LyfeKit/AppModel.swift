@@ -57,6 +57,24 @@ public final class AppModel {
     public private(set) var mealDraft: MealDraft?
     /// True while the targets entry is on screen.
     public private(set) var isEnteringTargets = false
+    /// Photo and barcode meals logged on this phone that the backend has
+    /// not confirmed yet, oldest first.
+    public private(set) var unsentCaptures: [FoodCapture]
+    /// The photo or barcode screen over Food, while one is open.
+    public private(set) var foodFlow: FoodFlow?
+
+    /// The screens a photo or barcode meal is logged and corrected on.
+    public enum FoodFlow: Equatable, Sendable {
+        /// Taking a photo meal: the photo, a line, the part of the day.
+        case photo
+        /// A photo meal's estimate, to check and correct.
+        case estimate(UUID)
+        /// Scanning a barcode and saying how much was eaten.
+        case scan
+        /// Typing the label of a code lyfe does not know, for a meal
+        /// already logged with it or about to be.
+        case label(code: String)
+    }
 
     /// The screens other than Home, for a signed-in owner.
     public enum Screen: Equatable, Sendable {
@@ -89,6 +107,7 @@ public final class AppModel {
     private let weighIns: WeighInStore
     private var isSendingWeighIns = false
     private let food: FoodStore
+    private let captures: CaptureStore
     private var isSendingFood = false
     private let ownerCheck: any OwnerCheck
     private let makeCues: @MainActor () -> any BreathCues
@@ -104,6 +123,7 @@ public final class AppModel {
         breath: BreathStore,
         weighIns: WeighInStore,
         food: FoodStore,
+        captures: CaptureStore? = nil,
         transport: any HTTPTransport,
         deviceName: String,
         defaultServerAddress: String = "",
@@ -117,6 +137,10 @@ public final class AppModel {
         self.breath = breath
         self.weighIns = weighIns
         self.food = food
+        // Tests that do not care keep them in a folder of their own.
+        self.captures =
+            captures
+            ?? CaptureStore(directory: FileManager.default.temporaryDirectory.appending(path: "lyfe-\(UUID().uuidString)"))
         self.ownerCheck = ownerCheck
         makeCues = cues
         self.transport = transport
@@ -136,6 +160,8 @@ public final class AppModel {
         unsentBreath = breath.outbox().map(\.id)
         unsentWeighIns = weighIns.outbox().map(\.id)
         unsentFood = food.outbox()
+        unsentCaptures = self.captures.outbox()
+        self.captures.prunePhotos(olderThan: 3 * 86_400, now: now())
         pickUpBreathSession()
         lock()
     }
@@ -151,6 +177,7 @@ public final class AppModel {
             breath: .standard(),
             weighIns: .standard(),
             food: .standard(),
+            captures: .standard(),
             transport: TailnetTransport.live(),
             deviceName: deviceName,
             defaultServerAddress: defaultServerAddress,
@@ -295,6 +322,7 @@ public final class AppModel {
         foodProblem = nil
         mealDraft = nil
         isEnteringTargets = false
+        foodFlow = nil
         screen = .home
         isEnteringWeight = false
         isLocked = false
@@ -337,6 +365,22 @@ public final class AppModel {
 
     private func loadHome(_ api: LyfeAPI, _ token: String) async throws {
         show(try await api.home(token: token))
+    }
+
+    /// Fetches Home again without asking Garmin: for following an estimate
+    /// while its screen is open. Quiet when it cannot reach the backend.
+    public func reloadHome() async {
+        guard phase == .signedIn, !isRefreshing, let api, let token else { return }
+        do {
+            try await loadHome(api, token)
+        } catch LyfeAPIError.unauthorized {
+            forgetSession()
+        } catch LyfeAPIError.unreachable(let why) {
+            isOffline = true
+            offlineReason = why
+        } catch {
+            // Kept as shown; the next refresh says what is wrong.
+        }
     }
 
     /// Takes an answer from the backend as the current state.
@@ -543,13 +587,16 @@ public final class AppModel {
     public func closeFood() {
         mealDraft = nil
         isEnteringTargets = false
+        foodFlow = nil
         screen = .home
     }
 
     /// The saved meal the Food screen's bar offers: the one for the next
     /// main meal still open today. Nil when there is nothing to tap.
     public var nextMeal: SavedMeal? {
-        guard let food = home?.food, case .log(let meal) = FoodText.bar(food, unsent: unsentFood).action else {
+        guard let food = home?.food,
+            case .log(let meal) = FoodText.bar(food, unsent: unsentFood, captures: unsentCaptures).action
+        else {
             return nil
         }
         return meal
@@ -581,6 +628,8 @@ public final class AppModel {
         defer { isSendingFood = false }
         var refused: Set<UUID> = []
         var tried: Set<UUID> = []
+        // Set when sending stopped for a reason that would stop the rest too.
+        var stopped = false
         // Read again each time round: a meal tapped while another is on
         // its way goes out in the same pass.
         while let tap = food.outbox().first(where: { !tried.contains($0.id) }) {
@@ -595,15 +644,56 @@ public final class AppModel {
                 refreshProblem = "The server's answer could not be read. The app may be older than the server."
             } catch LyfeAPIError.unauthorized {
                 forgetSession()
+                stopped = true
                 break
             } catch LyfeAPIError.unreachable(let why) {
                 isOffline = true
                 offlineReason = why
+                stopped = true
                 break
             } catch LyfeAPIError.server(let status) where (400..<500).contains(status) {
                 confirmedFood(tap.id)
                 refused.insert(tap.id)
                 foodProblem = "The server would not log \(tap.name) (\(status))."
+            } catch LyfeAPIError.server(let status) {
+                foodProblem = "The server could not log a meal just now (\(status)). It stays on this phone."
+                stopped = true
+                break
+            } catch {
+                stopped = true
+                break
+            }
+        }
+        guard !stopped else { return refused }
+        while let capture = captures.outbox().first(where: { !tried.contains($0.id) }) {
+            tried.insert(capture.id)
+            do {
+                let snapshot =
+                    switch capture.kind {
+                    case .photo:
+                        try await api.recordPhotoEntry(token: token, capture: capture, jpeg: captures.photo(capture.id))
+                    case .barcode:
+                        try await api.recordBarcodeEntry(token: token, capture: capture)
+                    }
+                show(snapshot)
+                confirmedCapture(capture.id)
+                foodProblem = nil
+            } catch LyfeAPIError.unreadableResponse {
+                confirmedCapture(capture.id)
+                refreshProblem = "The server's answer could not be read. The app may be older than the server."
+            } catch LyfeAPIError.unauthorized {
+                forgetSession()
+                stopped = true
+                break
+            } catch LyfeAPIError.unreachable(let why) {
+                isOffline = true
+                offlineReason = why
+                stopped = true
+                break
+            } catch LyfeAPIError.server(let status) where (400..<500).contains(status) {
+                confirmedCapture(capture.id, forget: true)
+                refused.insert(capture.id)
+                foodProblem = "The server would not log \(capture.name) (\(status))."
             } catch LyfeAPIError.server(let status) {
                 foodProblem = "The server could not log a meal just now (\(status)). It stays on this phone."
                 break
@@ -619,6 +709,11 @@ public final class AppModel {
         unsentFood.removeAll { $0.id == id }
     }
 
+    private func confirmedCapture(_ id: UUID, forget: Bool = false) {
+        captures.remove(id, forget: forget)
+        unsentCaptures.removeAll { $0.id == id }
+    }
+
     /// Takes a logged meal back, for a tap that was a slip. One still
     /// waiting on this phone is simply dropped; one the backend has needs
     /// a connection. Returns what went wrong, or nil.
@@ -626,6 +721,10 @@ public final class AppModel {
     public func takeBackMeal(_ id: UUID) async -> String? {
         if unsentFood.contains(where: { $0.id == id }) {
             confirmedFood(id)
+            return nil
+        }
+        if unsentCaptures.contains(where: { $0.id == id }) {
+            confirmedCapture(id, forget: true)
             return nil
         }
         return await changeFood("take that back") { api, token in
@@ -687,6 +786,133 @@ public final class AppModel {
         }
         if problem == nil { isEnteringTargets = false }
         return problem
+    }
+
+    // MARK: Photo and barcode meals
+
+    /// Opens the photo meal screen over Food.
+    public func openPhotoMeal() {
+        screen = .food
+        mealDraft = nil
+        isEnteringTargets = false
+        foodFlow = .photo
+    }
+
+    /// Opens a photo meal's estimate, to check and correct it.
+    public func openEstimate(_ id: UUID) {
+        screen = .food
+        foodFlow = .estimate(id)
+    }
+
+    /// Opens the barcode scanner over Food.
+    public func openScan() {
+        screen = .food
+        mealDraft = nil
+        isEnteringTargets = false
+        foodFlow = .scan
+    }
+
+    /// Opens the label entry for a code lyfe does not know.
+    public func openLabel(code: String) {
+        screen = .food
+        foodFlow = .label(code: code)
+    }
+
+    public func closeFoodFlow() {
+        foodFlow = nil
+    }
+
+    /// Logs a meal from a photo and one line. It is kept on this phone
+    /// before anything is sent, then sent at once; with no connection it
+    /// waits for the next refresh and still counts for the day it was eaten
+    /// on. Once the backend has it, its estimate opens, to follow and
+    /// correct; otherwise Food is shown again.
+    @discardableResult
+    public func logPhotoMeal(note: String, photo: Data?, slot: MealSlot) async -> MealLogOutcome {
+        let capture = FoodCapture(
+            eatenAt: now(), slot: slot,
+            kind: .photo(note: note.trimmingCharacters(in: .whitespacesAndNewlines), hasPhoto: photo != nil))
+        return await log(capture, jpeg: photo, then: .estimate(capture.id))
+    }
+
+    /// Logs packaged food by its barcode and the grams eaten. Kept on this
+    /// phone before it is sent, like every meal. A code the backend does
+    /// not know is logged too, and its label is asked for.
+    @discardableResult
+    public func logBarcode(code: String, grams: Double, slot: MealSlot, product: Product?) async -> MealLogOutcome {
+        let capture = FoodCapture(eatenAt: now(), slot: slot, kind: .barcode(code: code, grams: grams, product: product))
+        return await log(capture, jpeg: nil, then: nil)
+    }
+
+    private func log(_ capture: FoodCapture, jpeg: Data?, then next: FoodFlow?) async -> MealLogOutcome {
+        captures.enqueue(capture, jpeg: jpeg)
+        unsentCaptures.append(capture)
+        let refused = await sendUnsentFood()
+        let outcome: MealLogOutcome =
+            refused.contains(capture.id) ? .refused : unsentCaptures.contains { $0.id == capture.id } ? .saved : .sent
+        foodFlow = outcome == .sent ? next : nil
+        return outcome
+    }
+
+    /// What lyfe knows of a barcode.
+    public enum ProductLookup: Equatable, Sendable {
+        case found(Product)
+        /// Neither the owner's labels nor the food database have it.
+        case notFound
+        /// The backend could not be asked, and this phone has not seen it.
+        case offline
+    }
+
+    /// Looks a code up: packaged food logged lately is known on this phone
+    /// without a connection; anything else is asked of the backend.
+    public func lookUp(code: String) async -> ProductLookup {
+        if let known = home?.food?.products?.first(where: { Self.sameCode($0.code, code) }) {
+            return .found(known)
+        }
+        guard phase == .signedIn, let api, let token else { return .offline }
+        do {
+            return try await api.product(token: token, code: code).map(ProductLookup.found) ?? .notFound
+        } catch LyfeAPIError.unauthorized {
+            forgetSession()
+            return .offline
+        } catch LyfeAPIError.unreachable(let why) {
+            isOffline = true
+            offlineReason = why
+            return .offline
+        } catch {
+            return .offline
+        }
+    }
+
+    /// A 12-digit UPC and the 13-digit EAN with a 0 in front are one code.
+    static func sameCode(_ a: String, _ b: String) -> Bool {
+        func long(_ code: String) -> String { code.count == 12 ? "0" + code : code }
+        return long(a) == long(b)
+    }
+
+    /// Stores a label typed for a barcode; meals waiting for it get their
+    /// figures. Returns what went wrong, or nil.
+    @discardableResult
+    public func setLabel(_ product: Product) async -> String? {
+        await changeFood("save the label") { api, token in
+            try await api.setProduct(token: token, product: product)
+        }
+    }
+
+    /// Corrects a photo meal's estimate. Returns what went wrong, or nil.
+    @discardableResult
+    public func correctEstimate(_ id: UUID, _ change: LyfeAPI.EstimateChange) async -> String? {
+        await changeFood("change the estimate") { api, token in
+            try await api.correctEstimate(token: token, id: id, change: change)
+        }
+    }
+
+    /// The photo of a meal: the copy on this phone while it is kept, else
+    /// the backend's.
+    public func mealPhoto(_ id: UUID) async -> Data? {
+        if let local = captures.photo(id) { return local }
+        guard phase == .signedIn, let api, let token else { return nil }
+        return try? await api.foodPhoto(token: token, id: id)
     }
 
     /// Makes a change to food that needs the backend now, and shows the

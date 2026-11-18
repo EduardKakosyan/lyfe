@@ -28,6 +28,8 @@ targets:
         # Shown the first time lyfe asks for Face ID, which it does each
         # time it is opened.
         NSFaceIDUsageDescription: lyfe asks for Face ID each time it is opened, so only you see your routines and weight.
+        # A meal's photo, and a packet's barcode.
+        NSCameraUsageDescription: lyfe takes a photo of a meal to estimate it, and reads the barcode on packaged food.
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
         # The breath timer's tones keep playing, and its rounds keep

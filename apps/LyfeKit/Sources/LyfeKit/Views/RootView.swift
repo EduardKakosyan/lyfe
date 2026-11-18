@@ -35,16 +35,21 @@ public struct RootView: View {
                             onClose: { model.closeMealEditor() }
                         )
                         .id(draft.id)
+                    } else if let flow = model.foodFlow, model.home?.food != nil {
+                        FoodFlowView(model: model, flow: flow)
                     } else if model.isEnteringTargets, let food = model.home?.food {
                         FoodTargetsView(
                             current: food.target, today: food.day, onSave: { await model.setFoodTargets($0) },
                             onClose: { model.closeTargets() })
                     } else if model.screen == .food, let food = model.home?.food {
                         FoodScreen(
-                            food: food, unsent: model.unsentFood, problem: model.foodProblem,
-                            onBack: { model.closeFood() }, onLog: { await model.logMeal($0, servings: $1) },
+                            food: food, unsent: model.unsentFood, captures: model.unsentCaptures,
+                            problem: model.foodProblem, onBack: { model.closeFood() },
+                            onLog: { await model.logMeal($0, servings: $1) },
                             onTakeBack: { await model.takeBackMeal($0) }, onEditMeal: { model.openMealEditor($0) },
-                            onTargets: { model.openTargets() })
+                            onTargets: { model.openTargets() }, onPhoto: { model.openPhotoMeal() },
+                            onScan: { model.openScan() }, onEstimate: { model.openEstimate($0) },
+                            onLabel: { model.openLabel(code: $0) })
                     } else if model.screen == .progress, let home = model.home {
                         ProgressScreen(
                             weight: home.weight, today: home.today, unsent: model.unsentWeighIns.count,
@@ -69,6 +74,45 @@ public struct RootView: View {
             if phase == .background {
                 model.lock()
             }
+        }
+    }
+}
+
+/// The photo and barcode screens over Food.
+struct FoodFlowView: View {
+    let model: AppModel
+    let flow: AppModel.FoodFlow
+
+    var body: some View {
+        switch flow {
+        case .photo:
+            PhotoMealView(
+                onLog: { await model.logPhotoMeal(note: $0, photo: $1, slot: $2) }, onClose: { model.closeFoodFlow() })
+        case .estimate(let id):
+            if let entry = model.home?.food?.entries.first(where: { $0.id == id }) {
+                EstimateView(
+                    entry: entry, loadPhoto: { await model.mealPhoto(id) },
+                    onCorrect: { await model.correctEstimate(id, $0) }, onReload: { await model.reloadHome() },
+                    onTakeBack: { await model.takeBackMeal(id) }, onClose: { model.closeFoodFlow() })
+            } else if let capture = model.unsentCaptures.first(where: { $0.id == id }) {
+                WaitingPhotoView(capture: capture, loadPhoto: { await model.mealPhoto(id) }, onClose: { model.closeFoodFlow() })
+            } else {
+                // Taken off, or from another day: back to Food.
+                Color.clear.onAppear { model.closeFoodFlow() }
+            }
+        case .scan:
+            ScanView(
+                lookUp: { await model.lookUp(code: $0) }, onSetLabel: { await model.setLabel($0) },
+                onLog: { await model.logBarcode(code: $0, grams: $1, slot: $2, product: $3) },
+                onClose: { model.closeFoodFlow() })
+        case .label(let code):
+            LabelView(
+                code: code,
+                onSave: { label in
+                    let problem = await model.setLabel(label)
+                    if problem == nil { model.closeFoodFlow() }
+                    return problem
+                }, onClose: { model.closeFoodFlow() })
         }
     }
 }

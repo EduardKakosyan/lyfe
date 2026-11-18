@@ -5,6 +5,7 @@ pub mod api;
 pub mod auth;
 pub mod config;
 pub mod db;
+pub mod estimator;
 pub mod garmin;
 pub mod push;
 pub mod routines;

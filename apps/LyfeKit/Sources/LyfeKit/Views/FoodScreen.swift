@@ -1,12 +1,15 @@
 import SwiftUI
 
 /// Food: what is logged today against the calorie and protein targets,
-/// each meal of the day as logged or still unknown, and the saved meals,
-/// each logged with one tap. The black bar logs the next open meal.
+/// measured apart from estimated, each meal of the day as logged or still
+/// unknown, and the saved meals, each logged with one tap. The black bar
+/// logs the next open meal; anything else is a photo or a barcode.
 public struct FoodScreen: View {
     let food: FoodDay
     /// Meals tapped here that the backend does not have yet.
     var unsent: [MealTap] = []
+    /// Photo and barcode meals logged here that the backend does not have yet.
+    var captures: [FoodCapture] = []
     var problem: String?
     let onBack: () -> Void
     /// Logs this many portions of a saved meal.
@@ -16,6 +19,12 @@ public struct FoodScreen: View {
     /// Opens the editor on a saved meal, or on a new one.
     let onEditMeal: (SavedMeal?) -> Void
     let onTargets: () -> Void
+    var onPhoto: () -> Void = {}
+    var onScan: () -> Void = {}
+    /// Opens a photo meal's estimate.
+    var onEstimate: (UUID) -> Void = { _ in }
+    /// Opens the label entry for a code lyfe does not know.
+    var onLabel: (String) -> Void = { _ in }
 
     @State private var takingBack: FoodText.Row?
     @State private var note: String?
@@ -33,10 +42,11 @@ public struct FoodScreen: View {
                         NoticeRow(text: notice)
                         PosterRule(thickness: 1.5)
                     }
-                    ForEach(FoodText.rows(food, unsent: unsent)) { row in
-                        if row.entry == nil {
+                    ForEach(FoodText.rows(food, unsent: unsent, captures: captures)) { row in
+                        switch row.tap {
+                        case .none:
                             FoodRow(row: row)
-                        } else {
+                        case .takeBack:
                             Button {
                                 takingBack = row
                             } label: {
@@ -44,6 +54,22 @@ public struct FoodScreen: View {
                             }
                             .buttonStyle(.plain)
                             .accessibilityHint("Takes it off today")
+                        case .estimate(let id):
+                            Button {
+                                onEstimate(id)
+                            } label: {
+                                FoodRow(row: row)
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityHint("Shows the estimate, to correct it")
+                        case .label(let code):
+                            Button {
+                                onLabel(code)
+                            } label: {
+                                FoodRow(row: row)
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityHint("Type the figures from its label")
                         }
                         PosterRule(thickness: 1.5)
                     }
@@ -57,6 +83,7 @@ public struct FoodScreen: View {
                     StreakDays(streak: food.streak)
                 }
             }
+            captureButtons
             bar
         }
         .foregroundStyle(Poster.ink)
@@ -80,10 +107,31 @@ public struct FoodScreen: View {
         if let note { notices.append(note) }
         if let problem {
             notices.append(problem)
-        } else if !unsent.isEmpty {
-            notices.append(FoodText.unsent(unsent.count))
+        } else if !unsent.isEmpty || !captures.isEmpty {
+            notices.append(FoodText.unsent(unsent.count + captures.count))
+        }
+        if let unknown = FoodText.unknownNotice(food) {
+            notices.append(unknown)
         }
         return notices
+    }
+
+    /// Anything that is not a saved meal: a barcode, or a photo and a line.
+    private var captureButtons: some View {
+        HStack(spacing: 0) {
+            Button(action: onScan) {
+                CaptureButton(mark: "▥", title: "Scan", detail: "Barcode")
+            }
+            .accessibilityLabel("Scan a barcode")
+            Rectangle().fill(Poster.ink).frame(width: Poster.rule)
+            Button(action: onPhoto) {
+                CaptureButton(mark: "◉", title: "Photo", detail: "And one line")
+            }
+            .accessibilityLabel("Log a meal with a photo")
+        }
+        .buttonStyle(.plain)
+        .fixedSize(horizontal: false, vertical: true)
+        .overlay(alignment: .top) { PosterRule() }
     }
 
     /// The saved meals: a tap logs one portion, holding offers others.
@@ -120,7 +168,7 @@ public struct FoodScreen: View {
     }
 
     private var bar: some View {
-        let bar = FoodText.bar(food, unsent: unsent)
+        let bar = FoodText.bar(food, unsent: unsent, captures: captures)
         return Button {
             switch bar.action {
             case .log(let meal): log(meal, 1)
@@ -181,29 +229,50 @@ struct FuelHeader: View {
                 .padding(.top, -6)
                 .padding(.bottom, -4)
             if let target = food.target {
-                TargetBar(fraction: FoodText.fraction(Double(food.kcal), of: Double(target.kcal)), height: 22)
+                HStack {
+                    Text(FoodText.estimateLine(food) ?? "").posterLabel()
+                    Spacer(minLength: 6)
+                    Text(FoodText.openLine(food)).posterLabel()
+                }
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+                .padding(.bottom, 6)
+                let kcal = FoodText.split(food, kcal: true)
+                let protein = FoodText.split(food, kcal: false)
+                TargetBar(
+                    fraction: FoodText.fraction(kcal.measured, of: Double(target.kcal)),
+                    estimated: FoodText.fraction(kcal.estimated, of: Double(target.kcal)), height: 22)
                 HStack {
                     Text("Protein").posterLabel()
                     Spacer()
                     Text(FoodText.proteinLine(food)).posterLabel()
                 }
                 .padding(.top, 9)
-                TargetBar(fraction: FoodText.fraction(food.proteinG, of: Double(target.proteinG)), height: 14)
-                    .padding(.top, 5)
+                TargetBar(
+                    fraction: FoodText.fraction(protein.measured, of: Double(target.proteinG)),
+                    estimated: FoodText.fraction(protein.estimated, of: Double(target.proteinG)), height: 14
+                )
+                .padding(.top, 5)
                 HStack(spacing: 12) {
                     HStack(spacing: 4) {
                         PosterSquare(state: .solid, size: 11)
-                        Text("Weighed").posterLabel()
+                        Text("Measured").posterLabel()
+                    }
+                    HStack(spacing: 4) {
+                        PosterSquare(state: .striped, size: 11)
+                        Text("Estimated").posterLabel()
                     }
                     HStack(spacing: 4) {
                         PosterSquare(state: .outline, size: 11)
                         Text("Left").posterLabel()
                     }
-                    Spacer()
-                    Text(FoodText.openLine(food)).posterLabel()
+                    Spacer(minLength: 0)
                 }
                 .padding(.top, 8)
             } else {
+                if let estimate = FoodText.estimateLine(food) {
+                    Text(estimate).posterLabel().padding(.bottom, 6)
+                }
                 HStack {
                     Text("Protein").posterLabel()
                     Spacer()
@@ -227,18 +296,31 @@ struct FuelHeader: View {
     }
 }
 
-/// A bar that fills with ink toward a target: solid is what is logged,
-/// the empty part is what is left.
+/// A bar that fills with ink toward a target: solid is what was
+/// measured, stripes what was estimated, the empty part is what is left.
 struct TargetBar: View {
     /// From 0 to 1.
     var fraction: Double
+    /// From 0 to 1, after the solid part; the two never pass the end.
+    var estimated: Double = 0
     var height: CGFloat
 
     var body: some View {
         GeometryReader { geometry in
-            Rectangle()
-                .fill(Poster.ink)
-                .frame(width: geometry.size.width * fraction)
+            let solid = geometry.size.width * fraction
+            let striped = geometry.size.width * min(estimated, max(0, 1 - fraction))
+            HStack(spacing: 0) {
+                Rectangle().fill(Poster.ink).frame(width: solid)
+                if striped > 0 {
+                    Stripes(spacing: 4)
+                        .foregroundStyle(Poster.ink)
+                        .frame(width: striped)
+                        .clipped()
+                        .overlay(alignment: .leading) {
+                            Rectangle().fill(Poster.ink).frame(width: Poster.rule)
+                        }
+                }
+            }
         }
         .frame(height: height)
         .overlay(Rectangle().strokeBorder(Poster.ink, lineWidth: Poster.rule))
@@ -281,6 +363,29 @@ struct FoodRow: View {
         .contentShape(Rectangle())
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(row.spoken)
+    }
+}
+
+/// One of the two ways to log a meal that is not saved.
+struct CaptureButton: View {
+    var mark: String
+    var title: String
+    var detail: String
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Text(mark).font(.system(size: 22, weight: .heavy))
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title).posterHeading(20)
+                Text(detail).posterLabel().opacity(0.6)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, Poster.margin)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity)
+        .background(Poster.paper)
+        .contentShape(Rectangle())
     }
 }
 
@@ -418,41 +523,160 @@ public enum FoodText {
 
     struct Row: Identifiable, Equatable {
         var id: String
-        /// The entry a tap takes back; nil for a meal that is still open.
+        /// The logged meal this row is; nil for a meal that is still open.
         var entry: UUID?
         var mark: MarkState
         var title: String
         var label: String
         var value: String
         var dim = false
+        /// What tapping it does.
+        var tap: RowTap = .none
 
-        var spoken: String { "\(title), \(label), \(value == "?" ? "unknown" : "\(value) kilocalories")" }
+        var spoken: String {
+            let figure =
+                switch value {
+                case "?": "unknown"
+                case "…": "being estimated"
+                default: "\(value) kilocalories"
+                }
+            return "\(title), \(label), \(figure)"
+        }
     }
 
-    /// The day by slot: what was logged, what was tapped here and is still
+    enum RowTap: Equatable {
+        case none
+        /// Asks to take the meal off today.
+        case takeBack
+        /// Opens a photo meal's estimate.
+        case estimate(UUID)
+        /// Opens the label entry for this code.
+        case label(String)
+    }
+
+    /// The day by slot: what was logged, what was logged here and is still
     /// to be sent, and a question mark for each meal with nothing. A meal
     /// that is not logged is unknown, never zero.
-    static func rows(_ food: FoodDay, unsent: [MealTap]) -> [Row] {
+    static func rows(_ food: FoodDay, unsent: [MealTap], captures: [FoodCapture] = []) -> [Row] {
         MealSlot.allCases.flatMap { slot -> [Row] in
-            let logged = food.entries.filter { $0.slot == slot }.map { entry in
-                Row(
-                    id: "entry-\(entry.id)", entry: entry.id, mark: .solid, title: entry.name,
-                    label: entryLabel(servings: entry.servings, proteinG: entry.proteinG), value: kcal(entry.kcal))
-            }
+            let logged = food.entries.filter { $0.slot == slot }.map(entryRow)
             let waiting = unsent.filter { $0.slot == slot }.map { tap in
                 Row(
                     id: "tap-\(tap.id)", entry: tap.id, mark: .solid, title: tap.name,
-                    label: "ON THIS PHONE · NOT COUNTED YET", value: kcal(tap.kcal), dim: true)
+                    label: "ON THIS PHONE · NOT COUNTED YET", value: kcal(tap.kcal), dim: true, tap: .takeBack)
             }
-            if logged.isEmpty, waiting.isEmpty {
+            let captured = captures.filter { $0.slot == slot }.map(captureRow)
+            let waitingAll = waiting + captured
+            if logged.isEmpty, waitingAll.isEmpty {
                 return [
                     Row(
                         id: "open-\(slot.rawValue)", entry: nil, mark: .outline,
                         title: slot == .snack ? "SNACKS" : slotName(slot), label: "NOTHING LOGGED", value: "?", dim: true)
                 ]
             }
-            return logged + waiting
+            return logged + waitingAll
         }
+    }
+
+    /// A logged meal as its row: solid when measured, striped when
+    /// estimated, outlined with a question mark while its figures are not
+    /// known.
+    static func entryRow(_ entry: FoodDay.Entry) -> Row {
+        let id = "entry-\(entry.id)"
+        switch (entry.from, entry.figures ?? .known) {
+        case (.photo, .estimating):
+            return Row(
+                id: id, entry: entry.id, mark: .striped, title: entry.name,
+                label: entry.photo?.problem == nil ? "PHOTO · ESTIMATING ON THE SPARK" : "PHOTO · WAITING FOR THE SPARK",
+                value: "…", tap: .estimate(entry.id))
+        case (.photo, _) where !entry.isKnown:
+            return Row(
+                id: id, entry: entry.id, mark: .outline, title: entry.name, label: "PHOTO · NO ESTIMATE · TAP TO TYPE IT",
+                value: "?", tap: .estimate(entry.id))
+        case (.photo, _):
+            return Row(
+                id: id, entry: entry.id, mark: .striped, title: entry.name, label: photoLabel(entry),
+                value: kcal(entry.kcal), tap: .estimate(entry.id))
+        case (.barcode, _) where !entry.isKnown:
+            return Row(
+                id: id, entry: entry.id, mark: .outline, title: entry.name,
+                label: "NOT IN THE FOOD DATABASE · TAP TO TYPE ITS LABEL", value: "?",
+                tap: .label(entry.barcode?.code ?? ""))
+        case (.barcode, _):
+            return Row(
+                id: id, entry: entry.id, mark: .solid, title: entry.name,
+                label: "LABEL · \(grams(entry.barcode?.grams ?? 0)) G · \(grams(entry.proteinG)) G PROTEIN",
+                value: kcal(entry.kcal), tap: .takeBack)
+        case (.saved, _):
+            return Row(
+                id: id, entry: entry.id, mark: .solid, title: entry.name,
+                label: entryLabel(servings: entry.servings, proteinG: entry.proteinG), value: kcal(entry.kcal),
+                tap: .takeBack)
+        }
+    }
+
+    /// "PHOTO · 380–780 · 33 G", or "TYPED" once the owner typed it.
+    static func photoLabel(_ entry: FoodDay.Entry) -> String {
+        if entry.photo?.typed == true {
+            return "PHOTO · TYPED · \(grams(entry.proteinG)) G PROTEIN"
+        }
+        guard let low = entry.kcalLow, let high = entry.kcalHigh else {
+            return "PHOTO · \(grams(entry.proteinG)) G PROTEIN"
+        }
+        return "PHOTO · \(kcal(low))–\(kcal(high)) · \(grams(entry.proteinG)) G"
+    }
+
+    /// A photo or barcode meal still on this phone.
+    static func captureRow(_ capture: FoodCapture) -> Row {
+        let id = "capture-\(capture.id)"
+        switch capture.kind {
+        case .photo:
+            return Row(
+                id: id, entry: capture.id, mark: .striped, title: capture.name,
+                label: "ON THIS PHONE · ESTIMATED ONCE SENT", value: "…", dim: true, tap: .takeBack)
+        case .barcode(_, let weight, let product?):
+            return Row(
+                id: id, entry: capture.id, mark: .solid, title: capture.name,
+                label: "ON THIS PHONE · NOT COUNTED YET", value: kcal(product.amount(grams: weight).kcal), dim: true,
+                tap: .takeBack)
+        case .barcode(_, let weight, nil):
+            return Row(
+                id: id, entry: capture.id, mark: .outline, title: capture.name,
+                label: "ON THIS PHONE · \(grams(weight)) G · LOOKED UP ONCE SENT", value: "?", dim: true, tap: .takeBack)
+        }
+    }
+
+    /// The day's calories or protein, measured and estimated.
+    static func split(_ food: FoodDay, kcal: Bool) -> (measured: Double, estimated: Double) {
+        if kcal {
+            let estimated = Double(food.kcalEstimated ?? 0)
+            return (Double(food.kcalMeasured ?? food.kcal), estimated)
+        }
+        let estimated = food.proteinEstimatedG ?? 0
+        return (food.proteinMeasuredG ?? food.proteinG, estimated)
+    }
+
+    /// Under the giant figure, once part of it is estimated: how much, and
+    /// what the day may really be.
+    static func estimateLine(_ food: FoodDay) -> String? {
+        guard let estimated = food.kcalEstimated, estimated > 0, let low = food.kcalLow, let high = food.kcalHigh else {
+            return nil
+        }
+        return "\(kcal(estimated)) ESTIMATED · DAY \(kcal(low))–\(kcal(high))"
+    }
+
+    /// Said above the day when a logged meal's figures are still to come.
+    static func unknownNotice(_ food: FoodDay) -> String? {
+        let pending = food.entries.filter { !$0.isKnown }
+        guard !pending.isEmpty else { return nil }
+        let estimating = pending.filter { $0.figures == .estimating }.count
+        let rest = pending.count - estimating
+        var parts: [String] = []
+        if estimating == 1 { parts.append("1 photo meal is being estimated") }
+        if estimating > 1 { parts.append("\(estimating) photo meals are being estimated") }
+        if rest == 1 { parts.append("1 meal needs its figures typed") }
+        if rest > 1 { parts.append("\(rest) meals need their figures typed") }
+        return parts.joined(separator: "; ") + ". Not in the total until then."
     }
 
     /// "WEIGHED · 43 G PROTEIN", with the portions when not one.
@@ -508,11 +732,13 @@ public enum FoodText {
     /// The next thing to do about food: log the first main meal that is
     /// still open and has a saved meal, the one logged most recently for
     /// it. With nothing to tap it says where the day stands.
-    static func bar(_ food: FoodDay, unsent: [MealTap]) -> Bar {
+    static func bar(_ food: FoodDay, unsent: [MealTap], captures: [FoodCapture] = []) -> Bar {
         if food.meals.isEmpty {
             return Bar(small: "WEIGH IT ONCE · LOG IT WITH ONE TAP", big: "ADD A SAVED MEAL", action: .newMeal)
         }
-        let open = food.openSlots.filter { slot in !unsent.contains { $0.slot == slot } }
+        let open = food.openSlots.filter { slot in
+            !unsent.contains { $0.slot == slot } && !captures.contains { $0.slot == slot }
+        }
         for slot in open {
             if let meal = food.meals.first(where: { $0.slot == slot }) {
                 return Bar(

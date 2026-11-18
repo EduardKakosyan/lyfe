@@ -8,7 +8,9 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::routines::breath;
-use crate::routines::food::{self, Slot};
+use crate::routines::food::{self, Detail, Figures, PhotoDetail, Slot};
+use crate::routines::photo::{self, Oil};
+use crate::routines::product::{self, Origin, Product};
 use crate::routines::gym::Activity;
 use crate::routines::weight::{self, Unit};
 
@@ -580,21 +582,47 @@ pub async fn remove_food_entry(pool: &PgPool, id: Uuid) -> sqlx::Result<bool> {
 }
 
 /// Every logged meal not taken back, oldest first, with its time read in
-/// the owner's time zone.
-pub async fn food_entries(pool: &PgPool, timezone: chrono_tz::Tz) -> sqlx::Result<Vec<food::Entry>> {
+/// the owner's time zone. What a photo's model saw is read only for meals
+/// eaten from `items_since` on, the days the apps show.
+pub async fn food_entries(
+    pool: &PgPool,
+    timezone: chrono_tz::Tz,
+    items_since: DateTime<Utc>,
+) -> sqlx::Result<Vec<food::Entry>> {
     let rows = sqlx::query(
-        "select id, eaten_at, slot, meal_id, name, servings, kcal, protein_dg from food_entries
-         where removed_at is null
-         order by eaten_at, id",
+        "select e.id, e.eaten_at, e.slot, e.meal_id, e.name, e.servings, e.kcal, e.protein_dg, e.source, e.figures,
+                e.note, e.oil_asked, e.oil, e.typed, e.estimate_problem, e.barcode, e.grams,
+                exists (select 1 from food_photos p where p.entry_id = e.id) as has_photo
+         from food_entries e
+         where e.removed_at is null
+         order by e.eaten_at, e.id",
     )
     .fetch_all(pool)
     .await?;
+    let mut items = estimate_items_since(pool, items_since).await?;
     Ok(rows
         .into_iter()
         .map(|r| {
+            let id: Uuid = r.get("id");
             let eaten_at: DateTime<Utc> = r.get("eaten_at");
+            let detail = match r.get::<&str, _>("source") {
+                "photo" => Detail::Photo(PhotoDetail {
+                    note: r.get::<Option<String>, _>("note").unwrap_or_default(),
+                    has_photo: r.get("has_photo"),
+                    items: items.remove(&id).unwrap_or_default(),
+                    oil_asked: r.get("oil_asked"),
+                    oil: r.get::<Option<&str>, _>("oil").and_then(Oil::parse),
+                    typed: r.get("typed"),
+                    problem: r.get("estimate_problem"),
+                }),
+                "barcode" => Detail::Barcode {
+                    code: r.get::<Option<String>, _>("barcode").unwrap_or_default(),
+                    grams: r.get::<Option<f64>, _>("grams").unwrap_or_default(),
+                },
+                _ => Detail::Saved,
+            };
             food::Entry {
-                id: r.get("id"),
+                id,
                 eaten_local: eaten_at.with_timezone(&timezone).naive_local(),
                 slot: stored_slot(r.get("slot")),
                 meal_id: r.get("meal_id"),
@@ -604,9 +632,471 @@ pub async fn food_entries(pool: &PgPool, timezone: chrono_tz::Tz) -> sqlx::Resul
                     kcal: r.get::<i32, _>("kcal") as u32,
                     protein_dg: r.get::<i32, _>("protein_dg") as u32,
                 },
+                figures: Figures::parse(r.get("figures")).unwrap_or(Figures::Known),
+                detail,
             }
         })
         .collect())
+}
+
+/// What the model saw in each photo meal eaten from `since` on, by entry.
+async fn estimate_items_since(
+    pool: &PgPool,
+    since: DateTime<Utc>,
+) -> sqlx::Result<std::collections::HashMap<Uuid, Vec<photo::Item>>> {
+    let rows = sqlx::query(
+        "select i.entry_id, i.name, i.grams_seen, i.kcal_seen, i.protein_g_seen, i.grams
+         from food_estimate_items i join food_entries e on e.id = i.entry_id
+         where e.eaten_at >= $1
+         order by i.entry_id, i.position",
+    )
+    .bind(since)
+    .fetch_all(pool)
+    .await?;
+    let mut items: std::collections::HashMap<Uuid, Vec<photo::Item>> = std::collections::HashMap::new();
+    for r in rows {
+        items.entry(r.get("entry_id")).or_default().push(read_item(&r));
+    }
+    Ok(items)
+}
+
+fn read_item(r: &sqlx::postgres::PgRow) -> photo::Item {
+    photo::Item {
+        name: r.get("name"),
+        grams_seen: r.get("grams_seen"),
+        kcal_seen: r.get("kcal_seen"),
+        protein_g_seen: r.get("protein_g_seen"),
+        grams: r.get("grams"),
+    }
+}
+
+// --- Photo meals ---------------------------------------------------------
+
+/// A photo meal as it arrives from the phone, before the model has seen it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewPhotoEntry {
+    pub id: Uuid,
+    pub eaten_at: DateTime<Utc>,
+    pub slot: Slot,
+    pub note: String,
+    pub jpeg: Option<Vec<u8>>,
+}
+
+/// Stores a photo meal, to be estimated. Returns false, and changes
+/// nothing, when an entry with this id is already stored.
+pub async fn insert_photo_entry(pool: &PgPool, entry: &NewPhotoEntry, device_session_id: i64) -> sqlx::Result<bool> {
+    let mut tx = pool.begin().await?;
+    let result = sqlx::query(
+        "insert into food_entries
+            (id, eaten_at, slot, name, servings, kcal, protein_dg, device_session_id, source, figures, note,
+             estimate_due_at)
+         values ($1, $2, $3, $4, 1, 0, 0, $5, 'photo', 'estimating', $6, now())
+         on conflict (id) do nothing",
+    )
+    .bind(entry.id)
+    .bind(entry.eaten_at)
+    .bind(entry.slot.as_str())
+    .bind(photo::name_for(&entry.note))
+    .bind(device_session_id)
+    .bind(&entry.note)
+    .execute(&mut *tx)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Ok(false);
+    }
+    if let Some(jpeg) = &entry.jpeg {
+        sqlx::query("insert into food_photos (entry_id, jpeg) values ($1, $2)")
+            .bind(entry.id)
+            .bind(jpeg)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// A photo meal waiting for the model.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingPhoto {
+    pub id: Uuid,
+    pub note: String,
+    pub jpeg: Option<Vec<u8>>,
+    /// Answers the model gave that could not be used.
+    pub tries: i32,
+}
+
+/// The photo meal waiting longest whose next try is due, if any.
+pub async fn next_pending_photo(pool: &PgPool) -> sqlx::Result<Option<PendingPhoto>> {
+    let row = sqlx::query(
+        "select e.id, e.note, e.estimate_tries, p.jpeg
+         from food_entries e left join food_photos p on p.entry_id = e.id
+         where e.figures = 'estimating' and e.removed_at is null
+           and coalesce(e.estimate_due_at, '-infinity') <= now()
+         order by e.received_at, e.id
+         limit 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| PendingPhoto {
+        id: r.get("id"),
+        note: r.get::<Option<String>, _>("note").unwrap_or_default(),
+        jpeg: r.get("jpeg"),
+        tries: r.get("estimate_tries"),
+    }))
+}
+
+/// Stores what the model saw and what it comes to. An entry the owner has
+/// typed figures for or taken back since is left alone.
+pub async fn record_estimate(pool: &PgPool, id: Uuid, estimate: &photo::ModelEstimate) -> sqlx::Result<bool> {
+    let mut tx = pool.begin().await?;
+    let amount = photo::amount(&estimate.items, estimate.oil_asked, None);
+    let result = sqlx::query(
+        "update food_entries set
+            figures = 'known', kcal = $2, protein_dg = $3, oil_asked = $4, estimated_at = now(),
+            estimate_problem = null, estimate_due_at = null
+         where id = $1 and figures = 'estimating'",
+    )
+    .bind(id)
+    .bind(amount.kcal as i32)
+    .bind(amount.protein_dg as i32)
+    .bind(estimate.oil_asked)
+    .execute(&mut *tx)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Ok(false);
+    }
+    write_items(&mut tx, id, &estimate.items).await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+async fn write_items(tx: &mut sqlx::PgConnection, id: Uuid, items: &[photo::Item]) -> sqlx::Result<()> {
+    sqlx::query("delete from food_estimate_items where entry_id = $1").bind(id).execute(&mut *tx).await?;
+    let positions: Vec<i32> = (1..=items.len() as i32).collect();
+    let names: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
+    let grams_seen: Vec<f64> = items.iter().map(|i| i.grams_seen).collect();
+    let kcal_seen: Vec<f64> = items.iter().map(|i| i.kcal_seen).collect();
+    let protein_seen: Vec<f64> = items.iter().map(|i| i.protein_g_seen).collect();
+    let grams: Vec<f64> = items.iter().map(|i| i.grams).collect();
+    sqlx::query(
+        "insert into food_estimate_items (entry_id, position, name, grams_seen, kcal_seen, protein_g_seen, grams)
+         select $1, * from unnest($2::integer[], $3::text[], $4::double precision[], $5::double precision[],
+                                  $6::double precision[], $7::double precision[])",
+    )
+    .bind(id)
+    .bind(&positions)
+    .bind(&names)
+    .bind(&grams_seen)
+    .bind(&kcal_seen)
+    .bind(&protein_seen)
+    .bind(&grams)
+    .execute(&mut *tx)
+    .await?;
+    Ok(())
+}
+
+/// Why the model gave no estimate this time, and when to try again. With
+/// `counts`, the answer could not be used and the try is counted; after
+/// `photo::MAX_TRIES` of those the meal is left for the owner to type.
+pub async fn record_estimate_problem(
+    pool: &PgPool,
+    id: Uuid,
+    problem: &str,
+    counts: bool,
+    retry_in: chrono::Duration,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "update food_entries set
+            estimate_problem = $2,
+            estimate_tries = estimate_tries + $3::integer,
+            estimate_due_at = now() + make_interval(secs => $4),
+            figures = case when estimate_tries + $3::integer >= $5 then 'failed' else figures end
+         where id = $1 and figures = 'estimating'",
+    )
+    .bind(id)
+    .bind(problem)
+    .bind(i32::from(counts))
+    .bind(retry_in.num_seconds() as f64)
+    .bind(photo::MAX_TRIES)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Stops asking the model about a meal and leaves it for the owner to type.
+pub async fn give_up_estimate(pool: &PgPool, id: Uuid, problem: &str) -> sqlx::Result<()> {
+    sqlx::query(
+        "update food_entries set figures = 'failed', estimate_problem = $2, estimate_due_at = null
+         where id = $1 and figures = 'estimating'",
+    )
+    .bind(id)
+    .bind(problem)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// A photo meal as the owner corrects it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PhotoMeal {
+    pub figures: Figures,
+    pub items: Vec<photo::Item>,
+    pub oil_asked: bool,
+    pub oil: Option<Oil>,
+    pub typed: bool,
+}
+
+/// A photo meal not taken back, or `None`.
+pub async fn photo_meal(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<PhotoMeal>> {
+    let Some(row) = sqlx::query(
+        "select figures, oil_asked, oil, typed from food_entries
+         where id = $1 and source = 'photo' and removed_at is null",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Ok(None);
+    };
+    let items = sqlx::query(
+        "select name, grams_seen, kcal_seen, protein_g_seen, grams from food_estimate_items
+         where entry_id = $1 order by position",
+    )
+    .bind(id)
+    .fetch_all(pool)
+    .await?
+    .iter()
+    .map(read_item)
+    .collect();
+    Ok(Some(PhotoMeal {
+        figures: Figures::parse(row.get("figures")).unwrap_or(Figures::Known),
+        items,
+        oil_asked: row.get("oil_asked"),
+        oil: row.get::<Option<&str>, _>("oil").and_then(Oil::parse),
+        typed: row.get("typed"),
+    }))
+}
+
+/// Stores a photo meal as the owner corrected it: the grams of what the
+/// model saw and the oil answer, or figures typed instead.
+pub async fn correct_photo_meal(pool: &PgPool, id: Uuid, meal: &PhotoMeal, amount: food::Amount) -> sqlx::Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "update food_entries set
+            figures = $2, kcal = $3, protein_dg = $4, oil = $5, typed = $6,
+            estimate_problem = case when $2 = 'known' then null else estimate_problem end
+         where id = $1",
+    )
+    .bind(id)
+    .bind(meal.figures.as_str())
+    .bind(amount.kcal as i32)
+    .bind(amount.protein_dg as i32)
+    .bind(meal.oil.map(Oil::as_str))
+    .bind(meal.typed)
+    .execute(&mut *tx)
+    .await?;
+    if !meal.items.is_empty() {
+        write_items(&mut tx, id, &meal.items).await?;
+    }
+    tx.commit().await
+}
+
+/// The photo of a meal not taken back, as the phone sent it.
+pub async fn food_photo(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<Vec<u8>>> {
+    sqlx::query_scalar(
+        "select p.jpeg from food_photos p join food_entries e on e.id = p.entry_id
+         where p.entry_id = $1 and e.removed_at is null",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+// --- Packaged food -------------------------------------------------------
+
+fn read_product(r: &sqlx::postgres::PgRow, origin: Origin) -> Product {
+    Product {
+        code: r.get("code"),
+        name: r.get("name"),
+        kcal_per_100g: r.get("kcal_per_100g"),
+        protein_per_100g: r.get("protein_per_100g"),
+        serving_g: r.get("serving_g"),
+        origin,
+    }
+}
+
+/// The product with this code: the label the owner typed if there is one,
+/// else the food database's. Either form of a UPC or EAN is found.
+pub async fn product(pool: &PgPool, code: &str) -> sqlx::Result<Option<Product>> {
+    let codes = product::lookup_codes(code);
+    for (table, origin) in [("owner_products", Origin::Label), ("barcode_products", Origin::Database)] {
+        let row = sqlx::query(&format!(
+            "select code, name, kcal_per_100g, protein_per_100g, serving_g from {table}
+             where code = any($1) order by code = $2 desc limit 1"
+        ))
+        .bind(&codes)
+        .bind(code)
+        .fetch_optional(pool)
+        .await?;
+        if let Some(row) = row {
+            return Ok(Some(read_product(&row, origin)));
+        }
+    }
+    Ok(None)
+}
+
+/// A barcode meal as it arrives from the phone, with the product's figures
+/// when they are known.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewBarcodeEntry {
+    pub id: Uuid,
+    pub eaten_at: DateTime<Utc>,
+    pub slot: Slot,
+    pub code: String,
+    pub grams: f64,
+    pub product: Option<Product>,
+}
+
+/// Stores a barcode meal: with the label's figures when the product is
+/// known, else waiting for the owner to type the label. Returns false, and
+/// changes nothing, when an entry with this id is already stored.
+pub async fn insert_barcode_entry(pool: &PgPool, entry: &NewBarcodeEntry, device_session_id: i64) -> sqlx::Result<bool> {
+    let (name, amount, figures) = match &entry.product {
+        Some(product) => (product.name.clone(), product.amount(entry.grams), Figures::Known),
+        None => (format!("Barcode {}", entry.code), food::Amount::default(), Figures::NeedsLabel),
+    };
+    let result = sqlx::query(
+        "insert into food_entries
+            (id, eaten_at, slot, name, servings, kcal, protein_dg, device_session_id, source, figures, barcode, grams)
+         values ($1, $2, $3, $4, 1, $5, $6, $7, 'barcode', $8, $9, $10)
+         on conflict (id) do nothing",
+    )
+    .bind(entry.id)
+    .bind(entry.eaten_at)
+    .bind(entry.slot.as_str())
+    .bind(name)
+    .bind(amount.kcal as i32)
+    .bind(amount.protein_dg as i32)
+    .bind(device_session_id)
+    .bind(figures.as_str())
+    .bind(&entry.code)
+    .bind(entry.grams)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Stores a label the owner typed, and gives every barcode meal still
+/// waiting for it its figures. Meals already logged with the database's
+/// figures keep them.
+pub async fn set_owner_product(pool: &PgPool, product: &Product) -> sqlx::Result<u64> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "insert into owner_products (code, name, kcal_per_100g, protein_per_100g, serving_g) values ($1, $2, $3, $4, $5)
+         on conflict (code) do update set
+            name = excluded.name, kcal_per_100g = excluded.kcal_per_100g,
+            protein_per_100g = excluded.protein_per_100g, serving_g = excluded.serving_g, set_at = now()",
+    )
+    .bind(&product.code)
+    .bind(&product.name)
+    .bind(product.kcal_per_100g)
+    .bind(product.protein_per_100g)
+    .bind(product.serving_g)
+    .execute(&mut *tx)
+    .await?;
+    // Worked out here, as for a code that was known when scanned, so both
+    // round the same way.
+    let waiting = sqlx::query(
+        "select id, grams from food_entries
+         where source = 'barcode' and figures = 'needs_label' and barcode = any($1)
+         for update",
+    )
+    .bind(product::lookup_codes(&product.code))
+    .fetch_all(&mut *tx)
+    .await?;
+    for row in &waiting {
+        let amount = product.amount(row.get::<Option<f64>, _>("grams").unwrap_or_default());
+        sqlx::query("update food_entries set figures = 'known', name = $2, kcal = $3, protein_dg = $4 where id = $1")
+            .bind(row.get::<Uuid, _>("id"))
+            .bind(&product.name)
+            .bind(amount.kcal as i32)
+            .bind(amount.protein_dg as i32)
+            .execute(&mut *tx)
+            .await?;
+    }
+    let filled = waiting.len() as u64;
+    tx.commit().await?;
+    Ok(filled)
+}
+
+/// Packaged food logged lately and still known, most recent first.
+pub async fn recent_products(pool: &PgPool, limit: i64) -> sqlx::Result<Vec<Product>> {
+    let codes: Vec<String> = sqlx::query_scalar(
+        "select barcode from food_entries
+         where source = 'barcode' and figures = 'known' and removed_at is null
+         group by barcode order by max(eaten_at) desc limit $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    let mut products = Vec::with_capacity(codes.len());
+    for code in codes {
+        if let Some(product) = product(pool, &code).await? {
+            products.push(product);
+        }
+    }
+    Ok(products)
+}
+
+/// The downloaded food database while a new copy is being read in. It is
+/// filled in a table of its own and swapped in whole at the end, so a
+/// lookup meanwhile sees the old copy, never half of the new one.
+pub struct ProductImport {
+    pool: PgPool,
+    pub stored: u64,
+}
+
+impl ProductImport {
+    pub async fn begin(pool: &PgPool) -> sqlx::Result<ProductImport> {
+        sqlx::query("drop table if exists barcode_products_next").execute(pool).await?;
+        sqlx::query("create table barcode_products_next (like barcode_products including all)")
+            .execute(pool)
+            .await?;
+        Ok(ProductImport { pool: pool.clone(), stored: 0 })
+    }
+
+    /// Adds products; a code already read is kept as first read.
+    pub async fn add(&mut self, products: &[Product]) -> sqlx::Result<()> {
+        let codes: Vec<&str> = products.iter().map(|p| p.code.as_str()).collect();
+        let names: Vec<&str> = products.iter().map(|p| p.name.as_str()).collect();
+        let kcal: Vec<f64> = products.iter().map(|p| p.kcal_per_100g).collect();
+        let protein: Vec<f64> = products.iter().map(|p| p.protein_per_100g).collect();
+        let serving: Vec<Option<f64>> = products.iter().map(|p| p.serving_g).collect();
+        self.stored += sqlx::query(
+            "insert into barcode_products_next (code, name, kcal_per_100g, protein_per_100g, serving_g)
+             select * from unnest($1::text[], $2::text[], $3::double precision[], $4::double precision[],
+                                  $5::double precision[])
+             on conflict (code) do nothing",
+        )
+        .bind(&codes)
+        .bind(&names)
+        .bind(&kcal)
+        .bind(&protein)
+        .bind(&serving)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(())
+    }
+
+    /// Puts the new copy in place of the old.
+    pub async fn finish(self) -> sqlx::Result<u64> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("drop table barcode_products").execute(&mut *tx).await?;
+        sqlx::query("alter table barcode_products_next rename to barcode_products").execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(self.stored)
+    }
 }
 
 /// Sets the targets from a day on. Setting them again the same day

@@ -252,16 +252,73 @@ public struct SavedMeal: Codable, Equatable, Sendable, Identifiable {
     }
 }
 
+/// How much oil or sauce went into a meal, as the owner answers it. Not
+/// named none and some: as an optional, those would be read as nil and a
+/// value.
+public enum Oil: String, Codable, Sendable, CaseIterable {
+    case nothing = "none"
+    case aBit = "some"
+    case aLot = "a_lot"
+}
+
+/// A packaged food and the figures on its label.
+public struct Product: Codable, Equatable, Sendable {
+    public var code: String
+    public var name: String
+    public var kcalPer100g: Double
+    public var proteinPer100g: Double
+    /// The serving the label states, in grams.
+    public var servingG: Double?
+    /// "label" when the owner typed it, "database" when downloaded.
+    public var origin: String
+
+    enum CodingKeys: String, CodingKey {
+        case code, name, servingG, origin
+        case kcalPer100g = "kcalPer100G"
+        case proteinPer100g = "proteinPer100G"
+    }
+
+    public init(code: String, name: String, kcalPer100g: Double, proteinPer100g: Double, servingG: Double?, origin: String) {
+        self.code = code
+        self.name = name
+        self.kcalPer100g = kcalPer100g
+        self.proteinPer100g = proteinPer100g
+        self.servingG = servingG
+        self.origin = origin
+    }
+
+    /// What `grams` of it come to, as the backend works it out.
+    public func amount(grams: Double) -> (kcal: Int, proteinG: Double) {
+        (Int((grams * kcalPer100g / 100).rounded()), (grams * proteinPer100g / 10).rounded() / 10)
+    }
+}
+
 /// Food as the backend worked it out: what is logged today against the
 /// targets, the saved meals, and the logging streak.
 public struct FoodDay: Codable, Equatable, Sendable {
     public var day: CalendarDay
     /// What the day is held to; nil until the owner has set targets.
     public var target: Target?
-    /// Everything logged today. Not the day's intake unless every meal
-    /// was logged: see `openSlots`.
+    /// Everything logged today whose figures are known. Not the day's
+    /// intake unless every meal was logged: see `openSlots` and `unknown`.
     public var kcal: Int
     public var proteinG: Double
+    /// The parts of it that were measured (saved meals, labels) and
+    /// estimated (photos). Missing in answers cached before photo meals.
+    public var kcalMeasured: Int?
+    public var proteinMeasuredG: Double?
+    public var kcalEstimated: Int?
+    public var proteinEstimatedG: Double?
+    /// How far either way the estimated part may take the total.
+    public var kcalLow: Int?
+    public var kcalHigh: Int?
+    /// Meals logged today whose figures are not known yet.
+    public var unknown: Int?
+    /// How far either way a photo estimate may be, in percent.
+    public var estimateRangePct: Int?
+    /// Packaged food logged lately, so a code scanned again is found
+    /// without a connection.
+    public var products: [Product]?
     /// The target minus what is logged; negative once over.
     public var kcalLeft: Int?
     public var proteinLeftG: Double?
@@ -294,11 +351,24 @@ public struct FoodDay: Codable, Equatable, Sendable {
         /// The saved meal it was logged from.
         public var mealId: UUID?
         public var servings: Double
+        /// Zero while its figures are not known.
         public var kcal: Int
         public var proteinG: Double
+        /// Missing in answers cached before photo and barcode meals existed.
+        public var source: FoodSource?
+        public var figures: Figures?
+        /// True for a photo meal, whose figures are a model's estimate.
+        public var estimated: Bool?
+        /// How far either way an estimate may be.
+        public var kcalLow: Int?
+        public var kcalHigh: Int?
+        public var photo: PhotoDetail?
+        public var barcode: BarcodeDetail?
 
         public init(
-            id: UUID, slot: MealSlot, name: String, mealId: UUID?, servings: Double, kcal: Int, proteinG: Double
+            id: UUID, slot: MealSlot, name: String, mealId: UUID?, servings: Double, kcal: Int, proteinG: Double,
+            source: FoodSource? = nil, figures: Figures? = nil, estimated: Bool? = nil, kcalLow: Int? = nil,
+            kcalHigh: Int? = nil, photo: PhotoDetail? = nil, barcode: BarcodeDetail? = nil
         ) {
             self.id = id
             self.slot = slot
@@ -307,6 +377,100 @@ public struct FoodDay: Codable, Equatable, Sendable {
             self.servings = servings
             self.kcal = kcal
             self.proteinG = proteinG
+            self.source = source
+            self.figures = figures
+            self.estimated = estimated
+            self.kcalLow = kcalLow
+            self.kcalHigh = kcalHigh
+            self.photo = photo
+            self.barcode = barcode
+        }
+
+        /// Where its figures came from; a saved meal in older answers.
+        public var from: FoodSource { source ?? .saved }
+        /// Whether its figures are in the day's total.
+        public var isKnown: Bool { (figures ?? .known) == .known }
+    }
+
+    /// Where a logged meal's figures came from.
+    public enum FoodSource: String, Codable, Sendable {
+        /// A saved meal, weighed once. Measured.
+        case saved
+        /// A photo and one line, estimated by the model on the Spark.
+        case photo
+        /// A packaged food's label and the grams eaten. Measured.
+        case barcode
+    }
+
+    /// Whether a logged meal's figures are known yet.
+    public enum Figures: String, Codable, Sendable {
+        case known
+        /// A photo the model has not answered for yet.
+        case estimating
+        /// The model could not estimate it; the owner can type the figures.
+        case failed
+        /// A barcode the food database does not have; the owner types the label.
+        case needsLabel = "needs_label"
+    }
+
+    /// A photo meal's line, what the model saw, and the oil question.
+    public struct PhotoDetail: Codable, Equatable, Sendable {
+        public var note: String
+        public var hasPhoto: Bool
+        public var items: [EstimateItem]
+        /// Whether to ask how much oil or sauce went in.
+        public var oilAsked: Bool
+        /// The owner's answer; nil until answered.
+        public var oil: Oil?
+        /// The oil the figures include: the answer, or some until there is one.
+        public var oilCounted: Oil
+        public var oilKcal: Int
+        /// The owner typed the figures instead of the model's.
+        public var typed: Bool
+        /// Why there is no estimate yet, worded by the backend.
+        public var problem: String?
+
+        public init(
+            note: String, hasPhoto: Bool, items: [EstimateItem], oilAsked: Bool, oil: Oil?, oilCounted: Oil,
+            oilKcal: Int, typed: Bool, problem: String?
+        ) {
+            self.note = note
+            self.hasPhoto = hasPhoto
+            self.items = items
+            self.oilAsked = oilAsked
+            self.oil = oil
+            self.oilCounted = oilCounted
+            self.oilKcal = oilKcal
+            self.typed = typed
+            self.problem = problem
+        }
+    }
+
+    /// One food the model saw, at the grams that count.
+    public struct EstimateItem: Codable, Equatable, Sendable {
+        public var name: String
+        public var grams: Double
+        /// The model's grams, before any correction.
+        public var gramsSeen: Double
+        public var kcal: Int
+        public var proteinG: Double
+
+        public init(name: String, grams: Double, gramsSeen: Double, kcal: Int, proteinG: Double) {
+            self.name = name
+            self.grams = grams
+            self.gramsSeen = gramsSeen
+            self.kcal = kcal
+            self.proteinG = proteinG
+        }
+    }
+
+    public struct BarcodeDetail: Codable, Equatable, Sendable {
+        public var code: String
+        public var grams: Double
+
+        public init(code: String, grams: Double) {
+            self.code = code
+            self.grams = grams
         }
     }
 
@@ -360,12 +524,24 @@ public struct FoodDay: Codable, Equatable, Sendable {
 
     public init(
         day: CalendarDay, target: Target?, kcal: Int, proteinG: Double, kcalLeft: Int?, proteinLeftG: Double?,
-        openSlots: [MealSlot], entries: [Entry], meals: [SavedMeal], streak: DayStreak
+        openSlots: [MealSlot], entries: [Entry], meals: [SavedMeal], streak: DayStreak,
+        kcalMeasured: Int? = nil, proteinMeasuredG: Double? = nil, kcalEstimated: Int? = nil,
+        proteinEstimatedG: Double? = nil, kcalLow: Int? = nil, kcalHigh: Int? = nil, unknown: Int? = nil,
+        estimateRangePct: Int? = nil, products: [Product]? = nil
     ) {
         self.day = day
         self.target = target
         self.kcal = kcal
         self.proteinG = proteinG
+        self.kcalMeasured = kcalMeasured
+        self.proteinMeasuredG = proteinMeasuredG
+        self.kcalEstimated = kcalEstimated
+        self.proteinEstimatedG = proteinEstimatedG
+        self.kcalLow = kcalLow
+        self.kcalHigh = kcalHigh
+        self.unknown = unknown
+        self.estimateRangePct = estimateRangePct
+        self.products = products
         self.kcalLeft = kcalLeft
         self.proteinLeftG = proteinLeftG
         self.openSlots = openSlots

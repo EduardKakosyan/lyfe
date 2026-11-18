@@ -11,6 +11,13 @@
 //! with nothing logged is reported as open, and the day's total is only
 //! what was logged.
 //!
+//! Meals that are not saved meals come from a photo and one line, which a
+//! model estimates, or from a barcode and the label's figures. The day
+//! keeps what was measured (saved meals, labels) apart from what was
+//! estimated (photos), and a meal whose figures are not known yet (a photo
+//! still being estimated, a barcode not in the database) is logged but
+//! left out of the total: unknown, not zero.
+//!
 //! The streak is on logging, by the day, with the same recovery rule as
 //! every routine: a day counts once anything is logged on it, whatever the
 //! numbers were, so a day over target does not break it.
@@ -23,6 +30,8 @@ use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime};
 use serde::Serialize;
 use uuid::Uuid;
 
+use super::photo::{self, Oil};
+use super::product::Product;
 use super::streak::{self, Current, Mark, State};
 
 /// The longest name a meal or an ingredient can have.
@@ -128,6 +137,103 @@ impl Amount {
     }
 }
 
+/// Where a logged meal's figures came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Source {
+    /// A saved meal, weighed once. Measured.
+    Saved,
+    /// A photo and one line, estimated by a model. Estimated.
+    Photo,
+    /// A packaged food's label and the grams eaten. Measured.
+    Barcode,
+}
+
+impl Source {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Source::Saved => "saved",
+            Source::Photo => "photo",
+            Source::Barcode => "barcode",
+        }
+    }
+
+    pub fn is_estimated(self) -> bool {
+        self == Source::Photo
+    }
+}
+
+/// Whether a logged meal's figures are known yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Figures {
+    Known,
+    /// A photo the model has not answered for yet.
+    Estimating,
+    /// The model could not estimate it; the owner can type the figures.
+    Failed,
+    /// A barcode the food database does not have; the owner types the label.
+    NeedsLabel,
+}
+
+impl Figures {
+    pub fn parse(text: &str) -> Option<Figures> {
+        match text {
+            "known" => Some(Figures::Known),
+            "estimating" => Some(Figures::Estimating),
+            "failed" => Some(Figures::Failed),
+            "needs_label" => Some(Figures::NeedsLabel),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Figures::Known => "known",
+            Figures::Estimating => "estimating",
+            Figures::Failed => "failed",
+            Figures::NeedsLabel => "needs_label",
+        }
+    }
+}
+
+/// What a photo meal carries besides its figures.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PhotoDetail {
+    /// The one line typed with it.
+    pub note: String,
+    /// False for a meal described without a photo.
+    pub has_photo: bool,
+    /// What the model saw; empty until it has answered.
+    pub items: Vec<photo::Item>,
+    /// Whether the model judged it fried, sauced or from a restaurant.
+    pub oil_asked: bool,
+    pub oil: Option<Oil>,
+    /// The owner typed the figures instead of the model's.
+    pub typed: bool,
+    /// Why there is no estimate yet, in words the owner can act on.
+    pub problem: Option<String>,
+}
+
+/// What a logged meal carries, by where it came from.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum Detail {
+    #[default]
+    Saved,
+    Photo(PhotoDetail),
+    Barcode { code: String, grams: f64 },
+}
+
+impl Detail {
+    pub fn source(&self) -> Source {
+        match self {
+            Detail::Saved => Source::Saved,
+            Detail::Photo(_) => Source::Photo,
+            Detail::Barcode { .. } => Source::Barcode,
+        }
+    }
+}
+
 /// A meal the owner eats repeatedly, weighed once.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SavedMeal {
@@ -209,7 +315,10 @@ pub struct Entry {
     pub meal_id: Option<Uuid>,
     pub name: String,
     pub servings: f64,
+    /// Zero while `figures` is not known.
     pub amount: Amount,
+    pub figures: Figures,
+    pub detail: Detail,
 }
 
 /// The calorie and protein targets in force from a day on.
@@ -366,8 +475,57 @@ pub struct EntryView {
     /// The saved meal it was logged from.
     pub meal_id: Option<Uuid>,
     pub servings: f64,
+    /// Zero while `figures` is not known.
     pub kcal: u32,
     pub protein_g: f64,
+    pub source: Source,
+    pub figures: Figures,
+    /// True for a photo meal, whose figures are a model's estimate.
+    pub estimated: bool,
+    /// How far either way an estimate may be. Only for a photo meal with
+    /// known figures the owner did not type.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kcal_low: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kcal_high: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub photo: Option<PhotoView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub barcode: Option<BarcodeView>,
+}
+
+/// A photo meal's line, what the model saw, and the oil question.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PhotoView {
+    pub note: String,
+    pub has_photo: bool,
+    pub items: Vec<ItemView>,
+    /// Whether to ask how much oil or sauce went in.
+    pub oil_asked: bool,
+    /// The owner's answer; null until answered.
+    pub oil: Option<Oil>,
+    /// The oil the figures include: the answer, or "some" until there is one.
+    pub oil_counted: Oil,
+    pub oil_kcal: u32,
+    pub typed: bool,
+    pub problem: Option<String>,
+}
+
+/// One food the model saw, at the grams that count.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ItemView {
+    pub name: String,
+    pub grams: f64,
+    /// The model's grams, before any correction.
+    pub grams_seen: f64,
+    pub kcal: u32,
+    pub protein_g: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BarcodeView {
+    pub code: String,
+    pub grams: f64,
 }
 
 /// A saved meal, with what one portion comes to.
@@ -389,10 +547,25 @@ pub struct FoodDay {
     pub day: NaiveDate,
     /// What the day is held to; null until the owner has set targets.
     pub target: Option<Target>,
-    /// Everything logged today. Not the day's intake unless every meal
-    /// was logged: see `open_slots`.
+    /// Everything logged today whose figures are known. Not the day's
+    /// intake unless every meal was logged and known: see `open_slots` and
+    /// `unknown`.
     pub kcal: u32,
     pub protein_g: f64,
+    /// The part of it that was measured: saved meals and labels.
+    pub kcal_measured: u32,
+    pub protein_measured_g: f64,
+    /// The part of it that was estimated from photos.
+    pub kcal_estimated: u32,
+    pub protein_estimated_g: f64,
+    /// How far either way the estimated part may take the total.
+    pub kcal_low: u32,
+    pub kcal_high: u32,
+    /// Meals logged today whose figures are not known yet: left out of
+    /// the total, not counted as zero.
+    pub unknown: u32,
+    /// How far either way a photo estimate may be, in percent.
+    pub estimate_range_pct: u32,
     /// The target minus what is logged; negative once over. Null without
     /// a target.
     pub kcal_left: Option<i64>,
@@ -404,15 +577,83 @@ pub struct FoodDay {
     pub entries: Vec<EntryView>,
     /// The saved meals, by slot, the one logged most recently first.
     pub meals: Vec<MealView>,
+    /// Packaged food logged lately, most recent first, so a code scanned
+    /// again can be looked up without a connection.
+    pub products: Vec<Product>,
     pub streak: DayStreak,
+}
+
+/// An entry as the apps show it.
+fn entry_view(entry: &Entry, range_pct: u32) -> EntryView {
+    let source = entry.detail.source();
+    let known = entry.figures == Figures::Known;
+    let ranged = match &entry.detail {
+        Detail::Photo(detail) => known && !detail.typed,
+        _ => false,
+    };
+    let range = ranged.then(|| photo::range(entry.amount.kcal, range_pct));
+    EntryView {
+        id: entry.id,
+        slot: entry.slot,
+        name: entry.name.clone(),
+        meal_id: entry.meal_id,
+        servings: entry.servings,
+        kcal: entry.amount.kcal,
+        protein_g: entry.amount.protein_g(),
+        source,
+        figures: entry.figures,
+        estimated: source.is_estimated(),
+        kcal_low: range.map(|(low, _)| low),
+        kcal_high: range.map(|(_, high)| high),
+        photo: match &entry.detail {
+            Detail::Photo(detail) => {
+                let oil_counted = photo::oil_counted(detail.oil_asked, detail.oil);
+                Some(PhotoView {
+                    note: detail.note.clone(),
+                    has_photo: detail.has_photo,
+                    items: detail
+                        .items
+                        .iter()
+                        .map(|item| ItemView {
+                            name: item.name.clone(),
+                            grams: item.grams,
+                            grams_seen: item.grams_seen,
+                            kcal: item.kcal(),
+                            protein_g: item.protein_g(),
+                        })
+                        .collect(),
+                    oil_asked: detail.oil_asked,
+                    oil: detail.oil,
+                    oil_counted,
+                    oil_kcal: if detail.typed { 0 } else { oil_counted.kcal() },
+                    typed: detail.typed,
+                    problem: detail.problem.clone(),
+                })
+            }
+            _ => None,
+        },
+        barcode: match &entry.detail {
+            Detail::Barcode { code, grams } => Some(BarcodeView { code: code.clone(), grams: *grams }),
+            _ => None,
+        },
+    }
 }
 
 /// Everything the apps show about food, as of `today`. `meals` are the
 /// saved meals still in use; `entries` every entry not taken back.
-pub fn day(today: NaiveDate, meals: &[SavedMeal], entries: &[Entry], targets: &[Target]) -> FoodDay {
+/// `range_pct` is how far either way a photo estimate may be.
+pub fn day(today: NaiveDate, meals: &[SavedMeal], entries: &[Entry], targets: &[Target], range_pct: u32) -> FoodDay {
     let mut todays: Vec<&Entry> = entries.iter().filter(|entry| entry.eaten_local.date() == today).collect();
     todays.sort_by_key(|entry| (entry.slot, entry.eaten_local, entry.id));
-    let eaten = todays.iter().fold(Amount::default(), |sum, entry| sum.plus(entry.amount));
+    let known = || todays.iter().filter(|entry| entry.figures == Figures::Known);
+    let sum = |estimated: bool| {
+        known()
+            .filter(|entry| entry.detail.source().is_estimated() == estimated)
+            .fold(Amount::default(), |sum, entry| sum.plus(entry.amount))
+    };
+    let (measured, estimated) = (sum(false), sum(true));
+    let eaten = measured.plus(estimated);
+    let estimated_range = photo::range(estimated.kcal, range_pct);
     let target = target_on(targets, today);
 
     let last_logged = |meal: &SavedMeal| {
@@ -426,22 +667,19 @@ pub fn day(today: NaiveDate, meals: &[SavedMeal], entries: &[Entry], targets: &[
         target,
         kcal: eaten.kcal,
         protein_g: eaten.protein_g(),
+        kcal_measured: measured.kcal,
+        protein_measured_g: measured.protein_g(),
+        kcal_estimated: estimated.kcal,
+        protein_estimated_g: estimated.protein_g(),
+        kcal_low: measured.kcal + estimated_range.0,
+        kcal_high: measured.kcal + estimated_range.1,
+        unknown: todays.iter().filter(|entry| entry.figures != Figures::Known).count() as u32,
+        estimate_range_pct: range_pct,
         kcal_left: target.map(|target| i64::from(target.kcal) - i64::from(eaten.kcal)),
         protein_left_g: target
             .map(|target| (f64::from(target.protein_g) * 10.0 - f64::from(eaten.protein_dg)) / 10.0),
         open_slots: Slot::MAIN.into_iter().filter(|slot| !todays.iter().any(|entry| entry.slot == *slot)).collect(),
-        entries: todays
-            .into_iter()
-            .map(|entry| EntryView {
-                id: entry.id,
-                slot: entry.slot,
-                name: entry.name.clone(),
-                meal_id: entry.meal_id,
-                servings: entry.servings,
-                kcal: entry.amount.kcal,
-                protein_g: entry.amount.protein_g(),
-            })
-            .collect(),
+        entries: todays.iter().map(|entry| entry_view(entry, range_pct)).collect(),
         meals: ordered
             .into_iter()
             .map(|meal| {
@@ -457,6 +695,7 @@ pub fn day(today: NaiveDate, meals: &[SavedMeal], entries: &[Entry], targets: &[
                 }
             })
             .collect(),
+        products: Vec::new(),
         streak: streak(today, &logged_days(entries)),
     }
 }
@@ -516,6 +755,8 @@ mod tests {
             name: meal.name.clone(),
             servings,
             amount: meal.amount(servings),
+            figures: Figures::Known,
+            detail: Detail::Saved,
         }
     }
 
@@ -622,7 +863,7 @@ mod tests {
             entry(3, "2026-11-17 07:05", &b, 1.0),
         ];
         let targets = [Target::new(date("2026-11-02"), 2500, 170).unwrap()];
-        let day = day(date("2026-11-17"), &[l.clone(), b.clone()], &entries, &targets);
+        let day = day(date("2026-11-17"), &[l.clone(), b.clone()], &entries, &targets, 35);
 
         assert_eq!((day.kcal, day.protein_g), (1103, 92.1));
         assert_eq!((day.kcal_left, day.protein_left_g), (Some(1397), Some(77.9)));
@@ -642,21 +883,21 @@ mod tests {
         let l = lunch();
         let entries = [entry(1, "2026-11-17 12:40", &l, 5.0)];
         let targets = [Target::new(date("2026-11-02"), 2500, 170).unwrap()];
-        let day = day(date("2026-11-17"), std::slice::from_ref(&l), &entries, &targets);
+        let day = day(date("2026-11-17"), std::slice::from_ref(&l), &entries, &targets, 35);
         assert_eq!((day.kcal_left, day.protein_left_g), (Some(-306), Some(-75.0)));
     }
 
     #[test]
     fn without_a_target_nothing_is_left_or_over() {
         let b = breakfast();
-        let day = day(date("2026-11-17"), std::slice::from_ref(&b), &[entry(1, "2026-11-17 07:05", &b, 1.0)], &[]);
+        let day = day(date("2026-11-17"), std::slice::from_ref(&b), &[entry(1, "2026-11-17 07:05", &b, 1.0)], &[], 35);
         assert_eq!((day.target, day.kcal_left, day.protein_left_g), (None, None, None));
         assert_eq!(day.kcal, 542);
     }
 
     #[test]
     fn a_day_with_nothing_logged_has_every_main_meal_open() {
-        let day = day(date("2026-11-17"), &[], &[], &[]);
+        let day = day(date("2026-11-17"), &[], &[], &[], 35);
         assert_eq!((day.kcal, day.protein_g), (0, 0.0));
         assert_eq!(day.open_slots, Slot::MAIN.to_vec());
         assert!(day.entries.is_empty());
@@ -673,7 +914,7 @@ mod tests {
             entry(2, "2026-11-17 09:30", &b, 0.5),
             entry(3, "2026-11-17 15:00", &bar, 1.0),
         ];
-        let day = day(date("2026-11-17"), &[b.clone(), l, bar], &entries, &[]);
+        let day = day(date("2026-11-17"), &[b.clone(), l, bar], &entries, &[], 35);
         assert_eq!(day.kcal, 542 + 271 + 210);
         assert_eq!(day.entries.iter().map(|e| e.slot).collect::<Vec<_>>(), vec![Slot::Breakfast, Slot::Breakfast, Slot::Snack]);
         // The snack does not stand in for lunch or dinner.
@@ -686,7 +927,7 @@ mod tests {
         let eggs = SavedMeal::new(Uuid::from_u128(4), "Eggs on toast", Slot::Breakfast, 1, vec![ingredient("Eggs", 110.0, 143.0, 12.6)])
             .unwrap();
         let names = |entries: &[Entry]| -> Vec<String> {
-            day(date("2026-11-17"), &[usual.clone(), eggs.clone(), lunch()], entries, &[])
+            day(date("2026-11-17"), &[usual.clone(), eggs.clone(), lunch()], entries, &[], 35)
                 .meals
                 .into_iter()
                 .map(|meal| meal.name)
@@ -698,6 +939,110 @@ mod tests {
             names(&[entry(1, "2026-11-15 07:00", &eggs, 1.0), entry(2, "2026-11-16 07:00", &usual, 1.0)]),
             ["Usual breakfast", "Eggs on toast", "Batch lunch"]
         );
+    }
+
+    fn photo_entry(n: u128, at: &str, slot: Slot, figures: Figures, items: Vec<photo::Item>, oil_asked: bool) -> Entry {
+        let amount = if figures == Figures::Known { photo::amount(&items, oil_asked, None) } else { Amount::default() };
+        Entry {
+            id: Uuid::from_u128(n),
+            eaten_local: NaiveDateTime::parse_from_str(at, "%Y-%m-%d %H:%M").unwrap(),
+            slot,
+            meal_id: None,
+            name: "stir fry, rice".into(),
+            servings: 1.0,
+            amount,
+            figures,
+            detail: Detail::Photo(PhotoDetail {
+                note: "stir fry, rice".into(),
+                has_photo: true,
+                items,
+                oil_asked,
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn rice_and_chicken() -> Vec<photo::Item> {
+        let item = |name: &str, grams: f64, kcal: f64, protein: f64| photo::Item {
+            name: name.into(),
+            grams_seen: grams,
+            kcal_seen: kcal,
+            protein_g_seen: protein,
+            grams,
+        };
+        vec![item("Rice", 200.0, 260.0, 5.4), item("Chicken", 120.0, 198.0, 27.6)]
+    }
+
+    #[test]
+    fn the_day_keeps_measured_and_estimated_apart() {
+        let b = breakfast();
+        let bar = Entry {
+            id: Uuid::from_u128(3),
+            eaten_local: NaiveDateTime::parse_from_str("2026-11-17 15:00", "%Y-%m-%d %H:%M").unwrap(),
+            slot: Slot::Snack,
+            meal_id: None,
+            name: "Protein bar".into(),
+            servings: 1.0,
+            amount: Amount { kcal: 210, protein_dg: 198 },
+            figures: Figures::Known,
+            detail: Detail::Barcode { code: "96385074".into(), grams: 60.0 },
+        };
+        let entries = [
+            entry(1, "2026-11-17 07:05", &b, 1.0),
+            photo_entry(2, "2026-11-17 19:00", Slot::Dinner, Figures::Known, rice_and_chicken(), true),
+            bar,
+        ];
+        let targets = [Target::new(date("2026-11-02"), 2500, 170).unwrap()];
+        let day = day(date("2026-11-17"), std::slice::from_ref(&b), &entries, &targets, 35);
+
+        // Breakfast and the bar are measured; dinner, with some oil
+        // counted until the owner answers, is estimated.
+        assert_eq!((day.kcal_measured, day.protein_measured_g), (542 + 210, 62.9));
+        assert_eq!((day.kcal_estimated, day.protein_estimated_g), (578, 33.0));
+        assert_eq!((day.kcal, day.protein_g), (1330, 95.9));
+        assert_eq!(day.kcal_left, Some(2500 - 1330));
+        // Only the estimated part widens the day.
+        assert_eq!((day.kcal_low, day.kcal_high), (752 + 380, 752 + 780));
+        assert_eq!(day.unknown, 0);
+        assert_eq!(day.open_slots, vec![Slot::Lunch]);
+
+        let dinner = &day.entries[1];
+        assert_eq!((dinner.source, dinner.figures, dinner.estimated), (Source::Photo, Figures::Known, true));
+        assert_eq!((dinner.kcal, dinner.kcal_low, dinner.kcal_high), (578, Some(380), Some(780)));
+        let photo = dinner.photo.as_ref().unwrap();
+        assert_eq!((photo.oil_asked, photo.oil, photo.oil_counted, photo.oil_kcal), (true, None, Oil::Some, 120));
+        assert_eq!(photo.items[1].name, "Chicken");
+        assert_eq!((photo.items[1].kcal, photo.items[1].protein_g), (198, 27.6));
+        let bar = &day.entries[2];
+        assert_eq!((bar.source, bar.estimated, bar.kcal_low), (Source::Barcode, false, None));
+        assert_eq!(bar.barcode, Some(BarcodeView { code: "96385074".into(), grams: 60.0 }));
+        assert_eq!((day.entries[0].source, day.entries[0].photo.is_none()), (Source::Saved, true));
+    }
+
+    #[test]
+    fn a_meal_still_being_estimated_is_logged_but_unknown_not_zero() {
+        let entries = [photo_entry(1, "2026-11-17 12:30", Slot::Lunch, Figures::Estimating, vec![], false)];
+        let day = day(date("2026-11-17"), &[], &entries, &[], 35);
+        assert_eq!((day.kcal, day.unknown), (0, 1));
+        // Lunch was logged: it is not open, and the day counts for the streak.
+        assert_eq!(day.open_slots, vec![Slot::Breakfast, Slot::Dinner]);
+        assert_eq!((day.streak.state, day.streak.logged_today), (State::Kept, true));
+        let lunch = &day.entries[0];
+        assert_eq!((lunch.figures, lunch.kcal_low), (Figures::Estimating, None));
+    }
+
+    #[test]
+    fn typed_figures_have_no_range() {
+        let mut typed = photo_entry(1, "2026-11-17 19:00", Slot::Dinner, Figures::Known, rice_and_chicken(), true);
+        typed.amount = Amount { kcal: 650, protein_dg: 400 };
+        if let Detail::Photo(detail) = &mut typed.detail {
+            detail.typed = true;
+        }
+        let day = day(date("2026-11-17"), &[], &[typed], &[], 35);
+        assert_eq!((day.entries[0].kcal, day.entries[0].kcal_low), (650, None));
+        assert_eq!(day.entries[0].photo.as_ref().unwrap().oil_kcal, 0);
+        // Still estimated: typed from a menu or a guess, not weighed.
+        assert_eq!(day.kcal_estimated, 650);
     }
 
     // --- The logging streak ---
