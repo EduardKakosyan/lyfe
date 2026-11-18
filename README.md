@@ -148,6 +148,8 @@ Once, with administrator rights (you type your sudo password on the Spark):
 deploy/spark/bootstrap.sh
 ```
 
+Say how you reach your Spark in `deploy/spark/local.env`, which is not committed: `ADMIN_SSH` for the account with sudo rights, `LYFE_SSH` for the `lyfe` account, and `LYFE_SSH_KEY` for the key that logs in as it. Both scripts read it.
+
 This creates the `lyfe` account, installs the PostgreSQL programs without a machine-wide database, lets your SSH key log in as `lyfe`, copies the Garmin key file into lyfe's home, and publishes port 8444 on the tailnet. Read `deploy/spark/setup-admin.sh` first; it lists exactly what it changes.
 
 Then, and again for every new version (no sudo):

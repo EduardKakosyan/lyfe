@@ -50,6 +50,7 @@ Each step below works end to end, from capture to a screen you can look at, befo
 - Every capture has a unique ID, so retries cannot double-count.
 - Models on the Spark load on demand, check free memory first, cap their context and unload afterwards.
 - No keys or tokens in the repository or in these notes.
+- The repository is public. Nothing personal goes into it: no account or bank names, health figures, employer, location, or machine and device names. Research and discovery notes are kept outside it.
 - The streak and progression rules get automated tests before any screen depends on them.
 
 ## To settle before or during the build
