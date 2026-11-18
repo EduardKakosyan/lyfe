@@ -346,6 +346,26 @@ private func moment(_ run: BreathRun, round: Int, _ seconds: TimeInterval) -> Da
         #expect(cues.log.last == "end false")
     }
 
+    @Test func aRunningSessionLooksAtTheClockSeveralTimesASecond() async throws {
+        // The session must notice a round beginning, and a hold passing last
+        // time's, promptly. It used to sleep straight through to the next
+        // event, and a long sleep can be woken late.
+        let (model, clock, cues, _) = session(lastHolds: [2, nil, nil, nil, nil, nil])
+        model.start()
+        let run = try #require(model.run)
+        #expect(model.phase == .leadIn(until: run.firstRoundAt))
+        // Let the session settle into waiting for the first round.
+        try await Task.sleep(for: .milliseconds(60))
+
+        // Ten seconds pass for the session while almost none pass here.
+        clock.now = moment(run, round: 1, 3)
+        try await Task.sleep(for: .seconds(BreathSessionModel.longestNap * 3))
+        #expect(model.phase == .hold(round: 1, since: run.firstRoundAt, roundEnds: run.roundStart(2)))
+        #expect(model.beats == 1)
+        #expect(cues.log == ["begin", "beatLast"])
+        model.stop()
+    }
+
     @Test func aRunPickedUpAgainCarriesOnFromTheClock() {
         let clock = TestClock(start)
         var earlier = newRun()
@@ -608,7 +628,7 @@ private func moment(_ run: BreathRun, round: Int, _ seconds: TimeInterval) -> Da
 
     @Test func theTimerSaysWhatToDoInEveryPhase() {
         var run = newRun(lastHolds: [125, 132, nil, nil, nil, nil])
-        let ready = BreathText.look(for: run, phase: run.phase(at: start), at: start.addingTimeInterval(0.3))
+        let ready = BreathText.look(for: run, at: start.addingTimeInterval(0.3))
         #expect(ready.giant == "0:10")
         #expect(ready.word == "BREATHE")
         #expect(ready.small == "HOLD AT THE TONE · TO BEAT 2:05")
@@ -616,7 +636,7 @@ private func moment(_ run: BreathRun, round: Int, _ seconds: TimeInterval) -> Da
         #expect(!ready.holding)
 
         let at = moment(run, round: 1, 102.6)
-        let hold = BreathText.look(for: run, phase: run.phase(at: at), at: at)
+        let hold = BreathText.look(for: run, at: at)
         #expect(hold.topLeft == "ROUND 1 / 6")
         #expect(hold.topRight == "ENDS IN 2:18")
         #expect(hold.giant == "1:42")
@@ -627,13 +647,34 @@ private func moment(_ run: BreathRun, round: Int, _ seconds: TimeInterval) -> Da
 
         run.tap(at: moment(run, round: 1, 131))
         let after = moment(run, round: 1, 132)
-        let recover = BreathText.look(for: run, phase: run.phase(at: after), at: after)
+        let recover = BreathText.look(for: run, at: after)
         #expect(recover.topRight == "HELD 2:11 ▲")
         #expect(recover.giant == "1:48")
         #expect(recover.word == "BREATHE")
         #expect(recover.small == "NEXT HOLD AT THE TONE · TO BEAT 2:12")
         #expect(recover.barSmall == "NEXT · ROUND 2 OF 6")
         #expect(!recover.holding)
+    }
+
+    @Test func theScreenGoesToHoldWhenTheRoundBeginsWhateverElseIsLate() {
+        // Round 1 was tapped; nothing has touched the run since.
+        var run = newRun()
+        run.tap(at: moment(run, round: 1, 100))
+        let before = BreathText.look(for: run, at: moment(run, round: 1, 239.5))
+        #expect(before.word == "BREATHE")
+        #expect(before.giant == "0:01")
+
+        // The tone sounds at the start of round 2. From the run and the time
+        // alone, the screen is on HOLD and counting, with nothing telling it.
+        let onTheTone = BreathText.look(for: run, at: moment(run, round: 2, 0))
+        #expect(onTheTone.word == "HOLD")
+        #expect(onTheTone.giant == "0:00")
+        #expect(onTheTone.topLeft == "ROUND 2 / 6")
+        let after = BreathText.look(for: run, at: moment(run, round: 2, 3.4))
+        #expect(after.word == "HOLD")
+        #expect(after.giant == "0:03")
+        #expect(after.barBig == "BREATHE")
+        #expect(after.holding)
     }
 
     @Test func theHoldScreenTurnsBlueOncePastLastTime() {

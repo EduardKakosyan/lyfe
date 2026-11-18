@@ -26,6 +26,8 @@ public final class BreathSessionModel {
     /// The round whose hold has already been announced as beating last time.
     private var beatenRound: Int?
     private var finishReported = false
+    /// The longest the session goes without looking at the clock.
+    static let longestNap: TimeInterval = 0.25
 
     public init(
         table: BreathTable,
@@ -76,7 +78,12 @@ public final class BreathSessionModel {
                 let now = self.now()
                 self.advance(to: now)
                 guard let next = run.nextEvent(after: now) else { return }
-                try? await Task.sleep(for: .seconds(max(0.02, next.timeIntervalSince(self.now()))))
+                // Short naps, not one sleep to the next event: the system
+                // may wake a long sleep late by a share of its length,
+                // which would hold back everything that follows a round's
+                // start by seconds.
+                let wait = min(Self.longestNap, max(0.02, next.timeIntervalSince(self.now())))
+                try? await Task.sleep(for: .seconds(wait), tolerance: .milliseconds(10))
             }
         }
     }

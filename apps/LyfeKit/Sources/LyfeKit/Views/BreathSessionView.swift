@@ -18,8 +18,8 @@ public struct BreathSessionView: View {
 
     public var body: some View {
         Group {
-            if let run = session.run, let phase = session.phase {
-                if phase == .finished {
+            if let run = session.run {
+                if session.isFinished {
                     let unsent = model.unsentBreath.contains(run.id)
                     BreathDoneView(
                         run: run, breath: unsent ? nil : model.home?.breath, unsent: unsent,
@@ -28,7 +28,7 @@ public struct BreathSessionView: View {
                         model.closeBreathSession()
                     }
                 } else {
-                    BreathTimerView(session: session, run: run, phase: phase) {
+                    BreathTimerView(session: session, run: run) {
                         confirmingEnd = true
                     }
                 }
@@ -110,16 +110,20 @@ struct BreathReadyView: View {
 // MARK: Running
 
 /// The timer. The whole screen is the tap target during a hold.
+///
+/// What it shows is worked out from the clock at every tick, never from
+/// what the session was last told: the screen then cannot be left on
+/// BREATHE after a round has begun, however late anything else runs.
 struct BreathTimerView: View {
     let session: BreathSessionModel
     let run: BreathRun
-    let phase: BreathRun.Phase
     let onEnd: () -> Void
     @State private var flash = false
 
     var body: some View {
+        // Ticks fall on the round's own seconds, so a round begins on a tick.
         TimelineView(.periodic(from: run.firstRoundAt, by: 0.2)) { timeline in
-            let look = BreathText.look(for: run, phase: phase, at: timeline.date)
+            let look = BreathText.look(for: run, at: timeline.date)
             VStack(alignment: .leading, spacing: 0) {
                 HStack {
                     Button(action: onEnd) {
@@ -338,8 +342,9 @@ enum BreathText {
     /// A hold with nothing to beat takes this long to go from yellow to red.
     static let plainHoldMs = 120_000
 
-    /// What the timer shows at one moment.
-    static func look(for run: BreathRun, phase: BreathRun.Phase, at now: Date) -> Look {
+    /// What the timer shows at one moment, from the run and the time alone.
+    static func look(for run: BreathRun, at now: Date) -> Look {
+        let phase = run.phase(at: now)
         let table = run.table
         let rounds = "\(clockLabel(seconds: table.roundS)) ROUNDS · SET BY LYFE"
         func left(until date: Date) -> String {

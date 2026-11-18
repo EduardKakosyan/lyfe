@@ -127,14 +127,14 @@
 
         public var body: some View {
             Group {
-                if let run = session.run, let phase = session.phase {
-                    if phase == .finished {
+                if let run = session.run {
+                    if session.isFinished {
                         BreathDoneView(
                             run: run, breath: screen == "offline" ? nil : Self.answer(for: run),
                             unsent: screen == "offline", today: CalendarDay(year: 2026, month: 11, day: 17),
                             weekEnds: CalendarDay(year: 2026, month: 11, day: 22), onDone: {})
                     } else {
-                        BreathTimerView(session: session, run: run, phase: phase, onEnd: {})
+                        BreathTimerView(session: session, run: run, onEnd: {})
                     }
                 } else {
                     BreathReadyView(session: session, onClose: {})
