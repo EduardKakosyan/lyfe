@@ -311,8 +311,10 @@ pub struct PhotoDetail {
     pub note: String,
     /// False for a meal described without a photo.
     pub has_photo: bool,
-    /// Whether the photo has been drawn as a Poster illustration yet.
-    pub illustrated: bool,
+    /// When the photo's illustration was drawn, in milliseconds since
+    /// 1970; none until it has been. It changes when the photo is drawn
+    /// again in a new look.
+    pub illustration_version: Option<i64>,
     /// What the model saw; empty until it has answered.
     pub items: Vec<photo::Item>,
     /// Whether the model judged it fried, sauced or from a restaurant.
@@ -684,6 +686,9 @@ pub struct PhotoView {
     /// Whether the photo's illustration can be fetched; until it can, and
     /// if it never can, the app shows the photo.
     pub illustrated: bool,
+    /// Changes when the photo is drawn again, so the app fetches the new
+    /// drawing in place of the one it kept; null until it is drawn.
+    pub illustration_version: Option<i64>,
     pub items: Vec<ItemView>,
     /// Whether to ask how much oil or sauce went in.
     pub oil_asked: bool,
@@ -810,7 +815,8 @@ fn entry_view(entry: &Entry, range_pct: u32) -> EntryView {
                 Some(PhotoView {
                     note: detail.note.clone(),
                     has_photo: detail.has_photo,
-                    illustrated: detail.illustrated,
+                    illustrated: detail.illustration_version.is_some(),
+                    illustration_version: detail.illustration_version,
                     items: detail
                         .items
                         .iter()

@@ -294,8 +294,9 @@ public struct EstimateView: View {
         .foregroundStyle(Poster.ink)
         .background(Poster.paper.ignoresSafeArea())
         .task { photo = await loadPhoto() }
-        .task(id: detail?.illustrated == true) {
-            if detail?.illustrated == true { drawing = await loadIllustration() }
+        // Again when the photo has been drawn again in a new look.
+        .task(id: entry.illustration) {
+            if entry.illustration != nil { drawing = await loadIllustration() }
         }
         // Estimated and not drawn yet: look again now and then for a while,
         // so the drawing takes the photo's place without leaving the

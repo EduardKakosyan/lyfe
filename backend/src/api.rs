@@ -960,10 +960,11 @@ async fn food_photo(State(state): State<AppState>, _device: Device, Path(id): Pa
 
 /// A meal's photo drawn as a Poster illustration, once it has been. Until
 /// then, and for a meal never drawn, there is none and the app shows the
-/// photo. It never changes once drawn, so the app may keep it.
+/// photo. The app may keep it: it changes only when the photo is drawn
+/// again in a new look, which the meal's `illustration_version` says.
 async fn food_illustration(State(state): State<AppState>, _device: Device, Path(id): Path<Uuid>) -> Result<Response, ApiError> {
     let png = db::food_illustration(&state.pool, id).await?.ok_or(ApiError::NotFound)?;
-    Ok(([(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, "private, max-age=604800, immutable")], png).into_response())
+    Ok(([(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, "private, no-cache")], png).into_response())
 }
 
 /// The label lyfe has for a barcode: the one the owner typed, else the

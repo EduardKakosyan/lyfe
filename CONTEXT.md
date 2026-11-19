@@ -43,8 +43,8 @@ A photo meal's figures as the model judged them, always shown with a range eithe
 _Avoid_: Guess (in the app), approximation
 
 **Illustration**:
-A meal photo redrawn on the Spark as a pictogram in the five Poster colours, shown in the photo's place once it is ready. It only ever adds to a meal: the meal counts without it, and the photo stays if it never comes.
-_Avoid_: Filter, AI image, thumbnail
+A meal photo redrawn on the Spark as the meal it shows: the food in its own colours, black ink outlines, and its dish in a Poster colour, shown in the photo's place once it is ready. It only ever adds to a meal: the meal counts without it, and the photo stays if it never comes.
+_Avoid_: Filter, AI image, thumbnail, pictogram (that was the first look, which lost the meal)
 
 **Label**:
 The calories and protein per 100 g printed on packaged food, found by its barcode in the downloaded food database or typed once by the owner. A meal logged from a label is measured.

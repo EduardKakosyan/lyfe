@@ -34,6 +34,8 @@ public struct FoodScreen: View {
     var onEstimate: (UUID) -> Void = { _ in }
     /// Opens the label entry for a code lyfe does not know.
     var onLabel: (String) -> Void = { _ in }
+    /// Fetches the day again, to follow photos being estimated and drawn.
+    var onReload: () async -> Void = {}
 
     /// What a meal left half built comes to so far.
     public struct Building: Equatable, Sendable {
@@ -53,6 +55,10 @@ public struct FoodScreen: View {
     @State private var busy = false
 
     public var body: some View {
+        day.followingTheSpark(SparkWait(food.entries), reload: onReload)
+    }
+
+    private var day: some View {
         VStack(spacing: 0) {
             FuelHeader(food: food, onBack: onBack, onTargets: onTargets)
             PosterRule()
@@ -386,7 +392,7 @@ struct FoodRow: View {
             Spacer(minLength: 8)
             // Left of the figure, so figures line up with or without one.
             if let picture = row.picture {
-                MealIllustration(id: picture)
+                MealIllustration(illustration: picture)
                     .frame(width: 40, height: 40)
                     .padding(.vertical, -6)
             }
@@ -600,8 +606,8 @@ public enum FoodText {
         var dim = false
         /// What tapping it does.
         var tap: RowTap = .none
-        /// The meal whose illustration is shown on the row, once drawn.
-        var picture: UUID? = nil
+        /// The illustration shown on the row, once the meal is drawn.
+        var picture: Illustration? = nil
 
         var spoken: String {
             let figure =
@@ -656,7 +662,7 @@ public enum FoodText {
     /// known.
     static func entryRow(_ entry: FoodDay.Entry) -> Row {
         var row = figuresRow(entry)
-        row.picture = entry.illustrationID
+        row.picture = entry.illustration
         return row
     }
 

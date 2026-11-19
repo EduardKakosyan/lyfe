@@ -644,7 +644,8 @@ const ENTRY_COLUMNS: &str = "e.id, e.eaten_at, e.slot, e.meal_id, e.name, e.serv
     e.figures, e.note, e.oil_asked, e.oil, e.typed, e.estimate_problem, e.barcode, e.grams, e.part_of, e.position,
     e.kcal_per_100g, e.protein_per_100g, e.kcal_estimated, e.protein_dg_estimated,
     exists (select 1 from food_photos p where p.entry_id = e.id) as has_photo,
-    exists (select 1 from food_photos p where p.entry_id = e.id and p.illustration is not null) as illustrated";
+    (select (extract(epoch from p.illustrated_at) * 1000)::bigint from food_photos p
+      where p.entry_id = e.id and p.illustration is not null) as illustration_version";
 
 fn read_entry(
     r: &sqlx::postgres::PgRow,
@@ -662,7 +663,7 @@ fn read_entry(
         "photo" => Detail::Photo(PhotoDetail {
             note: r.get::<Option<String>, _>("note").unwrap_or_default(),
             has_photo: r.get("has_photo"),
-            illustrated: r.get("illustrated"),
+            illustration_version: r.get("illustration_version"),
             items: items.remove(&id).unwrap_or_default(),
             oil_asked: r.get("oil_asked"),
             oil: r.get::<Option<&str>, _>("oil").and_then(Oil::parse),
@@ -1116,15 +1117,19 @@ pub async fn next_pending_illustration(pool: &PgPool) -> sqlx::Result<Option<Pen
     }))
 }
 
-/// Attaches a meal's illustration. Returns false when it already had one.
+/// Attaches a meal's illustration, drawn in the look of now, in place of
+/// one drawn in an older look if it had one. Returns false when the photo
+/// was not waiting to be drawn.
 pub async fn record_illustration(pool: &PgPool, id: Uuid, png: &[u8]) -> sqlx::Result<bool> {
     let result = sqlx::query(
         "update food_photos set
-            illustration = $2, illustrated_at = now(), illustration_due_at = null, illustration_problem = null
-         where entry_id = $1 and illustration is null",
+            illustration = $2, illustration_look = $3, illustrated_at = now(), illustration_due_at = null,
+            illustration_problem = null
+         where entry_id = $1 and illustration_due_at is not null",
     )
     .bind(id)
     .bind(png)
+    .bind(illustration::LOOK)
     .execute(pool)
     .await?;
     Ok(result.rows_affected() == 1)
@@ -1132,7 +1137,8 @@ pub async fn record_illustration(pool: &PgPool, id: Uuid, png: &[u8]) -> sqlx::R
 
 /// A picture the model could not draw. It is tried again after `retry_in`,
 /// and after `illustration::MAX_TRIES` failures not at all. Returns true
-/// when it has been given up on.
+/// when it has been given up on. One that was being drawn again keeps the
+/// drawing it had.
 pub async fn record_illustration_problem(
     pool: &PgPool,
     id: Uuid,
@@ -1145,7 +1151,7 @@ pub async fn record_illustration_problem(
             illustration_tries = illustration_tries + 1,
             illustration_due_at = case when illustration_tries + 1 >= $4 then null
                                        else now() + make_interval(secs => $3) end
-         where entry_id = $1 and illustration is null
+         where entry_id = $1 and illustration_due_at is not null
          returning illustration_due_at is null",
     )
     .bind(id)
@@ -1167,6 +1173,20 @@ pub async fn put_off_illustrations(pool: &PgPool, problem: &str, retry_in: chron
     )
     .bind(problem)
     .bind(retry_in.num_seconds() as f64)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Marks every photo drawn in a look older than the one of now to be
+/// drawn again, oldest first. Each keeps the drawing it has until the new
+/// one replaces it. Returns how many were marked.
+pub async fn redraw_older_looks(pool: &PgPool) -> sqlx::Result<u64> {
+    let result = sqlx::query(
+        "update food_photos set illustration_due_at = received_at, illustration_tries = 0, illustration_problem = null
+         where illustration is not null and illustration_due_at is null and coalesce(illustration_look, 0) < $1",
+    )
+    .bind(illustration::LOOK)
     .execute(pool)
     .await?;
     Ok(result.rows_affected())

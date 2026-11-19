@@ -209,8 +209,7 @@
                 kcalHigh: 1830, unknown: 1, estimateRangePct: 35, products: [bar])
         }
 
-        /// A made-up illustration, in the five Poster colours on paper as the
-        /// Spark draws them: a plate with an egg and a slab of something.
+        /// A made-up illustration, on the app's paper as the Spark draws them: a plate with an egg and a slab of something.
         nonisolated static func pictogram() -> Data? {
             let size = 512
             // sRGB, as the Spark's untagged PNGs are read, so the paper

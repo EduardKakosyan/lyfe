@@ -487,12 +487,14 @@ public struct FoodDay: Codable, Equatable, Sendable {
         public var isKnown: Bool { (figures ?? .known) == .known }
         /// What carries figures: the parts of a built meal, else the meal.
         public var counted: [Entry] { from == .built ? (parts ?? []) : [self] }
-        /// The meal whose illustration stands for this one: a photo meal
-        /// once drawn, or for a built meal the first of its photos drawn.
-        /// Nil while there is none, and then the photo, if any, is shown.
-        public var illustrationID: UUID? {
-            if from == .built { return parts?.lazy.compactMap(\.illustrationID).first }
-            return from == .photo && photo?.illustrated == true ? id : nil
+        /// The illustration that stands for this meal: a photo meal's
+        /// once drawn, or for a built meal that of the first of its photos
+        /// drawn. Nil while there is none, and then the photo, if any, is
+        /// shown.
+        public var illustration: Illustration? {
+            if from == .built { return parts?.lazy.compactMap(\.illustration).first }
+            guard from == .photo, photo?.illustrated == true else { return nil }
+            return Illustration(meal: id, version: photo?.illustrationVersion ?? 0)
         }
 
         /// As something that goes into a saved meal, once its figures are
@@ -573,10 +575,13 @@ public struct FoodDay: Codable, Equatable, Sendable {
         /// is then shown in its place. Missing in answers from before
         /// illustrations, and for a photo not drawn yet.
         public var illustrated: Bool?
+        /// Changes when the photo is drawn again in a new look, so the
+        /// drawing kept on the phone is fetched afresh.
+        public var illustrationVersion: Int?
 
         public init(
             note: String, hasPhoto: Bool, items: [EstimateItem], oilAsked: Bool, oil: Oil?, oilCounted: Oil,
-            oilKcal: Int, typed: Bool, problem: String?, illustrated: Bool? = nil
+            oilKcal: Int, typed: Bool, problem: String?, illustrated: Bool? = nil, illustrationVersion: Int? = nil
         ) {
             self.note = note
             self.hasPhoto = hasPhoto
@@ -588,6 +593,7 @@ public struct FoodDay: Codable, Equatable, Sendable {
             self.typed = typed
             self.problem = problem
             self.illustrated = illustrated
+            self.illustrationVersion = illustrationVersion
         }
     }
 

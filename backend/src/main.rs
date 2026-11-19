@@ -231,6 +231,12 @@ async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         ),
         None => tracing::warn!("LYFE_ILLUSTRATOR is off; meals keep their photos"),
     }
+    if illustrator.settings().program.is_some() {
+        let redrawn = db::redraw_older_looks(&pool).await?;
+        if redrawn > 0 {
+            tracing::info!(redrawn, "meals drawn in an older look will be drawn again");
+        }
+    }
     tokio::spawn(illustrator.run_forever());
 
     let state = AppState {

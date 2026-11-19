@@ -1207,11 +1207,11 @@ public final class AppModel {
     /// A meal's photo drawn as a Poster illustration: the copy on this
     /// phone, else the backend's, kept here once fetched. Nil while it has
     /// not been drawn, or cannot be fetched now.
-    public func mealIllustration(_ id: UUID) async -> Data? {
-        if let kept = illustrations.illustration(id) { return kept }
+    public func mealIllustration(_ illustration: Illustration) async -> Data? {
+        if let kept = illustrations.picture(illustration) { return kept }
         guard phase == .signedIn, let api, let token else { return nil }
-        guard let png = try? await api.foodIllustration(token: token, id: id) else { return nil }
-        illustrations.keep(png, for: id)
+        guard let png = try? await api.foodIllustration(token: token, illustration) else { return nil }
+        illustrations.keep(png, for: illustration)
         return png
     }
 

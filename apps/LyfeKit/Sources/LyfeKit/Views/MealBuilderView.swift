@@ -508,7 +508,6 @@ public struct LoggedMealView: View {
     }
 
     private var parts: [FoodDay.Entry] { meal.parts ?? [] }
-    private var estimating: Bool { parts.contains { $0.figures == .estimating } }
 
     public var body: some View {
         VStack(spacing: 0) {
@@ -582,14 +581,8 @@ public struct LoggedMealView: View {
         }
         .foregroundStyle(Poster.ink)
         .background(Poster.paper.ignoresSafeArea())
-        // While the model is at a photo, look again every few seconds.
-        .task(id: estimating) {
-            while estimating, !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(4))
-                guard !Task.isCancelled else { return }
-                await onReload()
-            }
-        }
+        // While a photo is with the model, or still to be drawn, look again.
+        .followingTheSpark(SparkWait(parts), reload: onReload)
         .confirmationDialog(
             takingOut.map { "Take \($0.title) out of \(meal.name)?" } ?? "", isPresented: takingOutShown,
             titleVisibility: .visible

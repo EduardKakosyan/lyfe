@@ -569,8 +569,9 @@ struct CapturesAgainstARealBackendTests {
             await model.reloadHome()
             entry = try #require(model.home?.food?.entries.first { $0.id == id })
         }
-        #expect(entry.illustrationID == id, "set LYFE_ILLUSTRATOR to the stand-in (see the README)")
-        let png = try #require(await model.mealIllustration(id))
+        let drawn = try #require(entry.illustration, "set LYFE_ILLUSTRATOR to the stand-in (see the README)")
+        #expect((drawn.meal, drawn.version > 0) == (id, true))
+        let png = try #require(await model.mealIllustration(drawn))
         #expect(png.starts(with: [0x89, 0x50, 0x4E, 0x47]))
 
         #expect(await model.correctEstimate(id, .portions(grams: [300, 120], oil: .nothing)) == nil)

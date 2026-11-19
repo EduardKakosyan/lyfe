@@ -281,10 +281,14 @@ public struct LyfeAPI: Sendable {
 
     /// A meal's photo drawn as a Poster illustration (a PNG), or nil while
     /// it has not been drawn.
-    public func foodIllustration(token: String, id: UUID) async throws -> Data? {
+    public func foodIllustration(token: String, _ illustration: Illustration) async throws -> Data? {
         do {
+            // The version is not read by the backend: it makes a drawing
+            // made again a different address, so nothing in between
+            // answers with the old one.
             return try await perform(
-                "GET", "v1/food/entries/\(id.uuidString.lowercased())/illustration", token: token, body: nil, timeout: 20)
+                "GET", "v1/food/entries/\(illustration.meal.uuidString.lowercased())/illustration", token: token,
+                body: nil, timeout: 20, query: [URLQueryItem(name: "v", value: String(illustration.version))])
         } catch LyfeAPIError.server(status: 404) {
             return nil
         }
@@ -408,9 +412,11 @@ public struct LyfeAPI: Sendable {
     }
 
     private func perform(
-        _ method: String, _ path: String, token: String?, body: Data?, timeout: TimeInterval
+        _ method: String, _ path: String, token: String?, body: Data?, timeout: TimeInterval,
+        query: [URLQueryItem] = []
     ) async throws -> Data {
-        var request = URLRequest(url: baseURL.appending(path: path))
+        let address = baseURL.appending(path: path)
+        var request = URLRequest(url: query.isEmpty ? address : address.appending(queryItems: query))
         request.httpMethod = method
         request.timeoutInterval = timeout
         request.setValue("application/json", forHTTPHeaderField: "Accept")

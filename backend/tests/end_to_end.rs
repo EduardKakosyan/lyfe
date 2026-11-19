@@ -2865,6 +2865,7 @@ async fn a_photo_meal_is_illustrated_after_its_estimate_without_holding_it_up(po
     let home = h.log_photo(&token, 21, "2026-11-17T23:00:00Z", "dinner", "stir fry, rice, some oil").await;
     let dinner = &home["food"]["entries"][0];
     assert_eq!((&dinner["photo"]["has_photo"], &dinner["photo"]["illustrated"]), (&json!(true), &json!(false)));
+    assert_eq!(dinner["photo"]["illustration_version"], Value::Null);
     assert_eq!(home["food"]["streak"]["state"], "kept");
     assert_eq!(h.illustration(Some(&token), 21).await.0, StatusCode::NOT_FOUND);
 
@@ -2886,12 +2887,13 @@ async fn a_photo_meal_is_illustrated_after_its_estimate_without_holding_it_up(po
     assert_eq!(asked[0]["id"], food_id(21));
     assert_eq!(asked[0]["jpeg"], jpeg_base64());
     let prompt = asked[0]["prompt"].as_str().unwrap();
-    assert!(prompt.starts_with("Minimal screen-print food poster of this meal: stir fry, rice, some oil. "), "{prompt}");
-    assert!(prompt.ends_with("centred on a plain off-white background, no text."), "{prompt}");
+    assert!(prompt.starts_with("Redraw this photo of stir fry, rice, some oil as a bold flat graphic illustration"), "{prompt}");
+    assert!(prompt.ends_with("Centred on a plain off-white background. No text."), "{prompt}");
 
     let (_, home) = h.get("/v1/home", Some(&token)).await;
     let dinner = &home["food"]["entries"][0];
     assert_eq!(dinner["photo"]["illustrated"], true);
+    assert!(dinner["photo"]["illustration_version"].as_i64().unwrap() > 0);
     // Drawing it changed nothing that counts.
     assert_eq!((&dinner["kcal"], &home["food"]["kcal"]), (&json!(578), &json!(578)));
 
@@ -2929,7 +2931,7 @@ async fn photos_logged_together_are_drawn_with_one_load_and_only_photos_are_draw
     let asked = drawer.asked();
     assert_eq!(asked.iter().map(|a| a["id"].as_str().unwrap()).collect::<Vec<_>>(), [food_id(21), food_id(22)]);
     // No line: the photo alone says what it is.
-    assert!(asked[1]["prompt"].as_str().unwrap().starts_with("Minimal screen-print food poster of the meal in this photo."));
+    assert!(asked[1]["prompt"].as_str().unwrap().starts_with("Redraw this photo of a meal as a bold flat"));
     let (_, home) = h.get("/v1/home", Some(&token)).await;
     let illustrated: Vec<_> = home["food"]["entries"]
         .as_array()
@@ -3041,4 +3043,61 @@ async fn a_photo_that_cannot_be_drawn_keeps_showing_the_photo(pool: PgPool) {
     assert_eq!((&lunch["photo"]["illustrated"], &lunch["kcal"]), (&json!(false), &json!(578)));
     assert_eq!(h.illustration(Some(&token), 21).await.0, StatusCode::NOT_FOUND);
     assert_eq!(h.get(&format!("/v1/food/entries/{}/photo", food_id(21)), Some(&token)).await.0, StatusCode::OK);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_photo_drawn_in_an_older_look_is_drawn_again(pool: PgPool) {
+    use lyfe_server::illustrator::Outcome;
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    let model = Model::start(&h, 72).await;
+    model.answers(STIR_FRY).await;
+    h.log_photo(&token, 21, "2026-11-17T16:00:00Z", "lunch", "pho").await;
+    h.log_photo(&token, 22, "2026-11-17T23:00:00Z", "dinner", "stir fry").await;
+    while model.estimate().await != lyfe_server::estimator::Outcome::Idle {}
+    let drawer = Drawer::start(&h, 72, &[]).await;
+    assert_eq!(drawer.draw().await, Outcome::Drew(2));
+    let version = |home: &Value, n: usize| home["food"]["entries"][n]["photo"]["illustration_version"].as_i64();
+    let (_, home) = h.get("/v1/home", Some(&token)).await;
+    let (lunch_first, dinner_first) = (version(&home, 0).unwrap(), version(&home, 1).unwrap());
+
+    // Drawn in the look of now: nothing to do when the server starts.
+    assert_eq!(db::redraw_older_looks(&h.state.pool).await.unwrap(), 0);
+    assert_eq!(drawer.draw().await, Outcome::Idle);
+
+    // The lunch as if drawn in the first look, some time ago.
+    sqlx::query("update food_photos set illustration_look = 1, illustration = '\\x89504e470d0a1a0a6f6c64'::bytea, illustrated_at = illustrated_at - interval '1 day' where entry_id = $1::uuid")
+        .bind(food_id(21))
+        .execute(&h.state.pool)
+        .await
+        .unwrap();
+    let (_, home) = h.get("/v1/home", Some(&token)).await;
+    let lunch_old = version(&home, 0).unwrap();
+    assert!(lunch_old < lunch_first);
+    assert_eq!(db::redraw_older_looks(&h.state.pool).await.unwrap(), 1);
+    assert_eq!(db::redraw_older_looks(&h.state.pool).await.unwrap(), 0);
+
+    // Until it is drawn again, the old drawing is still the one shown.
+    let (status, _, old) = h.illustration(Some(&token), 21).await;
+    assert_eq!((status, old.ends_with(b"old")), (StatusCode::OK, true));
+    // A try that fails leaves it there too.
+    let cannot = Drawer::start(&h, 72, &["--cannot-draw"]).await;
+    assert_eq!(cannot.draw().await, Outcome::Drew(0));
+    assert!(h.illustration(Some(&token), 21).await.2.ends_with(b"old"));
+
+    illustrations_due(&h.state.pool).await;
+    assert_eq!(drawer.draw().await, Outcome::Drew(1));
+    assert_eq!(drawer.asked().last().unwrap()["id"], food_id(21));
+    let (_, _, new) = h.illustration(Some(&token), 21).await;
+    assert!(!new.ends_with(b"old") && new.starts_with(b"\x89PNG"));
+    // Its version moved on, so the phone fetches it again; the dinner's did not.
+    let (_, home) = h.get("/v1/home", Some(&token)).await;
+    assert!(version(&home, 0).unwrap() > lunch_old);
+    assert_eq!(version(&home, 1), Some(dinner_first));
+    let look: i32 = sqlx::query_scalar("select illustration_look from food_photos where entry_id = $1::uuid")
+        .bind(food_id(21))
+        .fetch_one(&h.state.pool)
+        .await
+        .unwrap();
+    assert_eq!(look, lyfe_server::routines::illustration::LOOK);
 }

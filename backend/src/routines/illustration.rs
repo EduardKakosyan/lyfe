@@ -3,34 +3,46 @@
 //!
 //! Pure rules, no I/O; the running is in `crate::illustrator`. A photo
 //! meal's picture goes to FLUX.2 klein 4B on the Spark as the image to
-//! redraw, with the meal's one line in a fixed prompt that asks for a
-//! pictogram on off-white (ADR 0005). The program snaps what it draws to the
-//! five Poster colours, so the result sits on the app's paper without a
-//! seam. An illustration only ever adds to a meal: the meal is logged and
-//! counted without it, and the photo is shown until it comes.
+//! redraw, with the meal's one line in a fixed prompt (ADR 0005, and for
+//! the look ADR 0006): the meal as it is, in its own colours, with black
+//! ink outlines and only its dish in a Poster colour. The program sets the
+//! background to the app's paper, so the result sits on the screen without
+//! a box around it. An illustration only ever adds to a meal: the meal is
+//! logged and counted without it, and the photo is shown until it comes.
 
 use serde::{Deserialize, Serialize};
 
 /// Times a picture may fail to draw before lyfe stops trying; the photo
 /// is shown instead, as it is meanwhile.
 pub const MAX_TRIES: i32 = 3;
-/// The largest illustration taken back from the program, in bytes. A
-/// five-colour PNG of 1024 pixels square is a few hundred kB at most.
+/// The largest illustration taken back from the program, in bytes. One of
+/// 768 pixels square in 64 colours is about 100 kB.
 pub const MAX_PNG_BYTES: usize = 4 * 1024 * 1024;
 
-/// The prompt that goes with the photo: the round-two pictogram prompt the
-/// owner chose in the test on the Spark, with the meal's line in it.
+/// The look this prompt draws, counted up whenever the prompt or the
+/// program's finishing changes what a drawing looks like. Photos drawn in
+/// an earlier look are drawn again (see `db::redraw_older_looks`).
+pub const LOOK: i32 = 2;
+
+/// The prompt that goes with the photo, with the meal's line in it: the
+/// look the owner chose from two rounds on the Spark, on their own photos.
+/// It keeps the meal recognisable, where the first look, a pictogram in
+/// five colours, did not.
 pub fn prompt(note: &str) -> String {
     let what = describe(note);
     format!(
-        "Minimal screen-print food poster of {what}. Reduce the meal to a few large bold shapes that still read \
-         clearly as each ingredient, like a pictogram. Flat red-orange, cobalt blue, yellow, black and off-white \
-         only, no gradients, no outlines thinner than a marker, centred on a plain off-white background, no text."
+        "Redraw this photo of {what} as a bold flat graphic illustration with thick black ink outlines and flat \
+         colour fills, no gradients. The food and drink keep exactly their natural colours. Only the cup, plate or \
+         bowl changes colour: draw it in one flat poster colour, cobalt blue, red-orange or yellow, whichever \
+         stands out most against the food. Draw only the main dish and the food or drink in it, with the same \
+         shapes, proportions and viewpoint as the photo, so it is instantly recognisable. Leave out everything \
+         else: no table, tray, cutlery, glasses, shakers, napkins, phones or laptops. Centred on a plain off-white \
+         background. No text."
     )
 }
 
 /// The meal as the prompt names it: the owner's line, on one line and
-/// without its closing stop, or the photo alone when there is no line.
+/// without its closing stop, or just a meal when there is no line.
 fn describe(note: &str) -> String {
     let line: String = note
         .split_whitespace()
@@ -40,11 +52,7 @@ fn describe(note: &str) -> String {
         .filter(|c| !c.is_control())
         .collect();
     let line = line.trim_end_matches(['.', '!', '?', ',', ';', ':', ' ']).trim();
-    if line.is_empty() {
-        "the meal in this photo".into()
-    } else {
-        format!("this meal: {line}")
-    }
+    if line.is_empty() { "a meal".into() } else { line.to_string() }
 }
 
 /// What lyfe sends the program for one picture, as one line of JSON.
@@ -136,15 +144,16 @@ mod tests {
     #[test]
     fn the_prompt_names_the_meal_by_its_line() {
         let prompt = prompt("  stir fry,\n rice, some oil. ");
-        assert!(prompt.starts_with("Minimal screen-print food poster of this meal: stir fry, rice, some oil. Reduce"), "{prompt}");
-        assert!(prompt.contains("centred on a plain off-white background, no text."));
-        assert!(prompt.contains("Flat red-orange, cobalt blue, yellow, black and off-white only"));
+        assert!(prompt.starts_with("Redraw this photo of stir fry, rice, some oil as a bold flat graphic illustration"), "{prompt}");
+        assert!(prompt.contains("The food and drink keep exactly their natural colours."));
+        assert!(prompt.contains("Only the cup, plate or bowl changes colour"));
+        assert!(prompt.ends_with("Centred on a plain off-white background. No text."));
     }
 
     #[test]
     fn without_a_line_the_photo_alone_says_what_it_is() {
-        assert!(prompt("").starts_with("Minimal screen-print food poster of the meal in this photo. Reduce"));
-        assert!(prompt(" ... ").starts_with("Minimal screen-print food poster of the meal in this photo. Reduce"));
+        assert!(prompt("").starts_with("Redraw this photo of a meal as a bold flat"));
+        assert!(prompt(" ... ").starts_with("Redraw this photo of a meal as a bold flat"));
         assert!(!prompt("eggs\u{7}").contains('\u{7}'));
     }
 

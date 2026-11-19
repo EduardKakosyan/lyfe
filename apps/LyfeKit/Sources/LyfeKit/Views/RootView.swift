@@ -63,7 +63,7 @@ public struct RootView: View {
                             onTargets: { model.openTargets() }, onPhoto: { model.openPhotoMeal() },
                             onScan: { model.openScan() }, onBuild: { model.openMealBuilder(typing: $0) },
                             onMeal: { model.openMeal($0) }, onEstimate: { model.openEstimate($0) },
-                            onLabel: { model.openLabel(code: $0) })
+                            onLabel: { model.openLabel(code: $0) }, onReload: { await model.reloadHome() })
                     } else if model.screen == .progress, let home = model.home {
                         ProgressScreen(
                             weight: home.weight, today: home.today, unsent: model.unsentWeighIns.count,
@@ -76,7 +76,7 @@ public struct RootView: View {
             }
         }
         // Rows show a meal's illustration once drawn, fetched once.
-        .environment(\.mealIllustration, IllustrationSource { [model] id in await model.mealIllustration(id) })
+        .environment(\.mealIllustration, IllustrationSource { [model] in await model.mealIllustration($0) })
         // The Poster palette is fixed; it does not follow dark mode. The
         // lock is ink, so the clock and battery over it are drawn light.
         .preferredColorScheme(model.isLocked ? .dark : .light)
@@ -116,7 +116,10 @@ struct FoodFlowView: View {
             if let entry = model.home?.food?.entry(id) {
                 EstimateView(
                     entry: entry, inMeal: model.home?.food?.entries.contains { $0.id == id } != true,
-                    loadPhoto: { await model.mealPhoto(id) }, loadIllustration: { await model.mealIllustration(id) },
+                    loadPhoto: { await model.mealPhoto(id) }, loadIllustration: {
+                        guard let drawn = model.home?.food?.entry(id)?.illustration else { return nil }
+                        return await model.mealIllustration(drawn)
+                    },
                     onCorrect: { await model.correctEstimate(id, $0) },
                     onReload: { await model.reloadHome() }, onTakeBack: { await model.takeBackMeal(id) },
                     onClose: { model.closeFoodFlow() })
