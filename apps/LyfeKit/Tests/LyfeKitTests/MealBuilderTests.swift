@@ -3,6 +3,22 @@ import Testing
 
 @testable import LyfeKit
 
+
+@Test func weighedStapleKeepsMacrosWhenSavedAndReweighed() throws {
+    let pork = try #require(CommonIngredient.staples.first { $0.name.contains("Pork") })
+    let food = pork.weighed(150)
+    #expect(food.kcal == 214.5)
+    #expect(food.carbsG == 0)
+    #expect(food.fatG == 5.25)
+    let restored = try JSONDecoder().decode(Ingredient.self, from: JSONEncoder().encode(food))
+    var fields = TypedFields(restored)
+    fields.grams = "200"
+    let changed = try fields.read().get()
+    #expect(changed.fatG == 7)
+    #expect(changed.carbsG == 0)
+    #expect(FoodText.macros(carbs: [0, nil], fat: [nil, nil]) == "Carbs 0 g recorded · Fat —")
+}
+
 /// Meals built from parts, in exactly the shape the backend sends them: a
 /// breakfast of a scanned bar, a typed banana, a coffee typed whole and a
 /// photo, and a photo sent ahead of a meal still being built.

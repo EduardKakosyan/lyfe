@@ -34,6 +34,7 @@ public struct MealBuilderView: View {
     @State private var selected: UUID?
     @State private var grams = ""
     /// The "save for one tap" section, on a meal being logged.
+    @State private var browsing = false
     @State private var savingOpen = false
     @State private var note: String?
     @State private var busy: Busy?
@@ -98,8 +99,27 @@ public struct MealBuilderView: View {
                     if let part = draft.parts.first(where: { $0.id == selected }) {
                         change(part)
                     } else {
+                        Button {
+                            browsing.toggle()
+                            typing = false
+                        } label: {
+                            StripRow(left: "Find an ingredient", right: browsing ? "Close" : "Search →")
+                                .frame(minHeight: 44)
+                        }.buttonStyle(.plain)
+                        if browsing {
+                            IngredientPicker { food in
+                                guard draft.parts.count < MealDraft.maxParts else {
+                                    note = "A meal takes \(MealDraft.maxParts) parts at most."
+                                    return
+                                }
+                                onChange { $0.parts.append(MealPart(.food(food))) }
+                                browsing = false
+                                note = nil
+                            }
+                        }
                         AddPartButtons(onScan: onScan, onPhoto: onPhoto) {
                             typing.toggle()
+                            browsing = false
                             note = nil
                         }
                         if typing {
@@ -529,6 +549,7 @@ public struct LoggedMealView: View {
                         .padding(.bottom, -6)
                         .animation(.snappy, value: meal.kcal)
                         Text(FoodText.mealLine(meal)).posterLabel()
+                        Text(FoodText.macros(parts)).posterLabel()
                     }
                     .padding(.horizontal, Poster.margin)
                     .padding(.bottom, 12)
@@ -541,6 +562,7 @@ public struct LoggedMealView: View {
                         partRow(FoodText.captureRow(capture))
                         PosterRule(thickness: 1.5)
                     }
+                    IngredientPicker { food in Task { await onType(food) } }
                     AddPartButtons(onScan: onScan, onPhoto: onPhoto) {
                         typing.toggle()
                         note = nil
@@ -650,6 +672,8 @@ struct TypedFields: Equatable {
     /// Per 100 g when weighed; what it comes to when whole.
     var kcal = ""
     var protein = ""
+    var carbs = ""
+    var fat = ""
 
     init(whole: Bool = false) {
         self.whole = whole
@@ -658,6 +682,9 @@ struct TypedFields: Equatable {
     /// A food, back in the form to be changed.
     init(_ food: Ingredient) {
         name = food.name
+        let scale = food.grams.map { 100 / $0 } ?? 1
+        carbs = food.carbsG.map { FoodText.plain($0 * scale) } ?? ""
+        fat = food.fatG.map { FoodText.plain($0 * scale) } ?? ""
         switch food.quantity {
         case .weighed(let weight, let kcalPer100g, let proteinPer100g):
             grams = FoodText.plain(weight)
@@ -671,14 +698,28 @@ struct TypedFields: Equatable {
     }
 
     var isEmpty: Bool {
-        [name, grams, kcal, protein].allSatisfy { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        [name, grams, kcal, protein, carbs, fat].allSatisfy {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
     }
 
     /// The food typed, or the first thing wrong with it.
     func read() -> Result<Ingredient, FoodSlip> {
-        whole
+        let result =
+            whole
             ? FoodTyping.whole(name: name, kcal: kcal, protein: protein)
             : FoodTyping.ingredient(name: name, grams: grams, kcal: kcal, protein: protein)
+        return result.flatMap { ingredient in
+            var food = ingredient
+            let scale = food.grams.map { $0 / 100 } ?? 1
+            for (text, key) in [(carbs, \Ingredient.carbsG), (fat, \Ingredient.fatG)] where !text.isEmpty {
+                guard let value = FoodTyping.number(text), value <= (whole ? 1000 : 100) else {
+                    return .failure(FoodSlip("Check the carbs and fat, or leave them blank"))
+                }
+                food[keyPath: key] = value * scale
+            }
+            return .success(food)
+        }
     }
 }
 
@@ -722,8 +763,17 @@ struct TypedFieldsView: View {
                     LabeledField(label: "Weighed · g", text: $fields.grams, prompt: "80", numeric: true)
                         .focused($focus, equals: .first)
                     LabeledField(label: "kcal per 100 g", text: $fields.kcal, prompt: "379", numeric: true)
-                    LabeledField(label: "Protein per 100 g", text: $fields.protein, prompt: "13.2", numeric: true)
+                    LabeledField(
+                        label: "Protein per 100 g", text: $fields.protein, prompt: "13.2", numeric: true)
                 }
+            }
+            HStack(spacing: 6) {
+                LabeledField(
+                    label: fields.whole ? "Carbs · g" : "Carbs per 100 g", text: $fields.carbs,
+                    prompt: "Optional", numeric: true)
+                LabeledField(
+                    label: fields.whole ? "Fat · g" : "Fat per 100 g", text: $fields.fat, prompt: "Optional",
+                    numeric: true)
             }
             HStack(spacing: 6) {
                 FormButton(title: primary, filled: true, wide: true, action: onPrimary)
@@ -748,6 +798,8 @@ struct TypedFieldsView: View {
             fields.grams = ""
             fields.kcal = ""
             fields.protein = ""
+            fields.carbs = ""
+            fields.fat = ""
         } label: {
             Text(name)
                 .font(.system(size: 10, weight: .heavy))
@@ -809,7 +861,8 @@ struct PortionStepper: View {
                 .frame(minWidth: 30)
                 .contentTransition(.numericText())
             step("+", by: 1)
-            Text(portions == 1 ? "Portion" : "Portions").posterLabel().frame(width: 70, alignment: .leading)
+            Text(portions == 1 ? "Portion" : "Portions").posterLabel().frame(
+                width: 70, alignment: .leading)
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("The recipe makes \(portions) \(portions == 1 ? "portion" : "portions")")

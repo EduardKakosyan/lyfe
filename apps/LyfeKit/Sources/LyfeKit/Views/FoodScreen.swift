@@ -522,6 +522,20 @@ public enum FoodText {
         return (value < 0 ? "−" : "") + text
     }
 
+    static func macros(_ entries: [FoodDay.Entry]) -> String {
+        macros(carbs: entries.map(\.carbsG), fat: entries.map(\.fatG))
+    }
+
+    static func macros(carbs: [Double?], fat: [Double?]) -> String {
+        func figure(_ values: [Double?]) -> String {
+            let known = values.compactMap { $0 }
+            if values.isEmpty { return "0 g" }
+            if known.isEmpty { return "—" }
+            return "\(plain(known.reduce(0, +))) g" + (known.count < values.count ? " recorded" : "")
+        }
+        return "Carbs \(figure(carbs)) · Fat \(figure(fat))"
+    }
+
     /// Whole grams: "43".
     static func grams(_ value: Double) -> String {
         String(Int(value.rounded()))

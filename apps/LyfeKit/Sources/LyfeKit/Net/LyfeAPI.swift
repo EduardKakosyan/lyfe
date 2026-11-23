@@ -168,12 +168,14 @@ public struct LyfeAPI: Sendable {
         var proteinPer100g: Double?
         var kcal: Double?
         var proteinG: Double?
+        var carbsG: Double?
+        var fatG: Double?
         var estimated: Bool?
 
         // Spelled out: the encoder would not put the underscore before
         // the digits.
         enum CodingKeys: String, CodingKey {
-            case id, eatenAt, slot, partOf, name, code, grams, kcal, proteinG, estimated
+            case id, eatenAt, slot, partOf, name, code, grams, kcal, proteinG, estimated, carbsG, fatG
             case kcalPer100g = "kcal_per_100g"
             case proteinPer100g = "protein_per_100g"
         }
@@ -182,6 +184,8 @@ public struct LyfeAPI: Sendable {
 
         init(_ food: Ingredient) {
             name = food.name
+            carbsG = food.carbsG
+            fatG = food.fatG
             switch food.quantity {
             case .weighed(let grams, let kcalPer100g, let proteinPer100g):
                 self.grams = grams

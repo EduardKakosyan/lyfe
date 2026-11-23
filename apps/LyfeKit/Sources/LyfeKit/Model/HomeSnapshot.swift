@@ -205,6 +205,8 @@ public enum MealSlot: String, Codable, Sendable, CaseIterable {
 /// One thing that goes into a meal: weighed, with the figures from its
 /// label, or just what it comes to.
 public struct Ingredient: Codable, Equatable, Sendable {
+    public var carbsG: Double?
+    public var fatG: Double?
     public var name: String
     public var quantity: Quantity
     /// True for what a photo was estimated at: it stays an estimate
@@ -224,7 +226,7 @@ public struct Ingredient: Codable, Equatable, Sendable {
     // Spelled the way the decoder turns "kcal_per_100g" into a name: it
     // capitalises the letter after the digits.
     enum CodingKeys: String, CodingKey {
-        case name, grams, kcal, proteinG, estimated, code
+        case name, grams, kcal, proteinG, estimated, code, carbsG, fatG
         case kcalPer100g = "kcalPer100G"
         case proteinPer100g = "proteinPer100G"
     }
@@ -258,6 +260,8 @@ public struct Ingredient: Codable, Equatable, Sendable {
                 proteinG: try values.decode(Double.self, forKey: .proteinG))
         }
         estimated = try values.decodeIfPresent(Bool.self, forKey: .estimated) ?? false
+        carbsG = try values.decodeIfPresent(Double.self, forKey: .carbsG)
+        fatG = try values.decodeIfPresent(Double.self, forKey: .fatG)
         code = try values.decodeIfPresent(String.self, forKey: .code)
     }
 
@@ -274,6 +278,8 @@ public struct Ingredient: Codable, Equatable, Sendable {
             try values.encode(proteinG, forKey: .proteinG)
         }
         if estimated { try values.encode(true, forKey: .estimated) }
+        try values.encodeIfPresent(carbsG, forKey: .carbsG)
+        try values.encodeIfPresent(fatG, forKey: .fatG)
         try values.encodeIfPresent(code, forKey: .code)
     }
 
@@ -437,6 +443,8 @@ public struct FoodDay: Codable, Equatable, Sendable {
         /// Zero while its figures are not known.
         public var kcal: Int
         public var proteinG: Double
+        public var carbsG: Double?
+        public var fatG: Double?
         /// Missing in answers cached before photo and barcode meals existed.
         public var source: FoodSource?
         public var figures: Figures?
@@ -502,12 +510,17 @@ public struct FoodDay: Codable, Equatable, Sendable {
         /// where a photo gave it.
         public var asIngredient: Ingredient? {
             guard isKnown, from != .built else { return nil }
+            var food: Ingredient
             if let weighed {
-                return Ingredient(
+                food = Ingredient(
                     name: name, grams: weighed.grams, kcalPer100g: weighed.kcalPer100g,
                     proteinPer100g: weighed.proteinPer100g, code: barcode?.code)
+            } else {
+                food = Ingredient(name: name, kcal: Double(kcal), proteinG: proteinG, estimated: from == .photo)
             }
-            return Ingredient(name: name, kcal: Double(kcal), proteinG: proteinG, estimated: from == .photo)
+            food.carbsG = carbsG
+            food.fatG = fatG
+            return food
         }
     }
 
