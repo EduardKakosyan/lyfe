@@ -112,6 +112,14 @@ install -m 755 "$STAGE/lyfe-illustrator-setup" ~/bin/lyfe-illustrator-setup
 if [ ! -e ~/illustrator/ready ]; then
     echo "Meals are not illustrated yet: run ~/bin/lyfe-illustrator-setup once as lyfe (about 21 GB; see the README)."
 fi
+# Money. The access address is written once, by `lyfe-server money-connect`.
+MONEY_FILE=$(sed -n 's/^LYFE_SIMPLEFIN_ACCESS_FILE=//p' ~/.config/lyfe/lyfe.env | tail -1)
+if [ -z "$MONEY_FILE" ]; then
+    echo "Money is off: LYFE_SIMPLEFIN_ACCESS_FILE is not set in ~/.config/lyfe/lyfe.env (see the README)."
+elif [ ! -s "$MONEY_FILE" ]; then
+    echo "No bank is connected yet: make a setup token at SimpleFIN Bridge, then run"
+    echo "  set -a; . ~/.config/lyfe/lyfe.env; set +a; ~/bin/lyfe-server money-connect"
+fi
 cp "$STAGE/lyfe-backup.service" "$STAGE/lyfe-backup.timer" ~/.config/systemd/user/
 systemctl --user daemon-reload
 if BACKUP_MISSING=$(~/bin/lyfe-backup ready); then

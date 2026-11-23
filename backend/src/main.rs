@@ -8,12 +8,14 @@ use clap::{Parser, Subcommand};
 
 use lyfe_server::api::{self, AppState};
 use lyfe_server::auth::{self, SignInThrottle};
-use lyfe_server::config::{DatabaseConfig, GarminConfig, IllustrationConfig, PhotoConfig, ServeConfig};
+use lyfe_server::config::{DatabaseConfig, GarminConfig, IllustrationConfig, MoneyConfig, PhotoConfig, ServeConfig};
 use lyfe_server::db;
 use lyfe_server::estimator::Estimator;
 use lyfe_server::illustrator::Illustrator;
 use lyfe_server::garmin::sync::{parse_activity, Syncer};
 use lyfe_server::garmin::GarminClient;
+use lyfe_server::money::sync::Importer;
+use lyfe_server::money::{self, BridgeClient};
 use lyfe_server::push::apns::{Alert, ApnsClient};
 use lyfe_server::push::notifier::Notifier;
 use lyfe_server::routines::gym::{self, Week};
@@ -50,6 +52,25 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         days: i64,
     },
+    /// Connect lyfe to SimpleFIN Bridge: asks for a setup token made there
+    /// (typed hidden), trades it for the access address and writes that to
+    /// the access file. Done once; the banks themselves are connected at
+    /// the bridge.
+    MoneyConnect {
+        #[command(flatten)]
+        money: MoneyConfig,
+    },
+    /// Ask the bridge for the last week and print counts only. Touches no
+    /// database; use it to confirm the access file works. It uses one of
+    /// the day's requests.
+    MoneyCheck {
+        #[command(flatten)]
+        money: MoneyConfig,
+    },
+    /// Import accounts and transactions now, without waiting for the next
+    /// time one is due, and print counts only. It uses one of the day's
+    /// requests.
+    MoneyImport(Box<ServeConfig>),
     /// Read the Open Food Facts export (tab separated, unzipped) from
     /// standard input and make it the food database barcodes are looked up
     /// in, replacing the last one.
@@ -99,6 +120,9 @@ async fn main() -> anyhow::Result<()> {
         Command::GymWeeks(config) => gym_weeks(*config).await,
         Command::PushTest(config) => push_test(*config).await,
         Command::GarminCheck { garmin, days } => garmin_check(garmin, days).await,
+        Command::MoneyConnect { money } => money_connect(money).await,
+        Command::MoneyCheck { money } => money_check(money).await,
+        Command::MoneyImport(config) => money_import(*config).await,
         Command::ImportFoodDb { database } => import_food_db(database).await,
         Command::PhotoCheck { photo, jpeg, note } => photo_check(photo, jpeg, note).await,
         Command::IllustrationCheck { illustration, jpeg, note, out } => {
@@ -121,6 +145,17 @@ fn garmin_syncer(config: &ServeConfig, pool: &sqlx::PgPool) -> anyhow::Result<Ar
         garmin_client(&config.garmin)?,
         config.garmin.garmin_backfill_days,
         config.garmin.garmin_window_days,
+    )))
+}
+
+fn money_importer(config: &ServeConfig, pool: &sqlx::PgPool) -> anyhow::Result<Arc<Importer>> {
+    let client = config.money.simplefin_access_file.clone().map(BridgeClient::new).transpose()?;
+    Ok(Arc::new(Importer::new(
+        pool.clone(),
+        client,
+        config.timezone,
+        i64::from(config.money.money_backfill_days),
+        i64::from(config.money.money_window_days),
     )))
 }
 
@@ -199,6 +234,18 @@ async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         }
     };
 
+    let importer = money_importer(&config, &pool)?;
+    if importer.is_configured() {
+        tracing::info!(every_hours = config.money.money_sync_hours, "accounts and transactions are imported from SimpleFIN Bridge");
+    } else {
+        tracing::warn!("LYFE_SIMPLEFIN_ACCESS_FILE is not set; no accounts or transactions will be imported");
+    }
+    tokio::spawn(
+        importer
+            .clone()
+            .run_forever(Duration::from_secs(u64::from(config.money.money_sync_hours) * 3600)),
+    );
+
     let estimator_wake = Arc::new(tokio::sync::Notify::new());
     let illustrator_wake = Arc::new(tokio::sync::Notify::new());
     let estimator = Arc::new(
@@ -251,6 +298,8 @@ async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         estimate_range_pct: config.photo.photo_range_percent,
         estimator_wake,
         illustrator_wake,
+        money: importer,
+        money_currency: config.money.money_currency.clone(),
         now: Arc::new(Utc::now),
     };
     let listener = tokio::net::TcpListener::bind(config.listen_addr)
@@ -428,6 +477,96 @@ async fn garmin_check(config: GarminConfig, days: i64) -> anyhow::Result<()> {
     for ((year, week), count) in by_week {
         println!("  {year} week {week}: {count} activities");
     }
+    Ok(())
+}
+
+fn access_file(config: &MoneyConfig) -> anyhow::Result<std::path::PathBuf> {
+    config
+        .simplefin_access_file
+        .clone()
+        .context("set LYFE_SIMPLEFIN_ACCESS_FILE or pass --simplefin-access-file")
+}
+
+async fn money_connect(config: MoneyConfig) -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let path = access_file(&config)?;
+    if path.exists() {
+        bail!(
+            "{} already holds an access address; lyfe is connected. To start over, revoke it at the bridge and delete the file",
+            path.display()
+        );
+    }
+    // Opened before the token is spent, so a place that cannot be written
+    // does not cost a token. Only this account can read it.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("could not create {}", path.display()))?;
+    let token = if std::io::stdin().is_terminal() {
+        rpassword::prompt_password("SimpleFIN setup token (hidden): ")?
+    } else {
+        let mut line = String::new();
+        std::io::stdin().lock().read_line(&mut line)?;
+        line
+    };
+    let access = match money::claim(&token).await {
+        Ok(access) => access,
+        Err(error) => {
+            let _ = std::fs::remove_file(&path);
+            bail!("{error}");
+        }
+    };
+    file.write_all(access.as_bytes()).and_then(|()| file.sync_all()).with_context(|| {
+        format!("the token was spent but {} could not be written; revoke it at the bridge and make a new one", path.display())
+    })?;
+    println!("Connected. The access address is in {}.", path.display());
+    println!("Check it with `lyfe-server money-check`, then restart lyfe-server.");
+    Ok(())
+}
+
+async fn money_check(config: MoneyConfig) -> anyhow::Result<()> {
+    let client = BridgeClient::new(access_file(&config)?)?;
+    let now = Utc::now();
+    let set = client.accounts(now - chrono::Duration::days(7), now + chrono::Duration::days(1)).await?;
+    println!(
+        "The bridge returned {} accounts under {} connections ({} unreadable).",
+        set.accounts.len(),
+        set.connections.len(),
+        set.unreadable_accounts
+    );
+    for (index, account) in set.accounts.iter().enumerate() {
+        println!(
+            "  account {}: {} posted in the last week ({} unreadable), balance as of {}",
+            index + 1,
+            account.transactions.len(),
+            account.unreadable,
+            account.balance_at.format("%Y-%m-%d %H:%M UTC")
+        );
+    }
+    for trouble in &set.troubles {
+        println!("  the bridge says: {}", trouble.text);
+    }
+    Ok(())
+}
+
+async fn money_import(config: ServeConfig) -> anyhow::Result<()> {
+    let pool = db::connect(&config.database.database_url)
+        .await
+        .context("could not open the database")?;
+    let importer = money_importer(&config, &pool)?;
+    let Some(result) = importer.import_once(Utc::now()).await else {
+        bail!("set LYFE_SIMPLEFIN_ACCESS_FILE to the file `lyfe-server money-connect` wrote; see the README");
+    };
+    let report = result?;
+    println!(
+        "Imported {} accounts, asking the bridge {} time(s): {} posted transactions, {} new, {} changed by the bank, {} unreadable.",
+        report.accounts, report.requests, report.fetched, report.new, report.changed, report.unreadable
+    );
+    println!("{} entries were sorted again; the bridge reported {} problems.", report.resorted, report.troubles);
     Ok(())
 }
 

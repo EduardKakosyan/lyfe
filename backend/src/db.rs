@@ -7,6 +7,7 @@ use sqlx::Row;
 
 use uuid::Uuid;
 
+use crate::money::{self, ledger};
 use crate::routines::breath;
 use crate::routines::food::{self, Detail, Figures, Label, PhotoDetail, Quantity, Slot};
 use crate::routines::illustration;
@@ -1652,4 +1653,387 @@ pub async fn record_sync_failure(pool: &PgPool, source: &str, error: &str) -> sq
     .execute(pool)
     .await?;
     Ok(())
+}
+
+// --- Money ---------------------------------------------------------------
+
+/// A bank connection as the bridge names it, with what it last said is
+/// wrong: its code and its words. `today` dates a problem that starts now;
+/// one already known keeps the day it started.
+pub async fn upsert_money_connection(
+    conn: &mut sqlx::PgConnection,
+    connection: &money::Connection,
+    problem: Option<(&str, &str)>,
+    today: NaiveDate,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "insert into money_connections (id, name, problem_code, problem, problem_since)
+         values ($1, $2, $3, $4, case when $4::text is null then null else $5::date end)
+         on conflict (id) do update set
+            name = excluded.name, problem_code = excluded.problem_code, problem = excluded.problem,
+            problem_since = case when excluded.problem is null then null
+                                 else coalesce(money_connections.problem_since, excluded.problem_since) end,
+            seen_at = now()",
+    )
+    .bind(&connection.id)
+    .bind(&connection.name)
+    .bind(problem.map(|(code, _)| code))
+    .bind(problem.map(|(_, text)| text))
+    .bind(today)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// Stores an account's name and balance as the bank has them now, and
+/// returns lyfe's id for it. A new account that holds investments starts
+/// set aside; after that, whether it is set aside is the owner's to say
+/// and is left alone.
+pub async fn upsert_money_account(
+    conn: &mut sqlx::PgConnection,
+    account: &money::BankAccount,
+    problem: Option<&str>,
+) -> sqlx::Result<Uuid> {
+    sqlx::query_scalar(
+        "insert into money_accounts
+            (connection_id, provider_id, name, currency, balance_minor, available_minor, balance_at, problem, set_aside)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         on conflict (connection_id, provider_id) do update set
+            name = excluded.name, currency = excluded.currency, balance_minor = excluded.balance_minor,
+            available_minor = excluded.available_minor, balance_at = excluded.balance_at,
+            problem = excluded.problem, seen_at = now()
+         returning id",
+    )
+    .bind(&account.connection_id)
+    .bind(&account.id)
+    .bind(&account.name)
+    .bind(&account.currency)
+    .bind(account.balance_minor)
+    .bind(account.available_minor)
+    .bind(account.balance_at)
+    .bind(problem)
+    .bind(account.holds_investments)
+    .fetch_one(conn)
+    .await
+}
+
+/// What storing one transaction came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stored {
+    New,
+    /// The bank changed something about one already stored.
+    Changed,
+    Same,
+}
+
+/// Stores one posted transaction under the bank's id for it, so the same
+/// days imported again refresh a row and never add one. A new entry is
+/// read from its sign until it is sorted with the rest; one already stored
+/// keeps how it was sorted, unless the bank changed its amount to the other
+/// sign, which starts it again.
+pub async fn upsert_money_entry(
+    conn: &mut sqlx::PgConnection,
+    account_id: Uuid,
+    transaction: &money::BankTransaction,
+    day: NaiveDate,
+) -> sqlx::Result<Stored> {
+    let payee_key = ledger::payee_key(&transaction.payee, &transaction.description);
+    let kind = if transaction.amount_minor < 0 { ledger::Kind::Expense } else { ledger::Kind::Income };
+    let row = sqlx::query(
+        "with before as (
+            select day, posted_at, amount_minor, payee, description, memo
+            from money_entries where account_id = $1 and provider_id = $2
+         ), stored as (
+            insert into money_entries
+                (account_id, provider_id, day, posted_at, amount_minor, payee, description, memo, payee_key, kind)
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            on conflict (account_id, provider_id) do update set
+                day = excluded.day, posted_at = excluded.posted_at, amount_minor = excluded.amount_minor,
+                payee = excluded.payee, description = excluded.description, memo = excluded.memo,
+                payee_key = excluded.payee_key,
+                kind = case when (money_entries.amount_minor < 0) = (excluded.amount_minor < 0)
+                            then money_entries.kind else excluded.kind end,
+                category = case when (money_entries.amount_minor < 0) = (excluded.amount_minor < 0)
+                                then money_entries.category end,
+                sorted_by = case when (money_entries.amount_minor < 0) = (excluded.amount_minor < 0)
+                                 then money_entries.sorted_by else 'auto' end,
+                peer_id = case when (money_entries.amount_minor < 0) = (excluded.amount_minor < 0)
+                               then money_entries.peer_id end
+            returning 1
+         )
+         select (select count(*) from before) = 0 as new,
+                exists (select 1 from before
+                        where (day, posted_at, amount_minor, payee, description, memo)
+                              is distinct from ($3::date, $4::timestamptz, $5::bigint, $6::text, $7::text, $8::text)) as changed
+         from stored",
+    )
+    .bind(account_id)
+    .bind(&transaction.id)
+    .bind(day)
+    .bind(transaction.posted_at)
+    .bind(transaction.amount_minor)
+    .bind(&transaction.payee)
+    .bind(&transaction.description)
+    .bind(&transaction.memo)
+    .bind(&payee_key)
+    .bind(kind.as_str())
+    .fetch_one(conn)
+    .await?;
+    Ok(match (row.get::<bool, _>("new"), row.get::<bool, _>("changed")) {
+        (true, _) => Stored::New,
+        (false, true) => Stored::Changed,
+        (false, false) => Stored::Same,
+    })
+}
+
+/// Records what the bridge said about the import as a whole.
+pub async fn set_money_notes(conn: &mut sqlx::PgConnection, notes: &[String]) -> sqlx::Result<()> {
+    sqlx::query("update money_notes set notes = $1").bind(notes).execute(conn).await?;
+    Ok(())
+}
+
+fn read_sorting(r: &sqlx::postgres::PgRow) -> ledger::Sorting {
+    ledger::Sorting {
+        kind: ledger::Kind::parse(r.get("kind")).unwrap_or(ledger::Kind::Transfer),
+        category: r.get("category"),
+        sorted_by: ledger::SortedBy::parse(r.get("sorted_by")).unwrap_or(ledger::SortedBy::Auto),
+        peer_id: r.get("peer_id"),
+    }
+}
+
+/// Sorts every entry again by the rules as they now stand and writes what
+/// changed. Returns how many entries that was. Run inside the transaction
+/// that changed an entry, a rule or an account.
+pub async fn resort_money(conn: &mut sqlx::PgConnection) -> sqlx::Result<u64> {
+    let rules: std::collections::HashMap<String, ledger::Rule> =
+        sqlx::query("select payee_key, kind, category from money_rules")
+            .fetch_all(&mut *conn)
+            .await?
+            .into_iter()
+            .filter_map(|r| {
+                let rule = match (r.get::<&str, _>("kind"), r.get::<Option<String>, _>("category")) {
+                    ("spending", Some(category)) => ledger::Rule::Spending(category),
+                    ("income", _) => ledger::Rule::Income,
+                    ("transfer", _) => ledger::Rule::Transfer,
+                    _ => return None,
+                };
+                Some((r.get("payee_key"), rule))
+            })
+            .collect();
+    let rows: Vec<ledger::Row> = sqlx::query(
+        "select e.id, e.account_id, a.set_aside, a.currency, e.day, e.amount_minor, e.payee_key,
+                e.kind, e.category, e.sorted_by, e.peer_id
+         from money_entries e join money_accounts a on a.id = e.account_id
+         order by e.day, e.id",
+    )
+    .fetch_all(&mut *conn)
+    .await?
+    .iter()
+    .map(|r| ledger::Row {
+        id: r.get("id"),
+        account_id: r.get("account_id"),
+        set_aside: r.get("set_aside"),
+        currency: r.get("currency"),
+        day: r.get("day"),
+        amount_minor: r.get("amount_minor"),
+        payee_key: r.get("payee_key"),
+        sorting: read_sorting(r),
+    })
+    .collect();
+    let sorted = ledger::sort_all(&rows, &rules);
+    let mut changed = 0;
+    for (row, sorting) in rows.iter().zip(sorted) {
+        if row.sorting == sorting {
+            continue;
+        }
+        sqlx::query("update money_entries set kind = $2, category = $3, sorted_by = $4, peer_id = $5 where id = $1")
+            .bind(row.id)
+            .bind(sorting.kind.as_str())
+            .bind(&sorting.category)
+            .bind(sorting.sorted_by.as_str())
+            .bind(sorting.peer_id)
+            .execute(&mut *conn)
+            .await?;
+        changed += 1;
+    }
+    Ok(changed)
+}
+
+const MONEY_ENTRY_COLUMNS: &str = "e.id, e.day, e.amount_minor, a.currency, e.payee, e.description, e.payee_key,
+    a.name as account, a.set_aside, e.kind, e.category, e.sorted_by, e.peer_id";
+
+fn read_money_entry(r: &sqlx::postgres::PgRow) -> ledger::Entry {
+    ledger::Entry {
+        id: r.get("id"),
+        day: r.get("day"),
+        amount_minor: r.get("amount_minor"),
+        currency: r.get("currency"),
+        payee: r.get("payee"),
+        description: r.get("description"),
+        payee_key: r.get("payee_key"),
+        account: r.get("account"),
+        set_aside: r.get("set_aside"),
+        sorting: read_sorting(r),
+    }
+}
+
+/// Entries that count on the days from `from` to `to`, both included.
+pub async fn money_entries_between(pool: &PgPool, from: NaiveDate, to: NaiveDate) -> sqlx::Result<Vec<ledger::Entry>> {
+    let rows = sqlx::query(&format!(
+        "select {MONEY_ENTRY_COLUMNS} from money_entries e join money_accounts a on a.id = e.account_id
+         where e.day between $1 and $2"
+    ))
+    .bind(from)
+    .bind(to)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(read_money_entry).collect())
+}
+
+pub async fn money_entry(conn: &mut sqlx::PgConnection, id: Uuid) -> sqlx::Result<Option<ledger::Entry>> {
+    let row = sqlx::query(&format!(
+        "select {MONEY_ENTRY_COLUMNS} from money_entries e join money_accounts a on a.id = e.account_id
+         where e.id = $1 for update of e"
+    ))
+    .bind(id)
+    .fetch_optional(conn)
+    .await?;
+    Ok(row.as_ref().map(read_money_entry))
+}
+
+/// Where the stored entries lie around the days from `from` to `to`.
+pub async fn money_history(pool: &PgPool, from: NaiveDate, to: NaiveDate) -> sqlx::Result<ledger::History> {
+    let row = sqlx::query(
+        "select min(day) as first, max(day) filter (where day < $1) as before, min(day) filter (where day > $2) as after
+         from money_entries",
+    )
+    .bind(from)
+    .bind(to)
+    .fetch_one(pool)
+    .await?;
+    Ok(ledger::History { first: row.get("first"), before: row.get("before"), after: row.get("after") })
+}
+
+/// The accounts the bridge still lists, a bank at a time. One whose
+/// connection was deleted at the bridge drops out; what was imported from
+/// it stays in its months.
+pub async fn money_accounts(pool: &PgPool) -> sqlx::Result<Vec<ledger::Account>> {
+    let rows = sqlx::query(
+        "select a.id, a.name, c.name as connection, a.currency, a.balance_minor, a.available_minor, a.balance_at,
+                a.set_aside, a.problem
+         from money_accounts a join money_connections c on c.id = a.connection_id
+         where c.seen_at >= (select max(seen_at) from money_connections) - interval '1 hour'
+         order by a.set_aside, c.name, a.name, a.id",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| ledger::Account {
+            id: r.get("id"),
+            name: r.get("name"),
+            connection: r.get("connection"),
+            currency: r.get("currency"),
+            balance_minor: r.get("balance_minor"),
+            available_minor: r.get("available_minor"),
+            balance_at: r.get("balance_at"),
+            set_aside: r.get("set_aside"),
+            problem: r.get("problem"),
+        })
+        .collect())
+}
+
+/// A connection the bridge says is broken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrokenConnection {
+    pub name: String,
+    pub code: String,
+    pub problem: String,
+    pub since: NaiveDate,
+}
+
+pub async fn broken_money_connections(pool: &PgPool) -> sqlx::Result<Vec<BrokenConnection>> {
+    let rows = sqlx::query(
+        "select name, problem_code, problem, problem_since from money_connections
+         where problem is not null and seen_at >= (select max(seen_at) from money_connections) - interval '1 hour'
+         order by problem_since, name",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| BrokenConnection {
+            name: r.get("name"),
+            code: r.get("problem_code"),
+            problem: r.get("problem"),
+            since: r.get("problem_since"),
+        })
+        .collect())
+}
+
+pub async fn money_notes(pool: &PgPool) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar("select notes from money_notes").fetch_optional(pool).await.map(Option::unwrap_or_default)
+}
+
+/// True once anything has been imported.
+pub async fn has_money(pool: &PgPool) -> sqlx::Result<bool> {
+    sqlx::query_scalar("select exists (select 1 from money_accounts)").fetch_one(pool).await
+}
+
+/// Says what one entry is, on the owner's word, whatever its payee's rule.
+pub async fn sort_money_entry(conn: &mut sqlx::PgConnection, id: Uuid, sorting: &ledger::Sorting) -> sqlx::Result<()> {
+    sqlx::query("update money_entries set kind = $2, category = $3, sorted_by = 'owner', peer_id = null where id = $1")
+        .bind(id)
+        .bind(sorting.kind.as_str())
+        .bind(&sorting.category)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// Takes the owner's word off one entry, so the rules decide it again.
+pub async fn unsort_money_entry(conn: &mut sqlx::PgConnection, id: Uuid) -> sqlx::Result<()> {
+    sqlx::query(
+        "update money_entries set kind = case when amount_minor < 0 then 'expense' else 'income' end,
+                category = null, sorted_by = 'auto', peer_id = null
+         where id = $1 and sorted_by = 'owner'",
+    )
+    .bind(id)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// Says what a payee is from now on, or with `None` forgets what was said.
+pub async fn set_money_rule(conn: &mut sqlx::PgConnection, payee_key: &str, rule: Option<&ledger::Rule>) -> sqlx::Result<()> {
+    let Some(rule) = rule else {
+        sqlx::query("delete from money_rules where payee_key = $1").bind(payee_key).execute(conn).await?;
+        return Ok(());
+    };
+    let (kind, category) = match rule {
+        ledger::Rule::Spending(category) => ("spending", Some(category.as_str())),
+        ledger::Rule::Income => ("income", None),
+        ledger::Rule::Transfer => ("transfer", None),
+    };
+    sqlx::query(
+        "insert into money_rules (payee_key, kind, category) values ($1, $2, $3)
+         on conflict (payee_key) do update set kind = excluded.kind, category = excluded.category, set_at = now()",
+    )
+    .bind(payee_key)
+    .bind(kind)
+    .bind(category)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// Sets an account aside or brings it back. False when there is no such
+/// account.
+pub async fn set_money_account_aside(conn: &mut sqlx::PgConnection, id: Uuid, set_aside: bool) -> sqlx::Result<bool> {
+    let result = sqlx::query("update money_accounts set set_aside = $2 where id = $1")
+        .bind(id)
+        .bind(set_aside)
+        .execute(conn)
+        .await?;
+    Ok(result.rows_affected() == 1)
 }

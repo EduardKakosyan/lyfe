@@ -15,11 +15,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
+mod money;
 mod progress;
 
 use crate::auth::{self, SignInThrottle};
 use crate::db;
 use crate::garmin::sync::{Syncer, SOURCE as GARMIN};
+use crate::money::sync::Importer;
 use crate::routines::breath::{self, BreathRules};
 use crate::routines::food::{self, FoodDay, Slot};
 use crate::routines::photo::{self, Oil};
@@ -56,6 +58,11 @@ pub struct AppState {
     /// Wakes the illustrator when a photo can be drawn: it arrives, or the
     /// built meal it is a part of does.
     pub illustrator_wake: Arc<tokio::sync::Notify>,
+    /// Imports accounts and transactions from the bridge.
+    pub money: Arc<Importer>,
+    /// The currency money is totalled in, when set; otherwise the one most
+    /// accounts are in.
+    pub money_currency: Option<String>,
     pub now: Clock,
 }
 
@@ -85,6 +92,9 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/food/products/{code}", get(find_product).put(set_product))
         .route("/v1/food/meals/{id}", put(save_meal).delete(remove_meal))
         .route("/v1/food/targets", put(set_food_targets))
+        .route("/v1/money", get(money::month))
+        .route("/v1/money/entries/{id}/sort", post(money::sort))
+        .route("/v1/money/accounts/{id}", put(money::set_account))
         .with_state(state)
 }
 
@@ -262,6 +272,9 @@ struct HomeResponse {
     breath: BreathWeek,
     weight: WeightTrend,
     food: FoodDay,
+    /// Missing while no bank is set up and nothing was ever imported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    money: Option<money::Glance>,
     sources: Sources,
     notifications: Notifications,
 }
@@ -378,6 +391,7 @@ async fn home_now(state: &AppState) -> Result<HomeResponse, ApiError> {
         breath: breath_week(state, today).await?,
         weight: weight::trend(&state.weight, today, &db::weigh_ins(&state.pool, state.timezone).await?),
         food: food_day(state, now, today).await?,
+        money: money::glance(state).await?,
         sources: Sources { garmin: garmin_status(state).await? },
         notifications: Notifications { server_ready: state.push_ready },
     })

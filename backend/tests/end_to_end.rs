@@ -73,7 +73,7 @@ async fn harness_at(pool: PgPool, now: &str, with_key: bool) -> Harness {
     let now = at(now);
     let state = AppState {
         pool: pool.clone(),
-        syncer: Arc::new(Syncer::new(pool, client, 180, 30)),
+        syncer: Arc::new(Syncer::new(pool.clone(), client, 180, 30)),
         throttle: Arc::new(SignInThrottle::new()),
         timezone: chrono_tz::America::Puerto_Rico,
         gym_rules: Arc::new(GymRules {
@@ -90,6 +90,8 @@ async fn harness_at(pool: PgPool, now: &str, with_key: bool) -> Harness {
         estimate_range_pct: 35,
         estimator_wake: Arc::new(tokio::sync::Notify::new()),
         illustrator_wake: Arc::new(tokio::sync::Notify::new()),
+        money: Arc::new(lyfe_server::money::sync::Importer::new(pool.clone(), None, chrono_tz::America::Puerto_Rico, 180, 14)),
+        money_currency: None,
         now: Arc::new(move || now),
     };
     Harness { state, garmin, _key_dir: key_dir }
@@ -3139,4 +3141,515 @@ async fn a_photo_drawn_in_an_older_look_is_drawn_again(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(look, lyfe_server::routines::illustration::LOOK);
+}
+
+// --- Money ---------------------------------------------------------------
+
+use lyfe_server::money::sync::{ImportError, ImportReport, Importer};
+use lyfe_server::money::{BridgeClient, BridgeError};
+
+/// A harness whose importer asks `bridge` instead of SimpleFIN Bridge.
+async fn banked(pool: PgPool) -> (Harness, MockServer) {
+    let mut h = harness(pool.clone()).await;
+    let bridge = MockServer::start().await;
+    let access_file = h._key_dir.0.join("simplefin-access");
+    let address = format!("{}/simplefin\n", bridge.uri().replace("http://", "http://lyfe:se%40cret@"));
+    std::fs::write(&access_file, address).unwrap();
+    let client = BridgeClient::new(access_file).unwrap();
+    h.state.money = Arc::new(Importer::new(pool, Some(client), h.state.timezone, 180, 14));
+    (h, bridge)
+}
+
+/// Serves `body` as the bridge's whole answer until replaced, to a caller
+/// who gives the user name and password from the access address.
+async fn bridge_answers(bridge: &MockServer, body: Value) {
+    use base64::Engine;
+    bridge.reset().await;
+    let basic = base64::engine::general_purpose::STANDARD.encode("lyfe:se@cret");
+    Mock::given(method("GET"))
+        .and(path("/simplefin/accounts"))
+        .and(header("Authorization", format!("Basic {basic}")))
+        .and(query_param("version", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(bridge)
+        .await;
+}
+
+async fn bridge_fails(bridge: &MockServer, status: u16) {
+    bridge.reset().await;
+    Mock::given(method("GET")).respond_with(ResponseTemplate::new(status)).mount(bridge).await;
+}
+
+/// Banks give a date and no time, which arrives as noon UTC.
+fn noon(day: &str) -> i64 {
+    at(&format!("{day}T12:00:00Z")).timestamp()
+}
+
+fn posted(id: &str, day: &str, amount: &str, payee: &str) -> Value {
+    json!({"id": id, "posted": noon(day), "transacted_at": noon(day), "amount": amount,
+           "description": format!("POS {} 0031", payee.to_uppercase()), "payee": payee, "memo": ""})
+}
+
+fn bank_account(id: &str, name: &str, balance: &str, transactions: Vec<Value>) -> Value {
+    json!({"id": id, "name": name, "conn_id": "CON-1", "currency": "CAD", "balance": balance,
+           "balance-date": noon("2026-11-17"), "transactions": transactions})
+}
+
+fn bridge_answer(accounts: Vec<Value>, errlist: Value) -> Value {
+    json!({
+        "errlist": errlist,
+        "connections": [{"conn_id": "CON-1", "name": "First Bank", "org_id": "ORG-1", "sfin_url": "https://bridge.invalid"}],
+        "accounts": accounts,
+    })
+}
+
+/// A chequing account and a card, with a card payment between them.
+fn chequing_and_card() -> (Vec<Value>, Vec<Value>) {
+    (
+        vec![
+            posted("T1", "2026-11-03", "-45.10", "Corner Grocer"),
+            posted("T2", "2026-11-10", "-500.00", "Card payment"),
+            posted("T3", "2026-11-14", "3000.00", "Employer"),
+            posted("T4", "2026-10-20", "-900.00", "Landlord"),
+        ],
+        vec![
+            posted("C1", "2026-11-02", "-80.00", "Noodle Bar"),
+            posted("C2", "2026-11-12", "500.00", "Payment received"),
+            posted("C3", "2026-11-05", "-39.90", "Corner Grocer #2"),
+        ],
+    )
+}
+
+fn two_accounts(chequing: Vec<Value>, card: Vec<Value>) -> Value {
+    bridge_answer(
+        vec![bank_account("ACT-1", "Chequing", "2500.00", chequing), bank_account("ACT-2", "Card", "-120.00", card)],
+        json!([]),
+    )
+}
+
+impl Harness {
+    async fn import(&self) -> ImportReport {
+        self.import_at((self.state.now)()).await.expect("import succeeds")
+    }
+
+    async fn import_at(&self, now: DateTime<Utc>) -> Result<ImportReport, ImportError> {
+        self.state.money.import_once(now).await.expect("the bridge is configured")
+    }
+
+    async fn money(&self, token: &str) -> Value {
+        let (status, body) = self.get("/v1/money", Some(token)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body
+    }
+
+    /// Sorts the entry called `name` and answers with the month.
+    async fn sort(&self, token: &str, name: &str, body: Value) -> (StatusCode, Value) {
+        let money = self.money(token).await;
+        let id = entry_named(&money, name)["id"].as_str().unwrap().to_string();
+        self.post(&format!("/v1/money/entries/{id}/sort"), Some(token), Some(body)).await
+    }
+}
+
+fn entry_named<'a>(money: &'a Value, name: &str) -> &'a Value {
+    money["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == name)
+        .unwrap_or_else(|| panic!("no entry called {name} in {}", money["entries"]))
+}
+
+fn category(money: &Value, name: &str) -> Value {
+    money["categories"].as_array().unwrap().iter().find(|c| c["name"] == name).cloned().unwrap_or(Value::Null)
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_month_of_spending_is_imported_and_a_card_payment_is_not_spent_twice(pool: PgPool) {
+    let (h, bridge) = banked(pool).await;
+    let token = h.signed_in().await;
+    let (chequing, card) = chequing_and_card();
+    bridge_answers(&bridge, two_accounts(chequing, card)).await;
+
+    let report = h.import().await;
+    assert_eq!((report.accounts, report.new, report.changed, report.unreadable), (2, 7, 0, 0));
+
+    let (status, _) = h.get("/v1/money", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let money = h.money(&token).await;
+    assert_eq!((&money["month"], &money["current"], &money["currency"]), (&json!("2026-11"), &json!(true), &json!("CAD")));
+    // The groceries twice and the noodles; not the 500 that paid the card.
+    assert_eq!(money["spent_minor"], 4510 + 8000 + 3990);
+    assert_eq!(money["unsorted_minor"], 16500);
+    assert_eq!(money["income_minor"], 300000);
+    // Three things bought and the pay, which is waiting to be called income.
+    assert_eq!(money["to_sort"], 4);
+    assert_eq!(money["categories"], json!([]));
+    assert_eq!(money["entries"].as_array().unwrap().len(), 6);
+    for half in ["Card payment", "Payment received"] {
+        let entry = entry_named(&money, half);
+        assert_eq!((&entry["kind"], &entry["sorted_by"], &entry["to_sort"]), (&json!("transfer"), &json!("match"), &json!(false)));
+    }
+    assert_eq!(
+        entry_named(&money, "Corner Grocer #2"),
+        &json!({"id": entry_named(&money, "Corner Grocer #2")["id"], "day": "2026-11-05", "name": "Corner Grocer #2",
+                "amount_minor": -3990, "currency": "CAD", "kind": "expense", "category": null, "sorted_by": "auto",
+                "to_sort": true, "has_payee": true, "account": "Card"})
+    );
+    // What is in the bank less what is owed on the card.
+    assert_eq!((&money["everyday_minor"], &money["set_aside_minor"]), (&json!(238000), &json!(0)));
+    let accounts = money["accounts"].as_array().unwrap();
+    assert_eq!(accounts.len(), 2);
+    assert_eq!(
+        (&accounts[0]["name"], &accounts[0]["connection"], &accounts[0]["balance_minor"], &accounts[0]["stale"]),
+        (&json!("Card"), &json!("First Bank"), &json!(-12000), &json!(false))
+    );
+    assert_eq!(accounts[0]["balance_at"], "2026-11-17T12:00:00Z");
+    assert_eq!((&money["problems"], &money["source"]["state"]), (&json!([]), &json!("ok")));
+    // October is there to step back to, but it is a part month and is not compared.
+    assert_eq!((&money["earlier"], &money["later"], &money["previous"]), (&json!("2026-10"), &json!(null), &json!(null)));
+    assert_eq!(money["category_names"].as_array().unwrap().len(), 12);
+
+    let (status, october) = h.get("/v1/money?month=2026-10", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!((&october["spent_minor"], &october["current"], &october["later"]), (&json!(90000), &json!(false), &json!("2026-11")));
+    let (status, _) = h.get("/v1/money?month=october", Some(&token)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Home carries the little it shows.
+    let (_, home) = h.get("/v1/home", Some(&token)).await;
+    assert_eq!(
+        home["money"],
+        json!({"month": "2026-11", "currency": "CAD", "spent_minor": 16500, "to_sort": 4, "problem": null,
+               "last_success_at": home["money"]["last_success_at"]})
+    );
+    assert!(home["money"]["last_success_at"].is_string());
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_payee_is_sorted_once_and_stays_sorted(pool: PgPool) {
+    let (h, bridge) = banked(pool).await;
+    let token = h.signed_in().await;
+    let (mut chequing, mut card) = chequing_and_card();
+    bridge_answers(&bridge, two_accounts(chequing.clone(), card.clone())).await;
+    h.import().await;
+
+    let (status, _) = h.post(&format!("/v1/money/entries/{}/sort", food_id(1)), None, Some(json!({"to": "Fun"}))).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = h.post(&format!("/v1/money/entries/{}/sort", food_id(1)), Some(&token), Some(json!({"to": "Fun"}))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    for wrong in [json!({"to": "Nonsense"}), json!({"to": "groceries"}), json!({"to": "income"}), json!({"to": "Fun", "month": "soon"})] {
+        let (status, body) = h.sort(&token, "Corner Grocer", wrong.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{wrong} {body}");
+    }
+
+    // Said once of the grocer, it holds for both of its entries, whichever account.
+    let (status, money) = h.sort(&token, "Corner Grocer", json!({"to": "Groceries"})).await;
+    assert_eq!(status, StatusCode::OK, "{money}");
+    assert_eq!(category(&money, "Groceries"), json!({"name": "Groceries", "spent_minor": 8500, "entries": 2}));
+    assert_eq!(entry_named(&money, "Corner Grocer #2")["sorted_by"], "rule");
+    assert_eq!((&money["to_sort"], &money["unsorted_minor"], &money["spent_minor"]), (&json!(2), &json!(8000), &json!(16500)));
+    let (_, money) = h.sort(&token, "Noodle Bar", json!({"to": "Eating out"})).await;
+    let (_, money) = (money, h.sort(&token, "Employer", json!({"to": "income"})).await.1);
+    assert_eq!((&money["to_sort"], &money["unsorted_minor"], &money["income_minor"]), (&json!(0), &json!(0), &json!(300000)));
+
+    // One entry can be said to be something else than its payee usually is.
+    let (_, money) = h.sort(&token, "Corner Grocer #2", json!({"to": "Other", "only_this": true})).await;
+    assert_eq!(entry_named(&money, "Corner Grocer #2")["sorted_by"], "owner");
+    assert_eq!(category(&money, "Groceries")["spent_minor"], 4510);
+    assert_eq!(category(&money, "Other")["spent_minor"], 3990);
+
+    // New entries from a payee already sorted need nothing, and money back
+    // from it comes off its category.
+    chequing.push(posted("T9", "2026-11-16", "-10.00", "Corner Grocer"));
+    card.push(posted("C9", "2026-11-16", "5.00", "CORNER GROCER #7"));
+    bridge_answers(&bridge, two_accounts(chequing.clone(), card.clone())).await;
+    let report = h.import().await;
+    assert_eq!((report.requests, report.new, report.changed), (1, 2, 0));
+    let money = h.money(&token).await;
+    assert_eq!(category(&money, "Groceries"), json!({"name": "Groceries", "spent_minor": 4510 + 1000 - 500, "entries": 3}));
+    assert_eq!(entry_named(&money, "CORNER GROCER #7")["kind"], "refund");
+    assert_eq!((&money["to_sort"], &money["spent_minor"]), (&json!(0), &json!(16500 + 1000 - 500)));
+
+    // The same answer again adds nothing; an amount the bank corrected is
+    // corrected here and keeps its category.
+    assert_eq!(h.import().await.new, 0);
+    chequing[0] = posted("T1", "2026-11-03", "-50.10", "Corner Grocer");
+    bridge_answers(&bridge, two_accounts(chequing, card)).await;
+    let report = h.import().await;
+    assert_eq!((report.new, report.changed), (0, 1));
+    let money = h.money(&token).await;
+    assert_eq!(entry_named(&money, "Corner Grocer")["category"], "Groceries");
+    assert_eq!(category(&money, "Groceries")["spent_minor"], 5010 + 1000 - 500);
+    assert_eq!(money["entries"].as_array().unwrap().len(), 8);
+
+    // Saying one half of a transfer is spending frees the other half, and
+    // taking that back pairs them again.
+    let (_, money) = h.sort(&token, "Card payment", json!({"to": "Other", "only_this": true})).await;
+    assert_eq!((&entry_named(&money, "Card payment")["kind"], &entry_named(&money, "Payment received")["kind"]), (&json!("expense"), &json!("income")));
+    assert_eq!(entry_named(&money, "Payment received")["to_sort"], true);
+    let (_, money) = h.sort(&token, "Card payment", json!({"to": "unsorted", "only_this": true})).await;
+    assert_eq!(entry_named(&money, "Card payment")["sorted_by"], "match");
+    assert_eq!(entry_named(&money, "Payment received")["sorted_by"], "match");
+
+    // Taking back what was said of a payee leaves all of it to sort again,
+    // except the one entry sorted by itself.
+    let (_, money) = h.sort(&token, "Corner Grocer", json!({"to": "unsorted"})).await;
+    assert_eq!(category(&money, "Groceries"), Value::Null);
+    assert_eq!(category(&money, "Other")["spent_minor"], 3990);
+    assert_eq!(money["to_sort"], 3);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn nothing_in_an_account_set_aside_counts_as_spending(pool: PgPool) {
+    let (h, bridge) = banked(pool).await;
+    let token = h.signed_in().await;
+    let chequing = vec![posted("T1", "2026-11-05", "-200.00", "To savings"), posted("T2", "2026-11-06", "-12.00", "Noodle Bar")];
+    let savings = vec![
+        posted("S1", "2026-11-06", "200.00", "Deposit"),
+        posted("S2", "2026-11-10", "1.20", "Interest"),
+        posted("S3", "2026-11-11", "-50.00", "Fund purchase"),
+    ];
+    let mut dollars = bank_account("ACT-3", "Dollars", "40.00", vec![posted("U1", "2026-11-07", "-9.00", "Bookshop")]);
+    dollars["currency"] = json!("USD");
+    // An account the bank lists holdings for is an investment account.
+    let mut brokerage = bank_account("ACT-4", "Brokerage", "20000.00", vec![posted("B1", "2026-11-08", "-700.00", "Fund purchase")]);
+    brokerage["holdings"] = json!([{"id": "H1", "symbol": "XYZ", "shares": "10"}]);
+    bridge_answers(
+        &bridge,
+        bridge_answer(
+            vec![
+                bank_account("ACT-1", "Chequing", "1000.00", chequing),
+                bank_account("ACT-2", "Savings", "9000.00", savings),
+                dollars,
+                brokerage,
+            ],
+            json!([]),
+        ),
+    )
+    .await;
+    h.import().await;
+
+    // Until the owner says so, lyfe cannot know the savings from an everyday account.
+    let money = h.money(&token).await;
+    // The brokerage it can tell by its holdings, and sets aside from the start.
+    assert_eq!((&money["spent_minor"], &money["to_sort"]), (&json!(1200 + 5000), &json!(4)));
+    assert_eq!((&money["everyday_minor"], &money["set_aside_minor"]), (&json!(1000000), &json!(2000000)));
+    let brokerage = money["accounts"].as_array().unwrap().iter().find(|a| a["name"] == "Brokerage").unwrap();
+    assert_eq!(brokerage["set_aside"], true);
+    // The account in another currency is listed and left out of every total.
+    assert_eq!(money["currency"], "CAD");
+    assert_eq!(entry_named(&money, "Bookshop")["currency"], "USD");
+
+    let savings_id = money["accounts"].as_array().unwrap().iter().find(|a| a["name"] == "Savings").unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let uri = format!("/v1/money/accounts/{savings_id}");
+    let (status, _) = h.put(&uri, None, json!({"set_aside": true})).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = h.put(&format!("/v1/money/accounts/{}", food_id(1)), Some(&token), json!({"set_aside": true})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, money) = h.put(&uri, Some(&token), json!({"set_aside": true})).await;
+    assert_eq!(status, StatusCode::OK, "{money}");
+    assert_eq!((&money["spent_minor"], &money["income_minor"]), (&json!(1200), &json!(0)));
+    // The noodles and the bookshop are left to sort; nothing in the savings is.
+    assert_eq!(money["to_sort"], 2);
+    assert_eq!((&money["everyday_minor"], &money["set_aside_minor"]), (&json!(100000), &json!(2900000)));
+    assert_eq!(entry_named(&money, "Fund purchase")["kind"], "transfer");
+    assert_eq!(money["accounts"].as_array().unwrap().last().unwrap()["name"], "Savings");
+
+    // The owner can still say what something in it is.
+    let (_, money) = h.sort(&token, "Interest", json!({"to": "income"})).await;
+    assert_eq!(money["income_minor"], 120);
+    let (_, money) = h.put(&uri, Some(&token), json!({"set_aside": false})).await;
+    assert_eq!(money["spent_minor"], 1200 + 5000);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_bank_to_sign_in_to_again_is_shown_and_prompted_for_once(pool: PgPool) {
+    let (h, bridge) = banked(pool).await;
+    let token = h.signed_in().await;
+    register_device(&h, &token).await;
+    let apple = MockServer::start().await;
+    apple_answers(&apple, "dev", 200, None).await;
+    let notifier = notifier(&h, &apple);
+    let (chequing, card) = chequing_and_card();
+    let healthy = two_accounts(chequing, card);
+    bridge_answers(&bridge, healthy.clone()).await;
+    h.import().await;
+    assert_eq!(notifier.money((h.state.now)()).await.unwrap(), lyfe_server::push::notifier::Outcome::NothingDue);
+
+    let mut broken = healthy.clone();
+    broken["errlist"] = json!([
+        {"code": "con.auth", "msg": "Sign in\nagain to continue", "conn_id": "CON-1"},
+        {"code": "act.missingdata", "msg": "Some transactions are missing", "account_id": "ACT-2"},
+        {"code": "gen.api", "msg": "You are asking too often"},
+    ]);
+    bridge_answers(&bridge, broken.clone()).await;
+    assert_eq!(h.import().await.troubles, 3);
+    let money = h.money(&token).await;
+    assert_eq!(
+        money["problems"],
+        json!([
+            {"text": "First Bank: Sign in again to continue", "reconnect": true},
+            {"text": "You are asking too often", "reconnect": false},
+        ])
+    );
+    let card = money["accounts"].as_array().unwrap().iter().find(|a| a["name"] == "Card").unwrap();
+    assert_eq!(card["problem"], "Some transactions are missing");
+    // What was imported before is still there.
+    assert_eq!(money["spent_minor"], 16500);
+    let (_, home) = h.get("/v1/home", Some(&token)).await;
+    assert_eq!(home["money"]["problem"], "First Bank: Sign in again to continue");
+    // What the bridge says in passing is for Money, not for Home.
+    let mut chatty = healthy.clone();
+    chatty["errlist"] = json!([{"code": "gen.api", "msg": "You are asking too often"}]);
+    bridge_answers(&bridge, chatty).await;
+    h.import().await;
+    assert_eq!(h.money(&token).await["problems"], json!([{"text": "You are asking too often", "reconnect": false}]));
+    let (_, home) = h.get("/v1/home", Some(&token)).await;
+    assert_eq!(home["money"]["problem"], Value::Null);
+    bridge_answers(&bridge, broken.clone()).await;
+    h.import().await;
+
+    // 03:00 in San Juan is no time to say so; 11:00 is, once.
+    use lyfe_server::push::notifier::Outcome as Told;
+    assert_eq!(notifier.money(at("2026-11-17T07:00:00Z")).await.unwrap(), Told::Quiet);
+    match notifier.money((h.state.now)()).await.unwrap() {
+        Told::Sent { title, body, devices } => {
+            assert_eq!((title.as_str(), devices), ("Sign in to a bank again", 1));
+            assert!(body.starts_with("First Bank has stopped"), "{body}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(notifier.money((h.state.now)()).await.unwrap(), Told::AlreadySent);
+    // Still broken the next day: the same break, not a new one.
+    h.import_at(at("2026-11-18T15:00:00Z")).await.unwrap();
+    assert_eq!(notifier.money(at("2026-11-18T15:00:00Z")).await.unwrap(), Told::AlreadySent);
+
+    // Mended, the problem goes; broken again later, it is said again.
+    bridge_answers(&bridge, healthy).await;
+    h.import_at(at("2026-11-19T15:00:00Z")).await.unwrap();
+    assert_eq!(h.money(&token).await["problems"], json!([]));
+    assert_eq!(notifier.money(at("2026-11-19T15:00:00Z")).await.unwrap(), Told::NothingDue);
+    bridge_answers(&bridge, broken).await;
+    h.import_at(at("2026-11-20T15:00:00Z")).await.unwrap();
+    assert!(matches!(notifier.money(at("2026-11-20T15:00:00Z")).await.unwrap(), Told::Sent { .. }));
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_failed_import_is_reported_and_what_was_imported_stays(pool: PgPool) {
+    let (h, bridge) = banked(pool).await;
+    let token = h.signed_in().await;
+    let (chequing, card) = chequing_and_card();
+    bridge_answers(&bridge, two_accounts(chequing, card)).await;
+    h.import().await;
+
+    for (status, error) in [(403, BridgeError::AccessRejected), (402, BridgeError::PaymentDue), (503, BridgeError::Status(503))] {
+        bridge_fails(&bridge, status).await;
+        match h.import_at((h.state.now)()).await {
+            Err(ImportError::Bridge(found)) => assert_eq!(found, error),
+            other => panic!("{other:?}"),
+        }
+        let money = h.money(&token).await;
+        assert_eq!(money["source"]["state"], "failing");
+        assert_eq!(money["problems"][0], json!({"text": format!("The last import failed: {error}."), "reconnect": false}));
+        assert_eq!(money["spent_minor"], 16500);
+    }
+    // An answer that is not what the bridge sends is refused whole.
+    bridge_answers(&bridge, json!({"oops": true})).await;
+    assert!(matches!(h.import_at((h.state.now)()).await, Err(ImportError::Bridge(BridgeError::BadResponse))));
+    // Wrong credentials never reach an answer.
+    bridge.reset().await;
+    assert!(matches!(h.import_at((h.state.now)()).await, Err(ImportError::Bridge(BridgeError::Status(404)))));
+    assert_eq!(h.money(&token).await["entries"].as_array().unwrap().len(), 6);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn the_bridge_is_asked_sparingly(pool: PgPool) {
+    let (h, bridge) = banked(pool).await;
+    let now = (h.state.now)();
+    let every = std::time::Duration::from_secs(6 * 3600);
+    let asked = |request: &wiremock::Request, name: &str| -> i64 {
+        request.url.query_pairs().find(|(key, _)| key == name).unwrap().1.parse().unwrap()
+    };
+
+    // The first import reaches back a stretch at a time while there is anything older.
+    let (chequing, card) = chequing_and_card();
+    bridge_answers(&bridge, two_accounts(chequing, card)).await;
+    let report = h.state.money.import_if_due(now, every).await.unwrap().unwrap();
+    assert_eq!((report.requests, report.new), (4, 7));
+    let requests = bridge.received_requests().await.unwrap();
+    let day = 86400;
+    assert_eq!(
+        requests.iter().map(|r| (now.timestamp() - asked(r, "start-date")) / day).collect::<Vec<_>>(),
+        vec![44, 89, 134, 179]
+    );
+    assert_eq!(asked(&requests[0], "end-date"), now.timestamp() + day);
+    assert_eq!(asked(&requests[1], "end-date"), asked(&requests[0], "start-date"));
+    // No stretch is longer than the bridge likes to answer for.
+    assert!(requests.iter().all(|r| asked(r, "end-date") - asked(r, "start-date") <= 45 * day));
+
+    // Asked again too soon, nothing goes out. (The attempt is stamped by
+    // the database's clock, so it is put on this test's clock first.)
+    sqlx::query("update source_sync set last_attempt_at = $1 where source = 'simplefin'")
+        .bind(now)
+        .execute(&h.state.pool)
+        .await
+        .unwrap();
+    assert!(h.state.money.import_if_due(now + chrono::Duration::hours(5), every).await.is_none());
+    assert_eq!(bridge.received_requests().await.unwrap().len(), 4);
+
+    // When it is due, one request for the last two weeks.
+    let later = now + chrono::Duration::hours(7);
+    let report = h.state.money.import_if_due(later, every).await.unwrap().unwrap();
+    assert_eq!((report.requests, report.new), (1, 0));
+    let requests = bridge.received_requests().await.unwrap();
+    assert_eq!((later.timestamp() - asked(&requests[4], "start-date")) / day, 14);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_bank_with_nothing_older_is_not_asked_for_more(pool: PgPool) {
+    let (h, bridge) = banked(pool).await;
+    bridge_answers(&bridge, bridge_answer(vec![bank_account("ACT-1", "Chequing", "10.00", vec![])], json!([]))).await;
+    let report = h.import().await;
+    assert_eq!((report.requests, report.accounts, report.fetched), (1, 1, 0));
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn without_a_bank_the_server_still_answers(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    let (_, home) = h.get("/v1/home", Some(&token)).await;
+    assert!(home.get("money").is_none());
+    let money = h.money(&token).await;
+    assert_eq!((&money["source"]["state"], &money["entries"], &money["accounts"]), (&json!("not_configured"), &json!([]), &json!([])));
+    assert_eq!((&money["spent_minor"], &money["problems"]), (&json!(0), &json!([])));
+    assert!(h.state.money.import_once((h.state.now)()).await.is_none());
+}
+
+#[tokio::test]
+async fn a_setup_token_is_traded_once_for_the_access_address() {
+    use base64::Engine;
+    let bridge = MockServer::start().await;
+    let token = base64::engine::general_purpose::STANDARD.encode(format!("{}/simplefin/claim/abc123", bridge.uri()));
+    let access = format!("{}/simplefin", bridge.uri().replace("http://", "http://lyfe:secret@"));
+    Mock::given(method("POST"))
+        .and(path("/simplefin/claim/abc123"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!("{access}\n")))
+        .up_to_n_times(1)
+        .mount(&bridge)
+        .await;
+    // Pasted with a line break in it, as a long token often is.
+    let (first, second) = token.split_at(20);
+    assert_eq!(lyfe_server::money::claim(&format!(" {first}\n{second} ")).await.as_deref(), Ok(access.as_str()));
+    assert!(lyfe_server::money::is_access_address(&access));
+
+    // Used already: the bridge refuses it, and lyfe says to make a new one.
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(403)).mount(&bridge).await;
+    assert_eq!(lyfe_server::money::claim(&token).await, Err(BridgeError::TokenRejected));
+    // An answer that is not an access address is not kept.
+    bridge.reset().await;
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_string("welcome")).mount(&bridge).await;
+    assert_eq!(lyfe_server::money::claim(&token).await, Err(BridgeError::BadResponse));
 }

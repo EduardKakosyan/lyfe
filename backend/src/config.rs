@@ -45,6 +45,43 @@ pub struct GarminConfig {
 }
 
 #[derive(Debug, Clone, Args)]
+pub struct MoneyConfig {
+    /// File holding the access address SimpleFIN Bridge issued (written by
+    /// `lyfe-server money-connect`). Without it the server runs and imports
+    /// no accounts or transactions.
+    #[arg(long, env = "LYFE_SIMPLEFIN_ACCESS_FILE")]
+    pub simplefin_access_file: Option<PathBuf>,
+
+    /// Hours between imports. The bridge refreshes about once a day and
+    /// allows about 24 requests a day, so there is nothing to gain from
+    /// asking often.
+    #[arg(long, env = "LYFE_MONEY_SYNC_HOURS", default_value_t = 6, value_parser = clap::value_parser!(u32).range(1..=168))]
+    pub money_sync_hours: u32,
+
+    /// Days of history asked for on the first import, as far as the banks
+    /// have them: at most 180, in four requests.
+    #[arg(long, env = "LYFE_MONEY_BACKFILL_DAYS", default_value_t = 180, value_parser = clap::value_parser!(u32).range(1..=180))]
+    pub money_backfill_days: u32,
+
+    /// Days re-read on every later import, so a transaction that posted
+    /// late or was changed by the bank is still picked up.
+    #[arg(long, env = "LYFE_MONEY_WINDOW_DAYS", default_value_t = 14, value_parser = clap::value_parser!(u32).range(1..=44))]
+    pub money_window_days: u32,
+
+    /// The currency totals are in, as a three-letter code. Unset, it is
+    /// the one most accounts are in.
+    #[arg(long, env = "LYFE_MONEY_CURRENCY", value_parser = parse_currency)]
+    pub money_currency: Option<String>,
+}
+
+fn parse_currency(text: &str) -> Result<String, String> {
+    let code = text.trim().to_ascii_uppercase();
+    (code.len() == 3 && code.chars().all(|c| c.is_ascii_uppercase()))
+        .then_some(code)
+        .ok_or_else(|| "use a three-letter currency code".to_string())
+}
+
+#[derive(Debug, Clone, Args)]
 pub struct PushConfig {
     /// The key Apple issued for sending notifications (a `.p8` file from
     /// the developer account). Without it the server runs and sends none.
@@ -180,6 +217,9 @@ pub struct ServeConfig {
 
     #[command(flatten)]
     pub push: PushConfig,
+
+    #[command(flatten)]
+    pub money: MoneyConfig,
 
     #[command(flatten)]
     pub photo: PhotoConfig,

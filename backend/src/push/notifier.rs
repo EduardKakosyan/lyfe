@@ -14,6 +14,11 @@
 //! Food logging is a streak by the day, so its prompt is by the day too:
 //! once, from a set time on, when a streak is alive and nothing has been
 //! logged yet today.
+//!
+//! Money has no streak. Its one prompt is for a bank that has stopped
+//! sending transactions until the owner signs in to it again at the
+//! bridge: once for each time that happens, since nothing else would say
+//! that the month on screen has quietly stopped filling.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,6 +29,7 @@ use sqlx::PgPool;
 use super::apns::{Alert, ApnsClient, Environment, PushError};
 use crate::db::{self, PushTarget};
 use crate::garmin::sync::Syncer;
+use crate::money::Trouble;
 use crate::routines::breath;
 use crate::routines::food::{self, FoodSettings};
 use crate::routines::gym::{self, GymRules};
@@ -32,6 +38,10 @@ use crate::routines::weight::{self, WeightSettings};
 
 /// What a weigh-in prompt is recorded as, once sent for a day.
 const WEIGH_IN_KIND: &str = "weigh_in";
+
+/// What a prompt to sign in to a bank again is recorded as, once sent for
+/// the day the connection broke.
+const RECONNECT_KIND: &str = "money_reconnect";
 
 /// How fresh the Garmin data must be for a prompt to be trusted.
 const FRESH_ENOUGH: Duration = Duration::from_secs(120);
@@ -193,6 +203,50 @@ impl Notifier {
         Ok(Outcome::Sent { title: alert.title, body: alert.body, devices })
     }
 
+    /// Sends the prompt to sign in to a bank again: once for each time a
+    /// connection breaks that way, inside the daytime window.
+    pub async fn money(&self, now: DateTime<Utc>) -> sqlx::Result<Outcome> {
+        let local = now.with_timezone(&self.timezone);
+        if local.hour() < self.from_hour || local.hour() >= self.until_hour {
+            return Ok(Outcome::Quiet);
+        }
+        let broken: Vec<_> = db::broken_money_connections(&self.pool)
+            .await?
+            .into_iter()
+            .filter(|connection| Trouble::needs_reconnecting(&connection.code))
+            .collect();
+        if broken.is_empty() {
+            return Ok(Outcome::NothingDue);
+        }
+        let mut unsent = None;
+        for connection in &broken {
+            if !db::notification_sent(&self.pool, RECONNECT_KIND, connection.since).await? {
+                unsent = Some(connection);
+                break;
+            }
+        }
+        let Some(connection) = unsent else {
+            return Ok(Outcome::AlreadySent);
+        };
+        let targets = db::push_targets(&self.pool).await?;
+        if targets.is_empty() {
+            return Ok(Outcome::NoDevices);
+        }
+        let alert = Alert {
+            title: "Sign in to a bank again".to_string(),
+            body: format!("{} has stopped sending transactions. Reconnect it at SimpleFIN Bridge.", connection.name),
+            collapse_id: RECONNECT_KIND.to_string(),
+            expires_at: self.window_end(local.date_naive(), now),
+            category: None,
+        };
+        let devices = self.deliver(&targets, &alert, now).await;
+        if devices == 0 {
+            return Ok(Outcome::Undelivered);
+        }
+        db::record_notification(&self.pool, RECONNECT_KIND, connection.since, &alert.title, &alert.body).await?;
+        Ok(Outcome::Sent { title: alert.title, body: alert.body, devices })
+    }
+
     fn local_to_utc(&self, local: NaiveDateTime) -> Option<DateTime<Utc>> {
         self.timezone.from_local_datetime(&local).earliest().map(|at| at.with_timezone(&Utc))
     }
@@ -308,6 +362,12 @@ impl Notifier {
                 Ok(Outcome::Undelivered) => tracing::warn!("the food-logging prompt was due but reached no device"),
                 Ok(_) => {}
                 Err(error) => tracing::error!(%error, "could not check for the food-logging prompt"),
+            }
+            match self.money(now).await {
+                Ok(Outcome::Sent { devices, .. }) => tracing::info!(devices, "bank reconnect prompt sent"),
+                Ok(Outcome::Undelivered) => tracing::warn!("the bank reconnect prompt was due but reached no device"),
+                Ok(_) => {}
+                Err(error) => tracing::error!(%error, "could not check for the bank reconnect prompt"),
             }
             match self.tick(now).await {
                 Ok(Outcome::Sent { title, devices, .. }) => {
