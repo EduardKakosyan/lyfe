@@ -1121,6 +1121,44 @@ async fn a_breath_session_belongs_to_the_owners_day(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn progress_requires_complete_logs_and_explicit_approval(pool: PgPool) {
+    let h = harness(pool.clone()).await;
+    let token = h.signed_in().await;
+    sqlx::raw_sql("insert into food_targets values ('2026-10-01',2000,100,now());
+      insert into trend_goal values(true,0,'2026-10-01');
+      insert into confirmed_food_days select date '2026-11-17'-i from generate_series(1,13) i;
+      insert into food_entries(id,eaten_at,slot,name,servings,kcal,protein_dg,source)
+        select gen_random_uuid(), timestamptz '2026-11-17 12:00Z'-i*interval '1 day','lunch','test',1,2000,1000,'typed' from generate_series(1,14) i;
+      insert into weigh_ins(id,measured_at,grams,unit) select gen_random_uuid(),timestamptz '2026-11-17 12:00Z'-i*interval '1 day',80000-i*100,'kg' from generate_series(1,21) i;").execute(&pool).await.unwrap();
+    let approve = json!({"kind":"approve","day":"2026-11-17","kcal":1900});
+    assert_eq!(h.post("/v1/progress",Some(&token),Some(approve.clone())).await.0,StatusCode::BAD_REQUEST);
+    sqlx::query("insert into confirmed_food_days values('2026-11-03')").execute(&pool).await.unwrap();
+    let (_, home) = h.get("/v1/home",Some(&token)).await;
+    assert_eq!(home["progress"]["proposed_kcal"],1900);
+    assert_eq!(h.post("/v1/progress",Some(&token),Some(approve.clone())).await.0,StatusCode::OK);
+    assert_eq!(h.post("/v1/progress",Some(&token),Some(approve)).await.0,StatusCode::BAD_REQUEST);
+    let target:(i32,i32)=sqlx::query_as("select kcal,protein_g from food_targets where effective_on='2026-11-17'").fetch_one(&pool).await.unwrap();
+    assert_eq!(target,(1900,100));
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn progress_captures_survive_retries(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    for (field, input) in [
+        ("pools", json!({"kind":"pool","day":"2026-11-17","id":uuid::Uuid::from_u128(1),"metres":25})),
+        ("tapes", json!({"kind":"tape","day":"2026-11-17","id":uuid::Uuid::from_u128(2),"height":180,"waist":90,"neck":40})),
+    ] {
+        for _ in 0..2 {
+            let (status, home) = h.post("/v1/progress", Some(&token), Some(input.clone())).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(home["progress"][field].as_array().unwrap().len(), 1);
+            if field == "tapes" { assert_eq!(home["progress"]["tape_due"], false); }
+        }
+    }
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
 async fn a_session_cut_short_counts_and_an_abandoned_one_does_not(pool: PgPool) {
     let h = harness(pool).await;
     let token = h.signed_in().await;

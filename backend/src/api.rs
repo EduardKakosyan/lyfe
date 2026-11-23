@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
+mod progress;
 
 use crate::auth::{self, SignInThrottle};
 use crate::db;
@@ -66,6 +67,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/sync", post(sync_now))
         .route("/v1/push-token", post(set_push_token))
         .route("/v1/home", get(home))
+        .route("/v1/progress", post(progress::record))
         .route("/v1/breath/sessions", post(record_breath_session))
         .route("/v1/weigh-ins", post(record_weigh_in))
         .route("/v1/food/entries", post(record_food_entry))
@@ -251,6 +253,7 @@ mod seconds {
 
 #[derive(Serialize)]
 struct HomeResponse {
+    progress: progress::Progress,
     #[serde(serialize_with = "seconds::required")]
     generated_at: DateTime<Utc>,
     today: NaiveDate,
@@ -360,6 +363,7 @@ async fn home_now(state: &AppState) -> Result<HomeResponse, ApiError> {
     let streak = gym::streak(&state.gym_rules, today, &activities);
     let done = sessions.len() as u32;
     Ok(HomeResponse {
+        progress: progress::snapshot(state, today).await?,
         generated_at: now,
         today,
         week,
