@@ -4,9 +4,13 @@ Status: written 2026-11-17, updated 2026-11-19. Steps 1 and 2 are built and runn
 
 ## What the first version is
 
+Step 8 update (local build, not installed): Progress now includes pool distance, tape estimates, holds, gym weeks and weight. Pool and tape entry currently require a connection. The tape reminder is on Progress, not a push. The owner can set a weekly weight trend and confirm completed food days. A proposal requires three non-overlapping seven-day averages (at least three mornings each), two changes missing the goal on the same side by more than 0.25 percentage points, and 14 confirmed days with known intake under unchanged settings. Approval changes calories by 100 from today and leaves protein alone. The phone walkthrough and deployment are outstanding.
+
+Money update (2026-11-23, built and tested on this Mac): money moved ahead of study once a provider was confirmed (ADR 0007). Accounts and posted transactions are imported from the banks through SimpleFIN Bridge by the backend itself, which replaces the trial script and its separate database. Money shows a month's spending across every account by category, with the entries behind it and the accounts; a card payment is paired with its other half and left out; an entry is sorted by the owner once for its payee; savings and investments are set aside. It was tried in the simulator against a local backend and a stand-in bridge: a month imported, entries sorted from the black bar, and the month redrawn. It is installed on the Spark, where the first real import brought back about six months of posted transactions in four requests, and on the phone. Its check on the real phone (sorting a month, and its figures set against the statements) is still to do. Bills, what is left until payday, what the investments hold and card rewards are not built.
+
 An iPhone app in the Poster style that keeps three routines going: gym, breath training and food logging. It shows streaks with a recovery rule, pushes breath-hold progression, holds you to calorie and protein targets, and takes as little typing as possible. The backend runs on the Spark and is reached over Tailscale.
 
-Not in the first version: study sessions, automatic bank sync, a watch app.
+Not in the first version: study sessions, a watch app.
 
 ## How the work is cut
 
@@ -23,6 +27,7 @@ Each step below works end to end, from capture to a screen you can look at, befo
 | 7 | See an illustration appear on each photo meal | 6 |
 | 8 | Approve target changes, enter pool distance and tape measurements, and see the full Progress screen | 3, 4, 5 |
 | 9 | Use the same data from the Mac, and let an AI assistant read and act through MCP | 1 to 8 |
+| 10 | See a month's spending across every account by category, without typing any of it | 1, and the banks connected at SimpleFIN Bridge |
 
 ## The steps
 
@@ -43,6 +48,8 @@ Each step below works end to end, from capture to a screen you can look at, befo
 **8. Targets, pool, tape, Progress.** lyfe proposes a calorie target change only when weigh-ins are sufficient, the trend has been off for two weeks and logs are complete, and you approve it. One-number pool entry. Tape measurement every two weeks with a body-fat estimate. Progress screen with holds, gym weeks and weight.
 
 **9. Mac and MCP.** A Mac app sharing the Swift code, and an MCP server exposing the same operations the apps use, with the same permission checks. This delivers the "usable by me and by an AI" boundary from discovery.
+
+**10. Money.** Backend: a job that asks SimpleFIN Bridge for balances and posted transactions a few times a day and stores them under the bank's own ids; the rules for what an entry is (an expense, a refund, money in, money moved) as one tested module, with card payments paired and kept out of spending; the owner's word on a payee kept and applied to every entry from it. App: the Money screen with the month's figure, categories, entries and accounts, the sorting screen, and a strip on Home. Check: connect the banks, and a month's spending by category matches the statements, with no card payment counted.
 
 ## Rules that apply to every step
 

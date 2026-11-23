@@ -1,6 +1,6 @@
 # lyfe
 
-lyfe is a private app that keeps one person's routines going.
+lyfe is a private app that keeps one person's routines going and shows them where their money went.
 
 ## Language
 
@@ -58,3 +58,43 @@ _Avoid_: Goal, budget, limit
 The mean of the day's weights over the last seven days that have one, given once at least three do. It is the weight trend; a single morning's reading is not.
 _Avoid_: Weight trend line (as a separate figure), moving average
 
+
+**Bridge**:
+SimpleFIN Bridge, the outside service the owner connects their banks to. It holds the bank sign-ins and hands lyfe a read-only view of the accounts. lyfe asks it; it never calls lyfe.
+_Avoid_: Aggregator (as a term in lyfe), bank API, sync provider
+
+**Connection**:
+One sign-in at one bank, held at the bridge. It can break until the owner signs in again there; its accounts then stop updating and lyfe says so.
+_Avoid_: Link, integration, login
+
+**Entry**:
+One posted transaction in an account, imported from the bank under the bank's own id for it, so importing it again never counts it twice. It is an expense, a refund, money in, or money moved. Pending transactions are not entries.
+_Avoid_: Transaction (in the app), line item, charge
+
+**Spending**:
+Expenses less refunds over a month, in every everyday account together. Money moved between the owner's own accounts is never spending, so a card payment is not: the purchases it pays for already were.
+_Avoid_: Outflow, total debits, burn
+
+**Refund**:
+Money back for something bought. It comes off the category it was bought under, not onto income.
+_Avoid_: Credit, reversal, negative expense
+
+**Money moved**:
+The same money leaving one of the owner's accounts and arriving in another: a card payment, a transfer to savings. lyfe pairs the two halves by amount when both accounts are connected; otherwise the owner says so.
+_Avoid_: Transfer (in the app), internal transaction, payment (for a card payment as if it were spending)
+
+**Payee**:
+Who an entry was paid to or came from, as the bank names it. The same shop is the same payee whatever branch number follows its name.
+_Avoid_: Merchant, vendor, counterparty
+
+**Sorting**:
+The owner saying what an entry is: a category, money in, or money moved. Said once it holds for the payee, for every entry past and to come, unless the owner sorts one entry by itself. Until then the entry waits, and counts in the month as spending not sorted yet.
+_Avoid_: Categorising, tagging, labelling, reviewing
+
+**Category**:
+One of twelve fixed kinds of spending an expense or refund is sorted into. The owner picks it; lyfe never guesses one.
+_Avoid_: Tag, budget line, envelope
+
+**Set aside**:
+An account the owner has marked as savings or investments. Its balance is shown; nothing that moves in it counts as spending or waits to be sorted. Every other account is an everyday account.
+_Avoid_: Hidden account, excluded account, savings (for the mark itself)
