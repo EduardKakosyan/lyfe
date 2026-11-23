@@ -567,6 +567,8 @@ async fn record_food_entry(
         meal_id: Some(meal.id),
         name: meal.name.clone(),
         servings,
+        carbs_g: meal.ingredients.iter().map(|i| i.carbs_g).sum::<Option<f64>>().map(|g| g * servings / meal.portions as f64),
+        fat_g: meal.ingredients.iter().map(|i| i.fat_g).sum::<Option<f64>>().map(|g| g * servings / meal.portions as f64),
         amount: meal.amount(servings),
         estimated: meal.estimated(servings),
     };
@@ -750,6 +752,8 @@ async fn record_barcode_entry(
 /// 100 g, or whole, with `kcal` and `protein_g`.
 #[derive(Deserialize)]
 struct TypedFood {
+    carbs_g: Option<f64>,
+    fat_g: Option<f64>,
     name: String,
     grams: Option<f64>,
     kcal_per_100g: Option<f64>,
@@ -773,7 +777,7 @@ impl TypedFood {
             (None, None, None, Some(kcal), Some(protein_g)) => food::Quantity::Whole { kcal, protein_g },
             _ => return Err("give grams, kcal_per_100g and protein_per_100g, or kcal and protein_g"),
         };
-        food::Ingredient { name: self.name, quantity, estimated: self.estimated, code: self.code }.checked()
+        food::Ingredient { name: self.name, quantity, carbs_g: self.carbs_g, fat_g: self.fat_g, estimated: self.estimated, code: self.code }.checked()
     }
 }
 
@@ -837,6 +841,8 @@ struct BuiltMealRequest {
 /// is a photo sent ahead under this id as a part of this meal.
 #[derive(Deserialize)]
 struct PartRequest {
+    carbs_g: Option<f64>,
+    fat_g: Option<f64>,
     id: Uuid,
     code: Option<String>,
     name: Option<String>,
@@ -881,6 +887,7 @@ async fn record_built_meal(
             (None, Some(name)) => {
                 let food = TypedFood {
                     name,
+                    carbs_g: part.carbs_g, fat_g: part.fat_g,
                     grams: part.grams,
                     kcal_per_100g: part.kcal_per_100g,
                     protein_per_100g: part.protein_per_100g,

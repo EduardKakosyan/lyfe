@@ -475,10 +475,10 @@ pub async fn upsert_saved_meal(pool: &PgPool, meal: &food::SavedMeal) -> sqlx::R
     let codes: Vec<Option<&str>> = meal.ingredients.iter().map(|i| i.code.as_deref()).collect();
     sqlx::query(
         "insert into saved_meal_ingredients
-            (meal_id, position, name, grams, kcal_per_100g, protein_per_100g, kcal, protein_g, estimated, barcode)
+            (meal_id, position, name, grams, kcal_per_100g, protein_per_100g, kcal, protein_g, estimated, barcode, carbs_g, fat_g)
          select $1, * from unnest($2::integer[], $3::text[], $4::double precision[], $5::double precision[],
                                   $6::double precision[], $7::double precision[], $8::double precision[],
-                                  $9::boolean[], $10::text[])",
+                                  $9::boolean[], $10::text[], $11::double precision[], $12::double precision[])",
     )
     .bind(meal.id)
     .bind(&positions)
@@ -490,6 +490,8 @@ pub async fn upsert_saved_meal(pool: &PgPool, meal: &food::SavedMeal) -> sqlx::R
     .bind(whole(|_, protein| protein))
     .bind(&estimated)
     .bind(&codes)
+    .bind(meal.ingredients.iter().map(|i| i.carbs_g).collect::<Vec<_>>())
+    .bind(meal.ingredients.iter().map(|i| i.fat_g).collect::<Vec<_>>())
     .execute(&mut *tx)
     .await?;
     tx.commit().await
@@ -528,7 +530,7 @@ async fn saved_meals_where(pool: &PgPool, id: Option<Uuid>) -> sqlx::Result<Vec<
         .collect();
     let ids: Vec<Uuid> = meals.iter().map(|meal| meal.id).collect();
     let rows = sqlx::query(
-        "select meal_id, name, grams, kcal_per_100g, protein_per_100g, kcal, protein_g, estimated, barcode
+        "select meal_id, name, grams, kcal_per_100g, protein_per_100g, kcal, protein_g, estimated, barcode, carbs_g, fat_g
          from saved_meal_ingredients where meal_id = any($1) order by meal_id, position",
     )
     .bind(&ids)
@@ -549,6 +551,7 @@ async fn saved_meals_where(pool: &PgPool, id: Option<Uuid>) -> sqlx::Result<Vec<
         };
         if let Some(meal) = meals.iter_mut().find(|meal| meal.id == meal_id) {
             meal.ingredients.push(food::Ingredient {
+                carbs_g: r.get("carbs_g"), fat_g: r.get("fat_g"),
                 name: r.get("name"),
                 quantity,
                 estimated: r.get("estimated"),
@@ -574,6 +577,9 @@ pub async fn saved_meal(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<food::Sa
 /// stood when it arrived.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredFoodEntry {
+    pub carbs_g: Option<f64>,
+    pub fat_g: Option<f64>,
+
     pub id: Uuid,
     pub eaten_at: DateTime<Utc>,
     pub slot: Slot,
@@ -591,8 +597,8 @@ pub async fn insert_food_entry(pool: &PgPool, entry: &StoredFoodEntry, device_se
     let result = sqlx::query(
         "insert into food_entries
             (id, eaten_at, slot, meal_id, name, servings, kcal, protein_dg, device_session_id, kcal_estimated,
-             protein_dg_estimated)
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             protein_dg_estimated, carbs_g, fat_g)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
          on conflict (id) do nothing",
     )
     .bind(entry.id)
@@ -606,6 +612,7 @@ pub async fn insert_food_entry(pool: &PgPool, entry: &StoredFoodEntry, device_se
     .bind(device_session_id)
     .bind(entry.estimated.kcal as i32)
     .bind(entry.estimated.protein_dg as i32)
+    .bind(entry.carbs_g).bind(entry.fat_g)
     .execute(pool)
     .await?;
     Ok(result.rows_affected() == 1)
@@ -640,7 +647,7 @@ pub async fn remove_food_entry(pool: &PgPool, id: Uuid) -> sqlx::Result<bool> {
 }
 
 /// The columns an entry is read from.
-const ENTRY_COLUMNS: &str = "e.id, e.eaten_at, e.slot, e.meal_id, e.name, e.servings, e.kcal, e.protein_dg, e.source,
+const ENTRY_COLUMNS: &str = "e.carbs_g, e.fat_g, e.id, e.eaten_at, e.slot, e.meal_id, e.name, e.servings, e.kcal, e.protein_dg, e.source,
     e.figures, e.note, e.oil_asked, e.oil, e.typed, e.estimate_problem, e.barcode, e.grams, e.part_of, e.position,
     e.kcal_per_100g, e.protein_per_100g, e.kcal_estimated, e.protein_dg_estimated,
     exists (select 1 from food_photos p where p.entry_id = e.id) as has_photo,
@@ -680,6 +687,7 @@ fn read_entry(
         _ => Detail::Saved,
     };
     food::Entry {
+        carbs_g: r.get("carbs_g"), fat_g: r.get("fat_g"),
         id,
         eaten_local: eaten_at.with_timezone(&timezone).naive_local(),
         slot: stored_slot(r.get("slot")),
@@ -1332,8 +1340,8 @@ async fn write_typed_entry(
     let result = sqlx::query(
         "insert into food_entries
             (id, eaten_at, slot, name, servings, kcal, protein_dg, device_session_id, source, figures, grams,
-             part_of, position, kcal_per_100g, protein_per_100g)
-         values ($1, $2, $3, $4, 1, $5, $6, $7, 'typed', 'known', $8, $9, $10, $11, $12)
+             part_of, position, kcal_per_100g, protein_per_100g, carbs_g, fat_g)
+         values ($1, $2, $3, $4, 1, $5, $6, $7, 'typed', 'known', $8, $9, $10, $11, $12, $13, $14)
          on conflict (id) do nothing",
     )
     .bind(entry.id)
@@ -1348,6 +1356,7 @@ async fn write_typed_entry(
     .bind(entry.position)
     .bind(kcal_per_100g)
     .bind(protein_per_100g)
+    .bind(entry.food.carbs_g).bind(entry.food.fat_g)
     .execute(&mut *conn)
     .await?;
     Ok(result.rows_affected() == 1)

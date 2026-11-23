@@ -2663,7 +2663,7 @@ async fn a_typed_food_is_logged_as_measured(pool: PgPool) {
     let token = h.signed_in().await;
 
     let coffee = json!({"id": food_id(51), "eaten_at": "2026-11-17T14:00:00Z", "slot": "snack",
-                        "name": " Flat white ", "kcal": 120, "protein_g": 6});
+                        "name": " Flat white ", "kcal": 120, "protein_g": 6, "carbs_g": 9, "fat_g": 6.5});
     let (status, _) = h.post("/v1/food/typed-entries", None, Some(coffee.clone())).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     let (status, home) = h.post("/v1/food/typed-entries", Some(&token), Some(coffee.clone())).await;
@@ -2671,7 +2671,7 @@ async fn a_typed_food_is_logged_as_measured(pool: PgPool) {
     assert_eq!(
         home["food"]["entries"],
         json!([{"id": food_id(51), "slot": "snack", "name": "Flat white", "meal_id": null, "servings": 1.0,
-                "kcal": 120, "protein_g": 6.0, "source": "typed", "figures": "known", "estimated": false}])
+                "kcal": 120, "protein_g": 6.0, "carbs_g": 9.0, "fat_g": 6.5, "source": "typed", "figures": "known", "estimated": false}])
     );
     assert_eq!((&home["food"]["kcal_measured"], &home["food"]["kcal_estimated"]), (&json!(120), &json!(0)));
     // Sent twice, logged once.
@@ -2692,6 +2692,7 @@ async fn a_typed_food_is_logged_as_measured(pool: PgPool) {
         json!({"name": "Oats", "kcal": 30000, "protein_g": 10}),
         json!({"name": "Oats", "grams": 80, "kcal_per_100g": 3790, "protein_per_100g": 13.2}),
         json!({"name": "Oats", "grams": 0, "kcal_per_100g": 379, "protein_per_100g": 13.2}),
+        json!({"name": "Oats", "grams": 80, "kcal_per_100g": 379, "protein_per_100g": 13.2, "fat_g": 90}),
     ] {
         let (status, body) = h.post("/v1/food/typed-entries", Some(&token), Some(typed(wrong.clone()))).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{wrong} {body}");

@@ -155,6 +155,10 @@ impl Quantity {
 /// label, or just what it comes to.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Ingredient {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub carbs_g: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fat_g: Option<f64>,
     pub name: String,
     #[serde(flatten)]
     pub quantity: Quantity,
@@ -171,6 +175,7 @@ impl Ingredient {
     /// Weighed and typed from its label.
     pub fn weighed(name: &str, grams: f64, kcal_per_100g: f64, protein_per_100g: f64) -> Ingredient {
         Ingredient {
+            carbs_g: None, fat_g: None,
             name: name.into(),
             quantity: Quantity::Weighed { grams, kcal_per_100g, protein_per_100g },
             estimated: false,
@@ -180,11 +185,13 @@ impl Ingredient {
 
     /// Typed as what it comes to.
     pub fn whole(name: &str, kcal: f64, protein_g: f64) -> Ingredient {
-        Ingredient { name: name.into(), quantity: Quantity::Whole { kcal, protein_g }, estimated: false, code: None }
+        Ingredient { carbs_g: None, fat_g: None, name: name.into(), quantity: Quantity::Whole { kcal, protein_g }, estimated: false, code: None }
     }
 
     /// The ingredient as it is kept, or what is wrong with it.
     pub fn checked(self) -> Result<Ingredient, &'static str> {
+        let limit = match self.quantity { Quantity::Weighed { grams, .. } => grams, Quantity::Whole { .. } => 1000.0 };
+        if [self.carbs_g, self.fat_g].into_iter().flatten().any(|v| !within(v, 0.0, limit + 0.000001)) { return Err("carbs and fat must be valid gram amounts"); }
         let name = clean_name(&self.name).ok_or("an ingredient's name must be 1 to 60 characters")?;
         match self.quantity {
             Quantity::Weighed { grams, kcal_per_100g, protein_per_100g } => {
@@ -437,6 +444,8 @@ pub fn servings_make_sense(servings: f64) -> bool {
 /// One meal logged.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Entry {
+    pub carbs_g: Option<f64>,
+    pub fat_g: Option<f64>,
     /// Made on the phone, so an entry sent twice is stored once.
     pub id: Uuid,
     /// When it was logged, in the owner's wall-clock time; decides its day.
@@ -628,6 +637,10 @@ impl Prompt {
 /// One logged meal.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct EntryView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub carbs_g: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fat_g: Option<f64>,
     pub id: Uuid,
     pub slot: Slot,
     pub name: String,
@@ -801,6 +814,7 @@ fn entry_view(entry: &Entry, range_pct: u32) -> EntryView {
         name: entry.name.clone(),
         meal_id: entry.meal_id,
         servings: entry.servings,
+        carbs_g: entry.carbs_g, fat_g: entry.fat_g,
         kcal: entry.amount.kcal,
         protein_g: entry.amount.protein_g(),
         source: entry.detail.source(),
@@ -1013,6 +1027,7 @@ mod tests {
 
     fn entry(n: u128, at: &str, meal: &SavedMeal, servings: f64) -> Entry {
         Entry {
+            carbs_g: None, fat_g: None,
             id: Uuid::from_u128(n),
             eaten_local: NaiveDateTime::parse_from_str(at, "%Y-%m-%d %H:%M").unwrap(),
             slot: meal.slot,
@@ -1212,6 +1227,7 @@ mod tests {
     fn photo_entry(n: u128, at: &str, slot: Slot, figures: Figures, items: Vec<photo::Item>, oil_asked: bool) -> Entry {
         let amount = if figures == Figures::Known { photo::amount(&items, oil_asked, None) } else { Amount::default() };
         Entry {
+            carbs_g: None, fat_g: None,
             id: Uuid::from_u128(n),
             eaten_local: NaiveDateTime::parse_from_str(at, "%Y-%m-%d %H:%M").unwrap(),
             slot,
@@ -1248,6 +1264,8 @@ mod tests {
     fn the_day_keeps_measured_and_estimated_apart() {
         let b = breakfast();
         let bar = Entry {
+            carbs_g: None,
+            fat_g: None,
             id: Uuid::from_u128(3),
             eaten_local: NaiveDateTime::parse_from_str("2026-11-17 15:00", "%Y-%m-%d %H:%M").unwrap(),
             slot: Slot::Snack,
@@ -1328,6 +1346,7 @@ mod tests {
     /// A part of meal number `meal`, standing at `position` in it.
     fn part(n: u128, meal: u128, position: i32, name: &str, amount: Amount, detail: Detail) -> Entry {
         Entry {
+            carbs_g: None, fat_g: None,
             id: Uuid::from_u128(n),
             eaten_local: NaiveDateTime::parse_from_str("2026-11-17 07:30", "%Y-%m-%d %H:%M").unwrap(),
             slot: Slot::Breakfast,
