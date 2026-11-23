@@ -6,6 +6,9 @@ import SwiftUI
 /// one tap next time, or both. The same screen types and changes a saved
 /// meal, where it only saves.
 public struct MealBuilderView: View {
+    var recent: [[Ingredient]] = []
+    var saved: [SavedMeal] = []
+    var onSaved: (SavedMeal) -> Void = { _ in }
     let draft: MealDraft
     /// The backend's entry for each photo part, once it has one.
     var estimates: [UUID: FoodDay.Entry] = [:]
@@ -51,13 +54,17 @@ public struct MealBuilderView: View {
     }
 
     public init(
-        draft: MealDraft, estimates: [UUID: FoodDay.Entry] = [:], unsent: Set<UUID> = [], typing: Bool = false,
+        draft: MealDraft, recent: [[Ingredient]] = [], saved: [SavedMeal] = [], onSaved: @escaping (SavedMeal) -> Void = { _ in }, estimates: [UUID: FoodDay.Entry] = [:], unsent: Set<UUID> = [],
+        typing: Bool = false,
         onChange: @escaping ((inout MealDraft) -> Void) -> Void, onScan: @escaping () -> Void = {},
         onPhoto: @escaping () -> Void = {}, onEstimate: @escaping (UUID) -> Void = { _ in },
         onLog: @escaping () async -> String? = { nil }, onSave: @escaping () async -> String?,
         onRemove: @escaping () async -> String? = { nil }, onDiscard: @escaping () async -> Void = {},
         onFollow: @escaping () async -> Void = {}, onClose: @escaping () -> Void
     ) {
+        self.recent = recent
+        self.onSaved = onSaved
+        self.saved = saved
         self.draft = draft
         self.estimates = estimates
         self.unsent = unsent
@@ -85,12 +92,38 @@ public struct MealBuilderView: View {
                 VStack(alignment: .leading, spacing: 0) {
                     header
                     PosterRule()
+                    if logs, draft.parts.isEmpty, !typing, !browsing {
+                        if !recent.isEmpty {
+                            ScrollView(.horizontal) {
+                                HStack {
+                                    ForEach(recent.indices, id: \.self) { index in
+                                        let portion = recent[index]
+                                        Button { onChange { $0.parts = portion.map { MealPart(.food($0)) } } } label: {
+                                            VStack(alignment: .leading, spacing: 4) {
+                                                Text("Recent · \(Int(portion.reduce(0) { $0 + $1.kcal }.rounded())) kcal").posterLabel()
+                                                Text(portion.map(\.name).joined(separator: " + ")).font(.headline).lineLimit(2)
+                                            }.padding(12).frame(maxWidth: 210, alignment: .leading).background(Poster.yellow)
+                                        }.buttonStyle(.plain)
+                                    }
+                                }.padding(.horizontal, Poster.margin)
+                            }.padding(.vertical, 8)
+                        }
+                        if !saved.isEmpty {
+                            Menu {
+                                ForEach(saved) { meal in Button(meal.name) { onSaved(meal) } }
+                            } label: { StripRow(left: "Log a saved meal", right: "1 portion ▾").frame(minHeight: 44) }
+                            PosterRule(thickness: 1.5)
+                        }
+                    }
                     ForEach(draft.parts) { part in
                         Button {
                             tap(part)
                         } label: {
-                            FoodRow(row: FoodText.partRow(part, estimate: estimates[part.id], unsent: unsent.contains(part.id)))
-                                .background(selected == part.id ? Poster.yellow : .clear)
+                            FoodRow(
+                                row: FoodText.partRow(
+                                    part, estimate: estimates[part.id], unsent: unsent.contains(part.id))
+                            )
+                            .background(selected == part.id ? Poster.yellow : .clear)
                         }
                         .buttonStyle(.plain)
                         .accessibilityHint(hint(for: part))
@@ -134,14 +167,14 @@ public struct MealBuilderView: View {
                         NoticeRow(text: note)
                         PosterRule(thickness: 1.5)
                     }
-                    if logs {
+                    if logs, !draft.parts.isEmpty {
                         saveForOneTap
                     }
                     wayOut
                 }
             }
             .scrollDismissesKeyboard(.interactively)
-            bar
+            if !logs || !draft.parts.isEmpty || typing { bar }
         }
         .foregroundStyle(Poster.ink)
         .background(Poster.paper.ignoresSafeArea())
@@ -156,7 +189,9 @@ public struct MealBuilderView: View {
                 await onFollow()
             }
         }
-        .confirmationDialog(confirmTitle, isPresented: confirmShown, titleVisibility: .visible, presenting: confirming) {
+        .confirmationDialog(
+            confirmTitle, isPresented: confirmShown, titleVisibility: .visible, presenting: confirming
+        ) {
             switch $0 {
             case .remove:
                 Button("Remove", role: .destructive) {
@@ -209,22 +244,17 @@ public struct MealBuilderView: View {
         VStack(alignment: .leading, spacing: 0) {
             TopLine(left: "✕ Close", right: title, onLeft: onClose)
                 .padding(.horizontal, -Poster.margin)
-            TextField(
-                "", text: name,
-                prompt: Text(logs ? "\(FoodText.slotName(draft.slot)) · NAME IT" : "MEAL NAME")
-                    .foregroundStyle(Poster.ink.opacity(0.25))
-            )
-            .font(.system(size: 34, weight: .heavy))
-            .tracking(-1)
-            .focused($nameFocused)
-            .submitLabel(.done)
-            #if os(iOS)
-                .textInputAutocapitalization(.characters)
-            #endif
-            .autocorrectionDisabled()
-            .accessibilityLabel("Meal name")
-            SlotPicker(slot: slot).padding(.top, 10)
             if logs {
+                Menu {
+                    Picker("Meal", selection: slot) {
+                        ForEach(MealSlot.allCases, id: \.self) { item in Text(item.title).tag(item) }
+                    }
+                } label: { Text("\(draft.slot.title) ▾").posterLabel().frame(minHeight: 44) }
+            } else {
+                mealName
+                SlotPicker(slot: slot).padding(.top, 10)
+            }
+            if logs, !draft.parts.isEmpty {
                 HStack(alignment: .lastTextBaseline, spacing: 8) {
                     Text(Poster.tight(FoodText.kcal(total.kcal), by: -4))
                         .font(.system(size: 76, weight: .heavy))
@@ -240,10 +270,15 @@ public struct MealBuilderView: View {
                 .animation(.snappy, value: total.kcal)
                 Text(FoodText.totalLine(total, parts: draft.parts.count)).posterLabel()
                     .accessibilityLabel(
-                        "\(total.kcal) kilocalories so far, \(FoodText.totalLine(total, parts: draft.parts.count))")
-            } else {
+                        "\(total.kcal) kilocalories so far, \(FoodText.totalLine(total, parts: draft.parts.count))"
+                    )
+                let foods = draft.parts.map { $0.ingredient(estimate: estimates[$0.id]) }
+                Text(FoodText.macros(carbs: foods.map { $0?.carbsG }, fat: foods.map { $0?.fatG }))
+                    .posterLabel()
+            } else if !logs {
                 PortionStepper(
-                    portions: Binding(get: { draft.portions }, set: { count in onChange { $0.portions = count } })
+                    portions: Binding(
+                        get: { draft.portions }, set: { count in onChange { $0.portions = count } })
                 )
                 .padding(.top, 12)
             }
@@ -252,13 +287,32 @@ public struct MealBuilderView: View {
         .padding(.bottom, 12)
     }
 
+    private var mealName: some View {
+            TextField(
+                "", text: name,
+                prompt: Text("Meal name")
+                    .foregroundStyle(Poster.ink.opacity(0.25))
+            )
+            .font(.system(size: 34, weight: .heavy))
+            .tracking(-1)
+            .focused($nameFocused)
+            .submitLabel(.done)
+            #if os(iOS)
+                .textInputAutocapitalization(.characters)
+            #endif
+            .autocorrectionDisabled()
+            .accessibilityLabel("Meal name")
+    }
+
     private var title: String {
         if logs { return "Build a meal" }
         return draft.isNew ? "New saved meal" : "Saved meal"
     }
 
     private func hint(for part: MealPart) -> String {
-        if case .photo = part.kind, estimates[part.id] != nil { return "Shows the estimate, to correct it" }
+        if case .photo = part.kind, estimates[part.id] != nil {
+            return "Shows the estimate, to correct it"
+        }
         return "Changes this part"
     }
 
@@ -294,7 +348,8 @@ public struct MealBuilderView: View {
         switch part.kind {
         case .food(let food) where food.code == nil:
             TypedFieldsView(
-                fields: $fields, title: food.estimated ? "A photo's estimate · type it to replace it" : "Change this part",
+                fields: $fields,
+                title: food.estimated ? "A photo's estimate · type it to replace it" : "Change this part",
                 primary: "Keep the change", onPrimary: { keepTyped(part) }, secondary: "Take it out",
                 onSecondary: { takeOut(part) })
         case .food, .scan:
@@ -336,11 +391,18 @@ public struct MealBuilderView: View {
         .buttonStyle(.plain)
         if savingOpen {
             VStack(alignment: .leading, spacing: 10) {
+                mealName
                 PortionStepper(
-                    portions: Binding(get: { draft.portions }, set: { count in onChange { $0.portions = count } }))
-                Text(draft.missing(estimates: estimates).map { $0 + " first" } ?? FoodText.portionLine(draft, estimates: estimates))
-                    .posterLabel()
-                FormButton(title: busy == .saving ? "Saving" : (draft.isSaved ? "Saved" : "Save it"), filled: true) {
+                    portions: Binding(
+                        get: { draft.portions }, set: { count in onChange { $0.portions = count } }))
+                Text(
+                    draft.missing(estimates: estimates).map { $0 + " first" }
+                        ?? FoodText.portionLine(draft, estimates: estimates)
+                )
+                .posterLabel()
+                FormButton(
+                    title: busy == .saving ? "Saving" : (draft.isSaved ? "Saved" : "Save it"), filled: true
+                ) {
                     Task { await save() }
                 }
                 .allowsHitTesting(busy == nil && !draft.isSaved)
@@ -427,7 +489,8 @@ public struct MealBuilderView: View {
         switch part.kind {
         case .food(var food):
             if case .weighed(_, let kcalPer100g, let proteinPer100g) = food.quantity {
-                food.quantity = .weighed(grams: weight, kcalPer100g: kcalPer100g, proteinPer100g: proteinPer100g)
+                food.quantity = .weighed(
+                    grams: weight, kcalPer100g: kcalPer100g, proteinPer100g: proteinPer100g)
             }
             replace(part, with: .food(food))
         case .scan(let code, _):
@@ -533,7 +596,8 @@ public struct LoggedMealView: View {
         VStack(spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
-                    TopLine(left: "← Food", right: "\(FoodText.slotName(meal.slot)) · Logged", onLeft: onClose)
+                    TopLine(
+                        left: "← Food", right: "\(FoodText.slotName(meal.slot)) · Logged", onLeft: onClose)
                     VStack(alignment: .leading, spacing: 0) {
                         Text(meal.name).posterHeading(34).lineLimit(2).minimumScaleFactor(0.6)
                         HStack(alignment: .lastTextBaseline, spacing: 8) {
@@ -569,7 +633,9 @@ public struct LoggedMealView: View {
                     }
                     if typing {
                         PosterRule(thickness: 1.5)
-                        TypedFieldsView(fields: $fields, title: "Type what else you ate", primary: "Add", onPrimary: { add() })
+                        TypedFieldsView(
+                            fields: $fields, title: "Type what else you ate", primary: "Add", onPrimary: { add() }
+                        )
                     }
                     PosterRule()
                     if let note {
@@ -614,7 +680,9 @@ public struct LoggedMealView: View {
                 Task { note = await onTakeBack(id) }
             }
         }
-        .confirmationDialog("Take \(meal.name) off today?", isPresented: $takingOff, titleVisibility: .visible) {
+        .confirmationDialog(
+            "Take \(meal.name) off today?", isPresented: $takingOff, titleVisibility: .visible
+        ) {
             Button("Take it off", role: .destructive) {
                 Task {
                     note = await onTakeBack(meal.id)

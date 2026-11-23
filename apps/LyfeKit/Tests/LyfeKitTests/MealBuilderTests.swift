@@ -3,6 +3,28 @@ import Testing
 
 @testable import LyfeKit
 
+@MainActor @Test func repeatedOfflinePortionsKeepNutritionButUndoOnlyTheLatestEntry() async throws {
+    let world = World.signedIn()
+    world.backend.goDown()
+    let model = world.launch()
+    model.openMealBuilder()
+    model.addPart(MealPart(.food(BuiltFixture.banana)))
+    #expect(await model.logMealDraft() == nil)
+    let first = try #require(model.receipt?.id)
+    let portion = try #require(world.launch().recentPortions.first)
+    #expect(portion == [BuiltFixture.banana])
+    model.openMealBuilder()
+    for food in portion { model.addPart(MealPart(.food(food))) }
+    #expect(await model.logMealDraft() == nil)
+    let second = try #require(model.receipt?.id)
+    #expect(first != second)
+    #expect(model.recentPortions == [portion])
+    #expect(await model.takeBackMeal(second) == nil)
+    #expect(model.receipt == nil)
+    #expect(model.unsentMeals.map(\.id) == [first])
+    await model.signOut()
+    #expect(world.drafts.recentPortions().isEmpty)
+}
 
 @Test func weighedStapleKeepsMacrosWhenSavedAndReweighed() throws {
     let pork = try #require(CommonIngredient.staples.first { $0.name.contains("Pork") })

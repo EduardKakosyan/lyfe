@@ -36,12 +36,17 @@ public struct RootView: View {
                         FoodFlowView(model: model, flow: flow)
                     } else if let draft = model.mealDraft {
                         MealBuilderView(
-                            draft: draft, estimates: model.draftEstimates,
+                            draft: draft, recent: model.recentPortions, saved: model.home?.food?.meals ?? [], onSaved: { meal in
+                                model.closeMealEditor()
+                                Task { await model.logMeal(meal) }
+                            }, estimates: model.draftEstimates,
                             unsent: Set(model.unsentCaptures.filter { $0.partOf == draft.id }.map(\.id)),
-                            typing: model.builderStartsTyping, onChange: { model.changeDraft($0) }, onScan: { model.openScan() },
+                            typing: model.builderStartsTyping, onChange: { model.changeDraft($0) },
+                            onScan: { model.openScan() },
                             onPhoto: { model.openPhotoMeal() }, onEstimate: { model.openEstimate($0) },
                             onLog: { await model.logMealDraft() }, onSave: { await model.saveMeal() },
-                            onRemove: { await model.removeMeal(draft.mealId) }, onDiscard: { await model.discardMeal() },
+                            onRemove: { await model.removeMeal(draft.mealId) },
+                            onDiscard: { await model.discardMeal() },
                             onFollow: {
                                 await model.sendUnsentFood()
                                 await model.reloadHome()
@@ -54,13 +59,14 @@ public struct RootView: View {
                             onClose: { model.closeTargets() })
                     } else if model.screen == .food, let food = model.home?.food {
                         FoodScreen(
-                            food: food, unsent: model.unsentFood, captures: model.unsentMeals,
+                            food: food, receipt: model.receipt?.day == food.day ? model.receipt : nil, onDismiss: model.dismissReceipt, unsent: model.unsentFood, captures: model.unsentMeals,
                             building: model.parkedMeal.map {
                                 .init(parts: $0.parts.count, kcal: $0.total(estimates: model.draftEstimates).kcal)
                             },
                             problem: model.foodProblem, onBack: { model.closeFood() },
                             onLog: { await model.logMeal($0, servings: $1) },
-                            onTakeBack: { await model.takeBackMeal($0) }, onEditMeal: { model.openMealEditor($0) },
+                            onTakeBack: { await model.takeBackMeal($0) },
+                            onEditMeal: { model.openMealEditor($0) },
                             onTargets: { model.openTargets() }, onPhoto: { model.openPhotoMeal() },
                             onScan: { model.openScan() }, onBuild: { model.openMealBuilder(typing: $0) },
                             onMeal: { model.openMeal($0) }, onEstimate: { model.openEstimate($0) },
@@ -93,7 +99,9 @@ public struct RootView: View {
             }
         }
         // Rows show a meal's illustration once drawn, fetched once.
-        .environment(\.mealIllustration, IllustrationSource { [model] in await model.mealIllustration($0) })
+        .environment(
+            \.mealIllustration, IllustrationSource { [model] in await model.mealIllustration($0) }
+        )
         // The Poster palette is fixed; it does not follow dark mode. The
         // lock is ink, so the clock and battery over it are drawn light.
         .preferredColorScheme(model.isLocked ? .dark : .light)
@@ -133,7 +141,8 @@ struct FoodFlowView: View {
             if let entry = model.home?.food?.entry(id) {
                 EstimateView(
                     entry: entry, inMeal: model.home?.food?.entries.contains { $0.id == id } != true,
-                    loadPhoto: { await model.mealPhoto(id) }, loadIllustration: {
+                    loadPhoto: { await model.mealPhoto(id) },
+                    loadIllustration: {
                         guard let drawn = model.home?.food?.entry(id)?.illustration else { return nil }
                         return await model.mealIllustration(drawn)
                     },
@@ -141,17 +150,21 @@ struct FoodFlowView: View {
                     onReload: { await model.reloadHome() }, onTakeBack: { await model.takeBackMeal(id) },
                     onClose: { model.closeFoodFlow() })
             } else if let capture = model.unsentCaptures.first(where: { $0.id == id }) {
-                WaitingPhotoView(capture: capture, loadPhoto: { await model.mealPhoto(id) }, onClose: { model.closeFoodFlow() })
+                WaitingPhotoView(
+                    capture: capture, loadPhoto: { await model.mealPhoto(id) },
+                    onClose: { model.closeFoodFlow() })
             } else {
                 // Taken off, or from another day: back to Food.
                 Color.clear.onAppear { model.closeFoodFlow() }
             }
         case .scan(let into):
             ScanView(
-                asPart: true, lookUp: { await model.lookUp(code: $0) }, onSetLabel: { await model.setLabel($0) },
+                asPart: true, lookUp: { await model.lookUp(code: $0) },
+                onSetLabel: { await model.setLabel($0) },
                 onLog: { code, grams, _, product in
                     if let meal = logged(into) {
-                        await model.logBarcode(code: code, grams: grams, slot: meal.slot, product: product, partOf: meal.id)
+                        await model.logBarcode(
+                            code: code, grams: grams, slot: meal.slot, product: product, partOf: meal.id)
                     } else {
                         model.addScan(code: code, grams: grams, product: product)
                     }
@@ -171,7 +184,8 @@ struct FoodFlowView: View {
                     onScan: { model.openScan(into: id) }, onPhoto: { model.openPhotoMeal(into: id) },
                     onType: { await model.logTyped($0, slot: meal.slot, partOf: id) },
                     onEstimate: { model.openEstimate($0) }, onLabel: { model.openLabel(code: $0) },
-                    onTakeBack: { await model.takeBackMeal($0) }, onSave: { model.openMealEditor(savingLogged: id) },
+                    onTakeBack: { await model.takeBackMeal($0) },
+                    onSave: { model.openMealEditor(savingLogged: id) },
                     onReload: { await model.reloadHome() }, onClose: { model.closeFoodFlow() })
             } else {
                 // Taken off, or from another day: back to Food.

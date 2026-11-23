@@ -323,6 +323,20 @@ extension MealSlot {
 public struct DraftStore: Sendable {
     private let file: URL
 
+    private var recentFile: URL { file.deletingLastPathComponent().appending(path: "recent-portions.json") }
+
+    func recentPortions() -> [[Ingredient]] {
+        guard let data = try? Data(contentsOf: recentFile) else { return [] }
+        return (try? JSONDecoder().decode([[Ingredient]].self, from: data)) ?? []
+    }
+
+    func saveRecent(_ portions: [[Ingredient]]) {
+        guard !portions.isEmpty else { try? FileManager.default.removeItem(at: recentFile); return }
+        guard let data = try? JSONEncoder().encode(Array(portions.prefix(6))) else { return }
+        try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? data.write(to: recentFile, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+    }
+
     public init(directory: URL) {
         file = directory.appending(path: "meal-draft.json")
     }

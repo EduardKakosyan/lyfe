@@ -131,6 +131,17 @@ public final class AppModel {
     private let food: FoodStore
     private let captures: CaptureStore
     private let drafts: DraftStore
+    private(set) var recentPortions: [[Ingredient]] = []
+    struct MealReceipt: Identifiable {
+        let id: UUID
+        let day: CalendarDay?
+        let name: String
+    }
+    private(set) var receipt: MealReceipt?
+
+    func dismissReceipt(_ id: UUID) {
+        if receipt?.id == id { receipt = nil }
+    }
     private let illustrations: IllustrationStore
     private var isSendingFood = false
     private let ownerCheck: any OwnerCheck
@@ -193,8 +204,9 @@ public final class AppModel {
         unsentBreath = breath.outbox().map(\.id)
         unsentWeighIns = weighIns.outbox().map(\.id)
         unsentFood = food.outbox()
+        recentPortions = hasSession ? self.drafts.recentPortions() : []
         if let kept = self.drafts.load() {
-            if now().timeIntervalSince(kept.startedAt) < Self.draftKeptFor {
+            if !kept.parts.isEmpty, now().timeIntervalSince(kept.startedAt) < Self.draftKeptFor {
                 parkedMeal = kept
             } else {
                 // Too old to be the meal in front of anyone: it goes, and
@@ -358,6 +370,9 @@ public final class AppModel {
     }
 
     private func forgetSession() {
+        receipt = nil
+        recentPortions = []
+        drafts.saveRecent([])
         token = nil
         apnsTokenSent = nil
         tokens.clear()
@@ -785,6 +800,7 @@ public final class AppModel {
         unsentFood.append(tap)
         let refused = await sendUnsentFood()
         if refused.contains(tap.id) { return .refused }
+        if phase == .signedIn { receipt = MealReceipt(id: tap.id, day: home?.today, name: meal.name) }
         return unsentFood.contains { $0.id == tap.id } ? .saved : .sent
     }
 
@@ -899,12 +915,15 @@ public final class AppModel {
     /// wrong, or nil.
     @discardableResult
     public func takeBackMeal(_ id: UUID) async -> String? {
+        if isSendingFood { return "Syncing this meal. Try again in a moment." }
         if unsentFood.contains(where: { $0.id == id }) {
             confirmedFood(id)
+            dismissReceipt(id)
             return nil
         }
         if let capture = unsentCaptures.first(where: { $0.id == id }) {
             confirmedCapture(id, forget: true)
+            dismissReceipt(id)
             takeOutOfDraft(id)
             if case .built(_, let parts) = capture.kind {
                 await dropPhotos(of: parts)
@@ -915,6 +934,7 @@ public final class AppModel {
             try await api.removeFoodEntry(token: token, id: id)
         }
         if problem == nil {
+            dismissReceipt(id)
             takeOutOfDraft(id)
         }
         return problem
@@ -1086,6 +1106,7 @@ public final class AppModel {
         }
         let capture = FoodCapture(
             id: draft.id, eatenAt: now(), slot: draft.slot, kind: .built(name: draft.name, parts: draft.parts))
+        let portion = draft.ingredients(estimates: draftEstimates)
         mealDraft = nil
         keepDraft()
         if await log(capture, jpeg: nil) == .refused {
@@ -1093,6 +1114,13 @@ public final class AppModel {
             mealDraft = draft
             keepDraft()
             return foodProblem ?? "The server would not log the meal."
+        }
+        if phase == .signedIn {
+            receipt = MealReceipt(id: capture.id, day: home?.today, name: capture.name)
+            if let portion, !portion.isEmpty {
+                recentPortions = Array(([portion] + recentPortions.filter { $0 != portion }).prefix(6))
+                drafts.saveRecent(recentPortions)
+            }
         }
         return nil
     }
