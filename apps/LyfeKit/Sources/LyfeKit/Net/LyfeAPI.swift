@@ -383,6 +383,40 @@ public struct LyfeAPI: Sendable {
         try await call("POST", "v1/sync", token: token, body: nil, timeout: 45)
     }
 
+    // MARK: Money
+
+    /// A month of money ("2026-11"), or the current one.
+    public func money(token: String, month: String? = nil) async throws -> MoneyMonth {
+        let query = month.map { [URLQueryItem(name: "month", value: $0)] } ?? []
+        return try await call("GET", "v1/money", token: token, body: nil, timeout: 15, query: query)
+    }
+
+    /// Says what an entry is: of its payee from now on, or with `onlyThis`
+    /// of this one entry. The backend answers with `month` as it now stands.
+    public func sortMoneyEntry(
+        token: String, id: UUID, to choice: MoneyChoice, onlyThis: Bool, month: String
+    ) async throws -> MoneyMonth {
+        struct Body: Encodable {
+            var to: String
+            var onlyThis: Bool
+            var month: String
+        }
+        let body = try JSONEncoder.lyfe.encode(Body(to: choice.word, onlyThis: onlyThis, month: month))
+        return try await call(
+            "POST", "v1/money/entries/\(id.uuidString.lowercased())/sort", token: token, body: body, timeout: 15)
+    }
+
+    /// Sets an account aside, or brings it back.
+    public func setMoneyAccount(token: String, id: UUID, setAside: Bool, month: String) async throws -> MoneyMonth {
+        struct Body: Encodable {
+            var setAside: Bool
+            var month: String
+        }
+        let body = try JSONEncoder.lyfe.encode(Body(setAside: setAside, month: month))
+        return try await call(
+            "PUT", "v1/money/accounts/\(id.uuidString.lowercased())", token: token, body: body, timeout: 15)
+    }
+
     /// Which part of the path failed, with the system's error number so it
     /// can be looked up.
     static func explain(_ error: URLError) -> String {
@@ -409,9 +443,10 @@ public struct LyfeAPI: Sendable {
     }
 
     private func call<Reply: Decodable>(
-        _ method: String, _ path: String, token: String?, body: Data?, timeout: TimeInterval
+        _ method: String, _ path: String, token: String?, body: Data?, timeout: TimeInterval,
+        query: [URLQueryItem] = []
     ) async throws -> Reply {
-        let data = try await perform(method, path, token: token, body: body, timeout: timeout)
+        let data = try await perform(method, path, token: token, body: body, timeout: timeout, query: query)
         do {
             return try JSONDecoder.lyfe.decode(Reply.self, from: data)
         } catch {

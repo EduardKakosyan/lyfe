@@ -51,6 +51,8 @@ struct LyfeApp: App {
                 ProgressGallery(screen: screen)
             } else if let screen = ProcessInfo.processInfo.environment["LYFE_DEBUG_FOOD"] {
                 FoodGallery(screen: screen)
+            } else if let screen = ProcessInfo.processInfo.environment["LYFE_DEBUG_MONEY"] {
+                MoneyGallery(screen: screen)
             } else {
                 RootView(model: model)
             }
@@ -112,14 +114,16 @@ struct LyfeApp: App {
         }
 
         /// With LYFE_DEBUG_OPEN set to `food`, `meal`, `build`, `targets`,
-        /// `photo`, `scan` or `progress`, a signed-in development build opens that
+        /// `photo`, `scan`, `progress` or `money`, a signed-in development build opens that
         /// screen by itself once Home has arrived. With LYFE_DEBUG_FOOD_TAP
         /// set as well it first logs the meal the Food screen's bar offers,
         /// as one tap would; with LYFE_DEBUG_FOOD_PHOTO set to a line it
         /// logs a made-up plate as a photo meal with that line and opens its
         /// estimate, or with `build` adds it to the meal being built as a
         /// part. Use either against a local backend, since the meal is
-        /// recorded.
+        /// recorded. With `money` and LYFE_DEBUG_MONEY_SORT set to a
+        /// category it sorts the oldest entry waiting into it, which is
+        /// recorded too.
         private func openFromEnvironment() async {
             let environment = ProcessInfo.processInfo.environment
             guard let screen = environment["LYFE_DEBUG_OPEN"] else { return }
@@ -147,6 +151,20 @@ struct LyfeApp: App {
             case "build": model.openMealBuilder()
             case "targets": model.openTargets()
             case "progress": model.openProgress()
+            case "money":
+                model.openMoney()
+                // With LYFE_DEBUG_MONEY_SORT set to a category, the oldest
+                // entry waiting is sorted into it, as one tap would, and
+                // the sorting screen is left on the next one.
+                if let category = environment["LYFE_DEBUG_MONEY_SORT"] {
+                    for _ in 0..<50 where model.money == nil {
+                        try? await Task.sleep(for: .milliseconds(200))
+                    }
+                    model.openSortingNext()
+                    if let entry = model.sortingEntry {
+                        await model.sortMoney(entry, to: .category(category), onlyThis: false)
+                    }
+                }
             default: break
             }
         }

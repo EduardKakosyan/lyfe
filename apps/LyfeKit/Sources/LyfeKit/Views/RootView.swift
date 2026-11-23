@@ -4,7 +4,8 @@ import SwiftUI
 /// breath session taking the whole screen while one is open. Progress and
 /// the weight entry open from Home or from the morning prompt; Food, with
 /// its meal builder and targets entry, from Home or from the logging
-/// prompt. All of it is behind Face ID each time lyfe is opened.
+/// prompt; Money, with its sorting screen, from Home. All of it is behind
+/// Face ID each time lyfe is opened.
 public struct RootView: View {
     let model: AppModel
     @Environment(\.scenePhase) private var scenePhase
@@ -64,6 +65,21 @@ public struct RootView: View {
                             onScan: { model.openScan() }, onBuild: { model.openMealBuilder(typing: $0) },
                             onMeal: { model.openMeal($0) }, onEstimate: { model.openEstimate($0) },
                             onLabel: { model.openLabel(code: $0) }, onReload: { await model.reloadHome() })
+                    } else if model.screen == .money {
+                        if let id = model.sortingEntry, let money = model.money,
+                            let entry = money.entries.first(where: { $0.id == id })
+                        {
+                            SortEntryView(
+                                entry: entry, categories: money.categoryNames, currency: money.currency,
+                                waiting: money.toSort, onSort: { await model.sortMoney(id, to: $0, onlyThis: $1) },
+                                onClose: { model.closeSorting() })
+                        } else {
+                            MoneyScreen(
+                                money: model.money, problem: model.moneyProblem, loading: model.isLoadingMoney,
+                                onBack: { model.closeMoney() }, onMonth: { await model.loadMoney(month: $0) },
+                                onSort: { model.openSorting($0) }, onSortNext: { model.openSortingNext() },
+                                onSetAside: { await model.setAside(account: $0, $1) })
+                        }
                     } else if model.screen == .progress, let home = model.home {
                         ProgressScreen(
                             weight: home.weight, today: home.today, home: home, save: model.recordProgress,

@@ -14,6 +14,9 @@ public struct HomeSnapshot: Codable, Equatable, Sendable {
     /// Missing in answers cached before food logging existed.
     public var food: FoodDay?
     var progress: ProgressHistory?
+    /// Missing while no bank is set up, and in answers cached before money
+    /// was imported.
+    public var money: MoneyGlance?
     public var sources: Sources
     /// Missing in answers cached before notifications existed.
     public var notifications: Notifications?

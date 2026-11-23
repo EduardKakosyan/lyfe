@@ -93,6 +93,7 @@ public final class AppModel {
         case home
         case progress
         case food
+        case money
     }
 
     /// True while lyfe is waiting for Face ID. Set when it is opened and
@@ -102,6 +103,15 @@ public final class AppModel {
     private var isUnlocking = false
 
     public private(set) var screen: Screen = .home
+
+    /// The month of money on screen, as the backend last answered. Kept
+    /// only while lyfe runs: money is not stored on the phone.
+    public private(set) var money: MoneyMonth?
+    /// What went wrong fetching or changing it, in words for the owner.
+    public private(set) var moneyProblem: String?
+    public private(set) var isLoadingMoney = false
+    /// The entry whose sorting screen is open.
+    public private(set) var sortingEntry: UUID?
     /// True while the weight entry is on screen.
     public private(set) var isEnteringWeight = false
 
@@ -363,6 +373,9 @@ public final class AppModel {
         setAside()
         isEnteringTargets = false
         foodFlow = nil
+        money = nil
+        moneyProblem = nil
+        sortingEntry = nil
         screen = .home
         isEnteringWeight = false
         isLocked = false
@@ -528,6 +541,107 @@ public final class AppModel {
     private func confirmed(_ id: UUID) {
         breath.remove(id)
         unsentBreath.removeAll { $0 == id }
+    }
+
+    // MARK: Money
+
+    /// Opens Money on the current month, showing the last answer until the
+    /// new one arrives.
+    public func openMoney() {
+        screen = .money
+        Task { await loadMoney(month: nil) }
+    }
+
+    public func closeMoney() {
+        sortingEntry = nil
+        screen = .home
+        // Home's strip says how many are left to sort.
+        Task { await reloadHome() }
+    }
+
+    /// Fetches a month ("2026-11"), or the current one. Money needs the
+    /// backend: with no connection the month already on screen stays.
+    public func loadMoney(month: String?) async {
+        guard phase == .signedIn, !isLoadingMoney else { return }
+        isLoadingMoney = true
+        defer { isLoadingMoney = false }
+        moneyProblem = await changeMoney("fetch the month") { api, token in
+            try await api.money(token: token, month: month)
+        }
+    }
+
+    /// Opens the sorting screen on an entry of the month shown.
+    public func openSorting(_ id: UUID) {
+        guard money?.entries.contains(where: { $0.id == id }) == true else { return }
+        sortingEntry = id
+    }
+
+    /// Opens the sorting screen on the oldest entry still waiting.
+    public func openSortingNext() {
+        sortingEntry = money?.waiting.first?.id
+    }
+
+    public func closeSorting() {
+        sortingEntry = nil
+    }
+
+    /// Says what an entry is. An entry that was waiting is followed by the
+    /// next one waiting, so a month is gone through without going back to
+    /// the list; one sorted again closes. Returns what went wrong, or nil.
+    @discardableResult
+    public func sortMoney(_ id: UUID, to choice: MoneyChoice, onlyThis: Bool) async -> String? {
+        guard let money, let entry = money.entries.first(where: { $0.id == id }) else { return "That entry is gone." }
+        let wasWaiting = entry.toSort
+        let after = money.waiting.drop { $0.id != id }.dropFirst().map(\.id)
+        let problem = await changeMoney("sort it") { api, token in
+            try await api.sortMoneyEntry(token: token, id: id, to: choice, onlyThis: onlyThis, month: money.month)
+        }
+        guard problem == nil else { return problem }
+        if sortingEntry == id {
+            // The next one that is still waiting: a payee sorted once may
+            // have taken several of them with it.
+            let waiting = Set(self.money?.waiting.map(\.id) ?? [])
+            sortingEntry = wasWaiting ? (after.first(where: waiting.contains) ?? self.money?.waiting.first?.id) : nil
+        }
+        return nil
+    }
+
+    /// Sets an account aside, or brings it back. Returns what went wrong.
+    @discardableResult
+    public func setAside(account id: UUID, _ aside: Bool) async -> String? {
+        guard let month = money?.month else { return "Open the month first." }
+        return await changeMoney("change the account") { api, token in
+            try await api.setMoneyAccount(token: token, id: id, setAside: aside, month: month)
+        }
+    }
+
+    /// Asks the backend about money and shows the month it answers with.
+    /// `what` finishes "Could not …". Returns what went wrong, or nil.
+    private func changeMoney(
+        _ what: String, _ change: (LyfeAPI, String) async throws -> MoneyMonth
+    ) async -> String? {
+        guard phase == .signedIn, let api, let token else { return "Sign in first." }
+        do {
+            money = try await change(api, token)
+            isOffline = false
+            offlineReason = nil
+            return nil
+        } catch LyfeAPIError.unauthorized {
+            forgetSession()
+            return "Signed out."
+        } catch LyfeAPIError.unreachable(let why) {
+            isOffline = true
+            offlineReason = why
+            return "Could not \(what): can't reach the server (\(why))."
+        } catch LyfeAPIError.unreadableResponse {
+            return "The server's answer could not be read. The app may be older than the server."
+        } catch LyfeAPIError.server(let status) where (400..<500).contains(status) {
+            return "The server would not \(what) (\(status))."
+        } catch LyfeAPIError.server(let status) {
+            return "Could not \(what): the server answered with an error (\(status))."
+        } catch {
+            return "Could not \(what)."
+        }
     }
 
     // MARK: Progress and weigh-ins
