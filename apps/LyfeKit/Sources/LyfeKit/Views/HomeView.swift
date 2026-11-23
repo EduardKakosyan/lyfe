@@ -2,7 +2,8 @@ import SwiftUI
 
 /// Home: the week, one band per routine, and the black bar with the next
 /// thing to do. The gym fills itself in from the watch; the breath band
-/// opens the next session; the fuel band opens the Food screen.
+/// opens the next session; the fuel band opens the Food screen. Under
+/// them, the ways to Progress and to Money.
 public struct HomeView: View {
     let model: AppModel
     @State private var confirmingSignOut = false
@@ -19,75 +20,92 @@ public struct HomeView: View {
                         header(home)
                         PosterRule()
                         TimelineView(.periodic(from: .now, by: 30)) { timeline in
-                            SourceStrip(model: model, home: home, now: timeline.date)
+                            let source = home.sources.garmin
+                            if model.isOffline || model.refreshProblem != nil || source.state != .ok || source.lastSuccessAt.map({ timeline.date.timeIntervalSince($0) >= 86400 }) != false {
+                                SourceStrip(model: model, home: home, now: timeline.date)
+                                PosterRule()
+                            }
                         }
-                        PosterRule()
                         ForEach(notices, id: \.self) { notice in
                             NoticeRow(text: notice)
                             PosterRule()
                         }
-                        GymBand(home: home)
-                        PosterRule()
-                        if let streak = home.gym.streak, !streak.recent.isEmpty || streak.previousBest > 0 {
-                            StreakWeeks(streak: streak)
-                            PosterRule()
+                        let strength = home.gym.sessions.filter { $0.activityType == "strength_training" }
+                        metric(
+                            "Strength training", "\(strength.reduce(0) { $0 + $1.durationMin }) min",
+                            "This week · \(strength.count) \(strength.count == 1 ? "session" : "sessions")", Poster.red,
+                            action: model.openTraining)
+                        let weight = WeightText.hero(home.weight)
+                        metric(
+                            "Weight", weight.figure, weight.caption, Poster.paper, action: model.openProgress)
+                        metric(
+                            "Money",
+                            home.money.map { "\(MoneyText.amount($0.spentMinor)) \($0.currency)" } ?? "—",
+                            home.money.map { "Spent · \($0.month)" } ?? "Monthly spending", Poster.ink,
+                            light: true, action: model.openMoney)
+                        if let food = home.food {
+                            metric(
+                                "Food", "\(FoodText.kcal(food.kcal)) kcal", "Logged today", Poster.yellow,
+                                action: model.openFood)
                         }
                         if let breath = home.breath {
-                            Button {
-                                model.openBreathSession()
-                            } label: {
-                                VStack(spacing: 0) {
-                                    BreathBand(home: home, breath: breath)
-                                    PosterRule()
-                                    BreathTableStrip(breath: breath)
-                                    PosterRule()
-                                }
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityHint("Opens the next breath session")
-                            if !breath.streak.recent.isEmpty || breath.streak.previousBest > 0 {
-                                StreakWeeks(streak: breath.streak)
-                                PosterRule()
-                            }
+                            metric(
+                                "Breath", "\(breath.done)/\(breath.target)", "This week · start session",
+                                Poster.blue, light: true, action: model.openBreathSession)
                         }
-                        if let food = home.food {
-                            Button {
-                                model.openFood()
-                            } label: {
-                                VStack(spacing: 0) {
-                                    FuelBand(food: food)
-                                    PosterRule()
-                                    StripRow(left: FoodText.homeLine(food), right: "Log →")
-                                    PosterRule()
-                                }
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityHint("Opens Food")
-                        }
-                        SessionRows(home: home)
-                        Button {
-                            model.openProgress()
-                        } label: {
-                            WeightStrip(weight: home.weight)
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityHint("Opens Progress")
-                        PosterRule()
-                        signOutButton
+                        DisclosureGroup("Sessions & streaks") {
+                            StripRow(left: "Gym this week", right: "\(home.gym.done) / \(home.gym.target)")
+                            SessionRows(home: home)
+                            if let gym = home.gym.streak { streakDetail("Gym", gym) }
+                            if let breath = home.breath { streakDetail("Breath", breath.streak) }
+                        }.padding(Poster.margin).tint(Poster.ink)
+
                     }
                 }
                 .refreshable { await model.refresh() }
-                NextBar(home: home) { model.openBreathSession() }
+
             } else {
                 waiting
             }
         }
         .foregroundStyle(Poster.ink)
         .background(Poster.paper.ignoresSafeArea())
-        .confirmationDialog("Sign out of lyfe on this device?", isPresented: $confirmingSignOut, titleVisibility: .visible) {
+        .confirmationDialog(
+            "Sign out of lyfe on this device?", isPresented: $confirmingSignOut, titleVisibility: .visible
+        ) {
             Button("Sign out", role: .destructive) {
                 Task { await model.signOut() }
             }
+        }
+    }
+
+    private func streakDetail(_ title: String, _ streak: HomeSnapshot.WeekStreak) -> some View {
+        VStack(spacing: 0) {
+            StripRow(
+                left: title,
+                right: "\(streak.weeks) weeks" + (streak.state == .recovering ? " · recovering" : ""))
+            StreakWeeks(streak: streak)
+        }
+    }
+
+    private func metric(
+        _ title: String, _ value: String, _ caption: String, _ color: Color, light: Bool = false,
+        action: @escaping () -> Void
+    ) -> some View {
+        VStack(spacing: 0) {
+            Button(action: action) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(title).posterHeading(22)
+                        Text(caption).posterLabel()
+                    }
+                    Spacer()
+                    Text(value).font(.title.bold()).monospacedDigit()
+                    Image(systemName: "chevron.right").font(.caption.bold()).accessibilityHidden(true)
+                }.padding(Poster.margin).foregroundStyle(light ? Poster.paper : Poster.ink).background(
+                    color)
+            }.buttonStyle(.plain)
+            PosterRule()
         }
     }
 
@@ -112,38 +130,24 @@ public struct HomeView: View {
         } else if !model.unsentFood.isEmpty {
             notices.append(FoodText.unsent(model.unsentFood.count))
         }
+        if let problem = model.home?.money?.problem {
+            notices.append("Money · \(problem)")
+        }
         return notices
     }
 
     private func header(_ home: HomeSnapshot) -> some View {
-        HStack(alignment: .bottom) {
-            VStack(alignment: .leading, spacing: -8) {
-                Text("WEEK")
-                Text("\(home.week.isoWeek)").contentTransition(.numericText())
-            }
-            .font(.system(size: 38, weight: .heavy))
-            .tracking(-1.6)
+        HStack {
+            Text("LYFE").posterHeading(24)
+            Text(home.today.posterLabel).posterLabel()
             Spacer()
-            VStack(alignment: .trailing, spacing: 2) {
-                Text(home.today.posterLabel)
-                Text("\(home.gym.daysLeft) \(home.gym.daysLeft == 1 ? "DAY" : "DAYS") LEFT")
-            }
-            .font(.system(size: 11, weight: .bold))
-            .tracking(0.9)
-        }
-        .padding(.horizontal, Poster.margin)
-        .padding(.top, 10)
-        .padding(.bottom, 8)
-    }
-
-    private var signOutButton: some View {
-        Button {
-            confirmingSignOut = true
-        } label: {
-            Text("Sign out").posterLabel().opacity(0.55)
-        }
-        .buttonStyle(.plain)
-        .padding(.vertical, 28)
+            Menu {
+                Button("Refresh") { Task { await model.refresh() } }
+                Button("Sign out", role: .destructive) { confirmingSignOut = true }
+            } label: {
+                Image(systemName: "person.crop.circle").font(.title3).frame(width: 44, height: 44)
+            }.accessibilityLabel("Account")
+        }.padding(.horizontal, Poster.margin)
     }
 
     /// Signed in, but nothing fetched or cached yet.
@@ -178,7 +182,9 @@ public struct HomeView: View {
 
     private var waitingLine: String {
         if model.isRefreshing { return "Fetching your week" }
-        if model.isOffline { return "Can't reach the server: \(model.offlineReason ?? "the connection failed")." }
+        if model.isOffline {
+            return "Can't reach the server: \(model.offlineReason ?? "the connection failed")."
+        }
         return model.refreshProblem ?? "Fetching your week"
     }
 }
@@ -210,7 +216,8 @@ struct SourceStrip: View {
     }
 
     private func describe() -> (mark: MarkState, left: String, right: String, detail: String?) {
-        let seen = model.homeFetchedAt.map { "LAST SEEN \(agoLabel(from: $0, to: now))" } ?? "NOT SEEN YET"
+        let seen =
+            model.homeFetchedAt.map { "LAST SEEN \(agoLabel(from: $0, to: now))" } ?? "NOT SEEN YET"
         if model.isOffline {
             return (.outline, "OFFLINE", seen, nil)
         }
@@ -324,7 +331,8 @@ struct GymBand: View {
             // The streak once the backend sends one; this week's count before that.
             numeral: gym.streak?.weeks ?? gym.done,
             recovering: gym.streak?.state == .recovering,
-            lines: HomeText.gymLines(for: home), squares: HomeText.squares(done: gym.done, target: gym.target),
+            lines: HomeText.gymLines(for: home),
+            squares: HomeText.squares(done: gym.done, target: gym.target),
             spoken: HomeText.gymSpoken(for: home))
     }
 }
@@ -340,7 +348,8 @@ struct BreathBand: View {
             numeral: breath.streak.weeks, recovering: breath.streak.state == .recovering,
             lines: HomeText.weekLines(for: breath.streak, home: home),
             squares: HomeText.squares(done: breath.done, target: breath.target),
-            spoken: HomeText.spoken("Breath", streak: breath.streak, done: breath.done, target: breath.target))
+            spoken: HomeText.spoken(
+                "Breath", streak: breath.streak, done: breath.done, target: breath.target))
     }
 }
 
@@ -353,7 +362,8 @@ struct FuelBand: View {
         RoutineBand(
             name: "Fuel", colour: Poster.yellow, shade: Poster.yellowShade, ink: Poster.ink,
             numeral: food.streak.days, recovering: food.streak.state == .recovering,
-            lines: FoodText.bandLines(food), squares: FoodText.squares(food.streak), spoken: FoodText.bandSpoken(food))
+            lines: FoodText.bandLines(food), squares: FoodText.squares(food.streak),
+            spoken: FoodText.bandSpoken(food))
     }
 }
 
@@ -386,7 +396,8 @@ struct StreakWeeks: View {
                 }
             }
             if !streak.recent.isEmpty {
-                Text(streak.recent.count == 1 ? "Last week" : "Last \(streak.recent.count) weeks").posterLabel()
+                Text(streak.recent.count == 1 ? "Last week" : "Last \(streak.recent.count) weeks")
+                    .posterLabel()
             }
             Spacer(minLength: 0)
             if streak.previousBest > 0 {
@@ -522,7 +533,9 @@ enum HomeText {
     }
 
     /// The two lines under a routine's name in its band.
-    static func weekLines(for streak: HomeSnapshot.WeekStreak, home: HomeSnapshot) -> (headline: String, detail: String?) {
+    static func weekLines(for streak: HomeSnapshot.WeekStreak, home: HomeSnapshot) -> (
+        headline: String, detail: String?
+    ) {
         let more = "\(streak.remaining) MORE \(deadline(for: home))"
         switch (streak.state, streak.reachable) {
         case (.kept, _):
@@ -545,11 +558,15 @@ enum HomeText {
     /// The band read aloud.
     static func gymSpoken(for home: HomeSnapshot) -> String {
         let gym = home.gym
-        guard let streak = gym.streak else { return "Gym: \(gym.done) of \(gym.target) sessions this week" }
+        guard let streak = gym.streak else {
+            return "Gym: \(gym.done) of \(gym.target) sessions this week"
+        }
         return spoken("Gym", streak: streak, done: gym.done, target: gym.target)
     }
 
-    static func spoken(_ name: String, streak: HomeSnapshot.WeekStreak, done: Int, target: Int) -> String {
+    static func spoken(_ name: String, streak: HomeSnapshot.WeekStreak, done: Int, target: Int)
+        -> String
+    {
         let week = "\(done) of \(target) sessions this week"
         let weeks = "\(streak.weeks) \(streak.weeks == 1 ? "week" : "weeks") in a row"
         switch streak.state {
@@ -569,9 +586,12 @@ enum HomeText {
 
     static func weeksSpoken(for streak: HomeSnapshot.WeekStreak) -> String {
         let kept = streak.recent.filter { $0.mark == .kept }.count
-        let recovered = streak.recent.filter { $0.mark == .recovered || $0.mark == .awaitingRecovery }.count
+        let recovered = streak.recent.filter { $0.mark == .recovered || $0.mark == .awaitingRecovery }
+            .count
         let missed = streak.recent.filter { $0.mark == .missed }.count
-        var parts = ["Last \(streak.recent.count) weeks: \(kept) kept, \(recovered) recovered, \(missed) missed"]
+        var parts = [
+            "Last \(streak.recent.count) weeks: \(kept) kept, \(recovered) recovered, \(missed) missed"
+        ]
         if streak.previousBest > 0 {
             parts.append("Previous best \(streak.previousBest) weeks")
         }
@@ -612,10 +632,12 @@ enum HomeText {
             SessionRow(
                 id: "breath-\(session.id)", date: session.date, day: session.date.weekdayLabel,
                 label: session.counts ? "BREATH" : "BREATH · TOO SHORT TO COUNT",
-                value: session.bestMs.map { "BEST \(clockLabel(ms: $0))" } ?? "NO HOLD", counts: session.counts)
+                value: session.bestMs.map { "BEST \(clockLabel(ms: $0))" } ?? "NO HOLD",
+                counts: session.counts)
         }
         // Stable: a day's gym session stays above its breath session.
-        return rows.enumerated().sorted { ($0.element.date, $0.offset) < ($1.element.date, $1.offset) }.map(\.element)
+        return rows.enumerated().sorted { ($0.element.date, $0.offset) < ($1.element.date, $1.offset) }
+            .map(\.element)
     }
 
     // MARK: The black bar
@@ -661,7 +683,8 @@ enum HomeText {
         let gym = gymStatus(for: home)
         guard let breath = home.breath else { return gym.next }
         let other = breathStatus(breath, home: home)
-        let first = (other.urgency.rawValue, other.slack) < (gym.urgency.rawValue, gym.slack) ? other : gym
+        let first =
+            (other.urgency.rawValue, other.slack) < (gym.urgency.rawValue, gym.slack) ? other : gym
         switch first.urgency {
         case .session:
             return first.next
@@ -669,7 +692,8 @@ enum HomeText {
             return Next(small: "\(first.name) · \(first.next.small)", big: first.next.big)
         case .doneToday:
             let open = [gym, other].filter { $0.remaining > 0 }.map { "\($0.name) \($0.remaining) MORE" }
-            return Next(small: "\(open.joined(separator: " · ")) \(deadline(for: home))", big: "DONE FOR TODAY")
+            return Next(
+                small: "\(open.joined(separator: " · ")) \(deadline(for: home))", big: "DONE FOR TODAY")
         case .weekDone:
             return Next(small: "GYM \(home.gym.done) · BREATH \(breath.done) SESSIONS", big: "WEEK DONE")
         }
@@ -679,11 +703,15 @@ enum HomeText {
         let gym = home.gym
         let slack = (gym.streak?.openDays ?? gym.daysLeft) - gym.remaining
         func status(_ urgency: Urgency, _ small: String, _ big: String) -> Status {
-            Status(name: "GYM", urgency: urgency, slack: slack, remaining: gym.remaining, next: Next(small: small, big: big))
+            Status(
+                name: "GYM", urgency: urgency, slack: slack, remaining: gym.remaining,
+                next: Next(small: small, big: big))
         }
         if gym.remaining == 0 {
             if let streak = gym.streak {
-                return status(.weekDone, "\(streak.weeks) \(weeksInARow(streak.weeks)) · \(gym.done) SESSIONS", "GYM WEEK DONE")
+                return status(
+                    .weekDone, "\(streak.weeks) \(weeksInARow(streak.weeks)) · \(gym.done) SESSIONS",
+                    "GYM WEEK DONE")
             }
             return status(.weekDone, "WEEK \(home.week.isoWeek) · \(gym.done) SESSIONS", "GYM WEEK DONE")
         }
@@ -709,7 +737,9 @@ enum HomeText {
         if breath.remaining == 0 {
             return status(
                 .weekDone,
-                Next(small: "\(streak.weeks) \(weeksInARow(streak.weeks)) · \(breath.done) SESSIONS", big: "BREATH WEEK DONE"))
+                Next(
+                    small: "\(streak.weeks) \(weeksInARow(streak.weeks)) · \(breath.done) SESSIONS",
+                    big: "BREATH WEEK DONE"))
         }
         if !streak.reachable {
             let lost = outOfReach(streak)

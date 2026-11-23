@@ -98,6 +98,22 @@ public struct RootView: View {
                 }
             }
         }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if model.phase == .signedIn, !model.isLocked, model.home != nil, model.breathSession == nil,
+                !model.isEnteringWeight, model.foodFlow == nil, model.mealDraft == nil,
+                !model.isEnteringTargets, model.sortingEntry == nil
+            {
+                VStack(spacing: 0) {
+                    PosterRule()
+                    HStack(spacing: 0) {
+                        tab(.home, "Home", "house")
+                        if model.home?.food != nil { tab(.food, "Food", "fork.knife") }
+                        tab(.progress, "Progress", "chart.xyaxis.line")
+                        tab(.money, "Money", "wallet.pass")
+                    }
+                }.background(Poster.paper)
+            }
+        }
         // Rows show a meal's illustration once drawn, fetched once.
         .environment(
             \.mealIllustration, IllustrationSource { [model] in await model.mealIllustration($0) }
@@ -117,6 +133,32 @@ public struct RootView: View {
             }
         }
     }
+    private func tab(_ screen: AppModel.Screen, _ title: String, _ symbol: String) -> some View {
+        let selected = screen == model.screen
+        return Button {
+            guard !selected else { return }
+            switch model.screen {
+            case .money: model.closeMoney()
+            case .food: model.closeFood()
+            case .progress: model.closeProgress()
+            case .home: break
+            }
+            switch screen {
+            case .money: model.openMoney()
+            case .food: model.openFood()
+            case .progress: model.openProgress()
+            case .home: break
+            }
+        } label: {
+            VStack(spacing: 4) {
+                Image(systemName: symbol)
+                Text(title).font(.caption.bold())
+            }.frame(maxWidth: .infinity, minHeight: 48)
+                .foregroundStyle(selected ? Poster.paper : Poster.ink)
+                .background(selected ? Poster.ink : Poster.paper)
+        }.buttonStyle(.plain).accessibilityAddTraits(selected ? .isSelected : [])
+    }
+
 }
 
 /// The screens over Food and the builder: adding a part, a photo's
