@@ -532,7 +532,15 @@ public final class AppModel {
 
     // MARK: Progress and weigh-ins
 
+    private(set) var startsOnTraining = false
+
+    func openTraining() {
+        openProgress()
+        startsOnTraining = true
+    }
+
     public func openProgress() {
+        startsOnTraining = false
         screen = .progress
     }
 
@@ -544,6 +552,7 @@ public final class AppModel {
     /// Opens the weight entry over Progress. Also what tapping the morning
     /// prompt itself does, rather than typing into it.
     public func openWeighIn() {
+        startsOnTraining = false
         screen = .progress
         isEnteringWeight = true
     }
@@ -1043,6 +1052,10 @@ public final class AppModel {
     }
 
     // MARK: Parts: photos, barcodes and typed food
+
+    func recordProgress(_ entry: ProgressEntry) async -> String? {
+        await changeFood("save progress") { api, token in try await api.recordProgress(token: token, entry: entry) }
+    }
 
     /// Opens the photo screen: for the meal being built, starting one when
     /// there is none, or with `into` for a meal already logged.

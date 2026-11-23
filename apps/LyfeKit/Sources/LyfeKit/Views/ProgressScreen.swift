@@ -6,11 +6,15 @@ import SwiftUI
 public struct ProgressScreen: View {
     let weight: WeightTrend?
     let today: CalendarDay
+    var home: HomeSnapshot?
+    var save: ((ProgressEntry) async -> String?)?
     /// Weights typed here that the backend does not have yet.
     var unsent: Int = 0
     var problem: String?
     let onBack: () -> Void
     let onWeighIn: () -> Void
+
+    @State var training = false
 
     public var body: some View {
         VStack(spacing: 0) {
@@ -25,18 +29,34 @@ public struct ProgressScreen: View {
                         NoticeRow(text: WeightText.unsent(unsent))
                         PosterRule()
                     }
-                    WeightSection(weight: weight, today: today)
-                    if let weight {
-                        WeightRows(rows: WeightText.rows(weight, today: today))
+                    if home != nil {
+                        Picker("Progress view", selection: $training) {
+                            Text("Weight").tag(false)
+                            Text("Training & more").tag(true)
+                        }.pickerStyle(.segmented).padding(Poster.margin)
+                    }
+                    if !training {
+                        WeightSection(weight: weight, today: today)
+                        if let weight {
+                            WeightRows(rows: WeightText.rows(weight, today: today))
+                        }
+                    } else if let home {
+                        StripRow(left: "Sessions", right: "This week")
+                        SessionRows(home: home)
+                    }
+                    if training, let home, let progress = home.progress, let save {
+                        ProgressDetails(home: home, progress: progress, save: save)
                     }
                 }
             }
-            let bar = WeightText.bar(weight, today: today)
-            Button(action: onWeighIn) {
-                BreathBar(small: bar.small, big: bar.big, mark: "→", onDark: false)
+            if !training {
+                let bar = WeightText.bar(weight, today: today)
+                Button(action: onWeighIn) {
+                    BreathBar(small: bar.small, big: bar.big, mark: "→", onDark: false)
+                }
+                .buttonStyle(.plain)
+                .accessibilityHint("Opens the weight entry")
             }
-            .buttonStyle(.plain)
-            .accessibilityHint("Opens the weight entry")
         }
         .foregroundStyle(Poster.ink)
         .background(Poster.paper.ignoresSafeArea())
@@ -91,7 +111,8 @@ struct WeightSection: View {
                 HStack {
                     Text(WeightText.chartStart(today: today)).posterLabel()
                     Spacer()
-                    Text(WeightText.span(low: span.low, high: span.high, unit: weight.unit)).posterLabel().opacity(0.55)
+                    Text(WeightText.span(low: span.low, high: span.high, unit: weight.unit)).posterLabel()
+                        .opacity(0.55)
                     Spacer()
                     Text("Today").posterLabel()
                 }
@@ -121,7 +142,8 @@ struct WeightChart: View {
         Canvas { context, size in
             let layout = WeightChartLayout(days: days, today: today, size: size)
             var baseline = Path()
-            baseline.addRect(CGRect(x: 0, y: size.height - Poster.rule, width: size.width, height: Poster.rule))
+            baseline.addRect(
+                CGRect(x: 0, y: size.height - Poster.rule, width: size.width, height: Poster.rule))
             context.fill(baseline, with: .foreground)
             for point in layout.dots {
                 let square = CGRect(x: point.x - 2.5, y: point.y - 2.5, width: 5, height: 5)
@@ -131,7 +153,8 @@ struct WeightChart: View {
                 var line = Path()
                 line.addLines(segment)
                 context.stroke(
-                    line, with: .foreground, style: StrokeStyle(lineWidth: 4.5, lineCap: .square, lineJoin: .miter))
+                    line, with: .foreground,
+                    style: StrokeStyle(lineWidth: 4.5, lineCap: .square, lineJoin: .miter))
             }
         }
         .accessibilityHidden(true)
@@ -333,7 +356,8 @@ public enum WeightText {
                 return "Level with last week"
             }
             let arrow = change < 0 ? "▼" : "▲"
-            return "\(arrow) \(number(abs(change))) \(unit) · \(signed(percent, decimals: 2))% on last week"
+            return
+                "\(arrow) \(number(abs(change))) \(unit) · \(signed(percent, decimals: 2))% on last week"
         }
         if weight.average != nil {
             return "The change shows after two weeks of weigh-ins"
@@ -366,7 +390,9 @@ public enum WeightText {
     static func chartStart(today: CalendarDay) -> String {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = TimeZone(secondsFromGMT: 0)!
-        guard let date = calendar.date(from: DateComponents(year: today.year, month: today.month, day: today.day, hour: 12)),
+        guard
+            let date = calendar.date(
+                from: DateComponents(year: today.year, month: today.month, day: today.day, hour: 12)),
             let start = calendar.date(byAdding: .day, value: -(WeightChartLayout.daysShown - 1), to: date)
         else { return "" }
         let parts = calendar.dateComponents([.year, .month, .day], from: start)
@@ -381,7 +407,9 @@ public enum WeightText {
     /// The black bar on Progress.
     static func bar(_ weight: WeightTrend?, today: CalendarDay) -> (small: String, big: String) {
         if let weight, let latest = weight.latest, latest.date == today {
-            return ("TODAY \(number(latest.value)) \(weight.unit.uppercased()) · TAP TO CORRECT", "WEIGHED IN")
+            return (
+                "TODAY \(number(latest.value)) \(weight.unit.uppercased()) · TAP TO CORRECT", "WEIGHED IN"
+            )
         }
         if let at = weight?.promptAt {
             return ("PROMPT AT \(at) · OR TYPE IT HERE", "WEIGH IN")
@@ -443,7 +471,9 @@ public enum WeightText {
 
     /// The notification that asks again when a weight typed into the
     /// prompt was not taken. Nil when it was, or is waiting to be sent.
-    public static func retry(after outcome: WeighInOutcome, typed: String, unit: String) -> (title: String, body: String)? {
+    public static func retry(after outcome: WeighInOutcome, typed: String, unit: String) -> (
+        title: String, body: String
+    )? {
         let shown = typed.trimmingCharacters(in: .whitespacesAndNewlines)
         switch outcome {
         case .sent, .saved:
@@ -454,7 +484,9 @@ public enum WeightText {
                 "“\(shown)” is not a weight. Hold this and type it again, like \(example(unit))."
             )
         case .refused:
-            return ("Weigh-in not saved", "The server would not take “\(shown)”. Hold this and type it again.")
+            return (
+                "Weigh-in not saved", "The server would not take “\(shown)”. Hold this and type it again."
+            )
         }
     }
 }

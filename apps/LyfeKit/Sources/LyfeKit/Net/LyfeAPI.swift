@@ -375,6 +375,10 @@ public struct LyfeAPI: Sendable {
     }
 
     /// Asks the backend to check Garmin now. Can take as long as Garmin does.
+    func recordProgress(token: String, entry: ProgressEntry) async throws -> HomeSnapshot {
+        try await call("POST", "v1/progress", token: token, body: JSONEncoder.lyfe.encode(entry), timeout: 15)
+    }
+
     public func sync(token: String) async throws -> Sources {
         try await call("POST", "v1/sync", token: token, body: nil, timeout: 45)
     }

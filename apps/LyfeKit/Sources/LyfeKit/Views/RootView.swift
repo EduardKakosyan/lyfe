@@ -66,9 +66,10 @@ public struct RootView: View {
                             onLabel: { model.openLabel(code: $0) }, onReload: { await model.reloadHome() })
                     } else if model.screen == .progress, let home = model.home {
                         ProgressScreen(
-                            weight: home.weight, today: home.today, unsent: model.unsentWeighIns.count,
+                            weight: home.weight, today: home.today, home: home, save: model.recordProgress,
+                            unsent: model.unsentWeighIns.count,
                             problem: model.weighInProblem, onBack: { model.closeProgress() },
-                            onWeighIn: { model.openWeighIn() })
+                            onWeighIn: { model.openWeighIn() }, training: model.startsOnTraining)
                     } else {
                         HomeView(model: model)
                     }

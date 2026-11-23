@@ -13,6 +13,7 @@ public struct HomeSnapshot: Codable, Equatable, Sendable {
     public var weight: WeightTrend?
     /// Missing in answers cached before food logging existed.
     public var food: FoodDay?
+    var progress: ProgressHistory?
     public var sources: Sources
     /// Missing in answers cached before notifications existed.
     public var notifications: Notifications?
