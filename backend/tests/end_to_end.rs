@@ -3155,6 +3155,31 @@ async fn a_photo_drawn_in_an_older_look_is_drawn_again(pool: PgPool) {
     assert_eq!(look, lyfe_server::routines::illustration::LOOK);
 }
 
+// --- Migrations ------------------------------------------------------------
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_database_that_ran_the_reworded_migration_is_still_brought_up_to_date(pool: PgPool) {
+    // As the Spark's database is: migration 13 run in its earlier wording.
+    let earlier = sqlx::query("update _sqlx_migrations set checksum = '\\x0013'::bytea where version = 13")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(earlier.rows_affected(), 1);
+    assert!(lyfe_server::db::MIGRATOR.run(&pool).await.is_err(), "sqlx alone refuses it");
+    lyfe_server::db::migrate(&pool).await.unwrap();
+    lyfe_server::db::MIGRATOR.run(&pool).await.unwrap();
+    // What it made is gone either way, which is why the wording is not held to.
+    let left: i64 = sqlx::query_scalar("select count(*) from information_schema.tables where table_name like 'plaid%'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
+
+    // Any other migration changed after it ran is still refused.
+    sqlx::query("update _sqlx_migrations set checksum = '\\x0012'::bytea where version = 12").execute(&pool).await.unwrap();
+    assert!(lyfe_server::db::migrate(&pool).await.is_err());
+}
+
 // --- Food icons -----------------------------------------------------------
 
 /// Brings every icon's next try forward to now.

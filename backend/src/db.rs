@@ -23,8 +23,36 @@ pub async fn connect(database_url: &str) -> anyhow::Result<PgPool> {
         .max_connections(5)
         .connect(database_url)
         .await?;
-    MIGRATOR.run(&pool).await?;
+    migrate(&pool).await?;
     Ok(pool)
+}
+
+/// A migration whose wording changed after databases had run it. It made
+/// only the two tables the next migration drops, so a database that ran
+/// the earlier wording ends up exactly where one that ran this wording
+/// does.
+const REWORDED_MIGRATION: i64 = 13;
+
+/// Brings the database up to date. Every migration already run must be the
+/// one in this build, as sqlx checks, except the reworded one: a database
+/// that ran its earlier wording, on the Spark or restored from a backup,
+/// is told it ran this one, so that it is not refused.
+pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
+    let reworded = MIGRATOR.iter().find(|migration| migration.version == REWORDED_MIGRATION);
+    let has_run_any: bool = sqlx::query_scalar("select to_regclass('_sqlx_migrations') is not null").fetch_one(pool).await?;
+    if let (Some(reworded), true) = (reworded, has_run_any) {
+        let accepted = sqlx::query("update _sqlx_migrations set checksum = $2 where version = $1 and success and checksum <> $2")
+            .bind(REWORDED_MIGRATION)
+            .bind(reworded.checksum.as_ref())
+            .execute(pool)
+            .await?
+            .rows_affected();
+        if accepted > 0 {
+            tracing::info!(version = REWORDED_MIGRATION, "a migration reworded since this database ran it is taken as run");
+        }
+    }
+    MIGRATOR.run(pool).await?;
+    Ok(())
 }
 
 // --- Owner and device sessions -------------------------------------------
