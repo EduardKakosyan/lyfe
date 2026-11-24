@@ -90,6 +90,52 @@ public struct LyfeAPI: Sendable {
         return try await call("POST", "v1/breath/sessions", token: token, body: body, timeout: 20)
     }
 
+    /// Hands the backend a finished study session. It answers with Home as
+    /// it now stands. Sending the same session again changes nothing.
+    public func recordStudySession(token: String, run: StudyRun) async throws -> HomeSnapshot {
+        let body = try JSONEncoder.lyfe.encode(StudySessionUpload(run))
+        return try await call("POST", "v1/study/sessions", token: token, body: body, timeout: 20)
+    }
+
+    /// Sets a goal, or changes the title, figure or date of one already
+    /// set. It answers with Home as it now stands.
+    public func setGoal(token: String, id: UUID, request: GoalRequest) async throws -> HomeSnapshot {
+        let body = try JSONEncoder.lyfe.encode(request)
+        return try await call("PUT", "v1/goals/\(id.uuidString.lowercased())", token: token, body: body, timeout: 15)
+    }
+
+    /// Makes a goal active, parks it, or ends it as reached or dropped.
+    public func setGoalStatus(token: String, id: UUID, status: GoalStatus, note: String?) async throws -> HomeSnapshot {
+        struct Body: Encodable {
+            var status: GoalStatus
+            var note: String?
+        }
+        let body = try JSONEncoder.lyfe.encode(Body(status: status, note: note))
+        return try await call(
+            "POST", "v1/goals/\(id.uuidString.lowercased())/status", token: token, body: body, timeout: 15)
+    }
+
+    /// Keeps a practice test's score for an exam goal.
+    public func recordPractice(token: String, goal: UUID, entry: PracticeEntry) async throws -> HomeSnapshot {
+        let body = try JSONEncoder.lyfe.encode(entry)
+        return try await call(
+            "POST", "v1/goals/\(goal.uuidString.lowercased())/scores", token: token, body: body, timeout: 15)
+    }
+
+    /// Keeps how an exam went.
+    public func recordExamResult(
+        token: String, goal: UUID, passed: Bool, on: CalendarDay, score: Int?
+    ) async throws -> HomeSnapshot {
+        struct Body: Encodable {
+            var outcome: String
+            var on: CalendarDay
+            var score: Int?
+        }
+        let body = try JSONEncoder.lyfe.encode(Body(outcome: passed ? "passed" : "failed", on: on, score: score))
+        return try await call(
+            "POST", "v1/goals/\(goal.uuidString.lowercased())/result", token: token, body: body, timeout: 15)
+    }
+
     /// Hands the backend a weight the owner typed. It answers with Home as
     /// it now stands. Sending the same weigh-in again changes nothing.
     /// Kept short: it may be running behind the lock screen, where the

@@ -53,11 +53,20 @@ public struct HomeView: View {
                                 "Breath", "\(breath.done)/\(breath.target)", "This week · start session",
                                 Poster.blue, light: true, action: model.openBreathSession)
                         }
+                        if home.study != nil || model.studyRun != nil {
+                            TimelineView(.periodic(from: .now, by: 1)) { timeline in
+                                metric(
+                                    "Study", StudyText.homeFigure(home.study, running: model.studyRun, now: timeline.date),
+                                    StudyText.homeCaption(home.study, running: model.studyRun, now: timeline.date),
+                                    Poster.green, action: model.openStudy)
+                            }
+                        }
                         DisclosureGroup("Sessions & streaks") {
                             StripRow(left: "Gym this week", right: "\(home.gym.done) / \(home.gym.target)")
                             SessionRows(home: home)
                             if let gym = home.gym.streak { streakDetail("Gym", gym) }
                             if let breath = home.breath { streakDetail("Breath", breath.streak) }
+                            if let study = home.study { streakDetail("Study", study.streak) }
                         }.padding(Poster.margin).tint(Poster.ink)
 
                     }
@@ -119,6 +128,11 @@ public struct HomeView: View {
             notices.append(problem)
         } else if !model.unsentBreath.isEmpty {
             notices.append(HomeText.unsentBreath(model.unsentBreath.count))
+        }
+        if let problem = model.studyProblem {
+            notices.append(problem)
+        } else if !model.unsentStudy.isEmpty {
+            notices.append(StudyText.unsent(model.unsentStudy.count))
         }
         if let problem = model.weighInProblem {
             notices.append(problem)

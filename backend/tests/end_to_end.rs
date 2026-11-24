@@ -81,6 +81,7 @@ async fn harness_at(pool: PgPool, now: &str, with_key: bool) -> Harness {
             min_duration_s: 15.0 * 60.0,
         }),
         breath_rules: Arc::new(lyfe_server::routines::breath::BreathRules::default()),
+        study_rules: Arc::new(lyfe_server::routines::study::StudyRules::default()),
         // Kilograms here; pounds, the default, have their own test.
         weight: lyfe_server::routines::weight::WeightSettings {
             unit: lyfe_server::routines::weight::Unit::Kg,
@@ -728,6 +729,7 @@ fn notifier(h: &Harness, apple: &MockServer) -> Notifier {
         default_environment: Environment::Development,
         timezone: h.state.timezone,
         gym_rules: h.state.gym_rules.clone(),
+        study_rules: h.state.study_rules.clone(),
         from_hour: 7,
         until_hour: 18,
         weight: h.state.weight,
@@ -1347,6 +1349,459 @@ async fn when_both_routines_need_today_each_gets_its_own_prompt(pool: PgPool) {
     assert_eq!(sent(notifier.tick(at("2026-11-21T12:05:00Z")).await.unwrap()), "Breath: 2 more by Sunday");
     assert_eq!(notifier.tick(at("2026-11-21T12:10:00Z")).await.unwrap(), Outcome::AlreadySent);
     assert_eq!(apple.received_requests().await.unwrap().len(), 2);
+}
+
+// --- Study sessions ------------------------------------------------------
+
+/// A study session as the phone sends it: `minutes` on the timer from
+/// `started_at`, with no pause.
+fn study_session(n: u32, started_at: &str, minutes: i64, subject: &str, kind: &str) -> Value {
+    let ended_at = at(started_at) + chrono::Duration::minutes(minutes);
+    json!({
+        "id": format!("00000000-0000-4000-a000-{n:012}"),
+        "started_at": started_at,
+        "ended_at": ended_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "active_s": minutes * 60,
+        "subject": subject,
+        "kind": kind,
+    })
+}
+
+impl Harness {
+    async fn record_study(&self, token: &str, session: Value) -> Value {
+        let (status, body) = self.post("/v1/study/sessions", Some(token), Some(session)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body
+    }
+
+    /// Four 50-minute evenings (Monday to Thursday) in each week starting
+    /// on the given Mondays.
+    async fn study_weeks(&self, token: &str, mondays: &[&str]) {
+        for (week, monday) in mondays.iter().enumerate() {
+            for day in 0..4 {
+                let date: chrono::NaiveDate = monday.parse().unwrap();
+                let started_at = format!("{}T23:00:00Z", date + chrono::Duration::days(day));
+                let n = 1000 + (week * 10) as u32 + day as u32;
+                self.record_study(token, study_session(n, &started_at, 50, "System design", "questions")).await;
+            }
+        }
+    }
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_study_session_counts_once_its_timer_passes_the_minimum(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+
+    let (_, before) = h.get("/v1/home", Some(&token)).await;
+    let study = &before["study"];
+    assert_eq!((&study["target"], &study["done"], &study["remaining"]), (&json!(4), &json!(0), &json!(4)));
+    assert_eq!(study["streak"]["state"], "not_started");
+    assert_eq!(study["subjects"], json!([]));
+    assert_eq!(
+        study["rules"],
+        json!({"min_minutes": 45, "target_minutes": 90, "builds_per_week": 2, "stop_after_minutes": 180})
+    );
+
+    // Thirty minutes this morning does not count; ninety-two this evening
+    // (Monday 19:00 in San Juan is Monday 23:00 UTC) on the day before.
+    let short = h
+        .record_study(&token, study_session(1, "2026-11-17T12:00:00Z", 30, "System design", "reading"))
+        .await;
+    assert_eq!((&short["study"]["done"], &short["study"]["done_today"]), (&json!(0), &json!(false)));
+    assert_eq!(short["study"]["sessions"][0]["not_counted"], "short");
+
+    let mut questions = study_session(2, "2026-11-16T23:00:00Z", 92, "  system   DESIGN ", "questions");
+    questions["answered"] = json!(12);
+    questions["right_first"] = json!(8);
+    let after = h.record_study(&token, questions.clone()).await;
+    let study = &after["study"];
+    assert_eq!((&study["done"], &study["remaining"], &study["done_today"]), (&json!(1), &json!(3), &json!(false)));
+    assert_eq!(study["minutes"], 122);
+    let first = &study["sessions"][0];
+    assert_eq!((&first["date"], &first["minutes"], &first["counts"]), (&json!("2026-11-16"), &json!(92), &json!(true)));
+    assert_eq!((&first["answered"], &first["right_first"]), (&json!(12), &json!(8)));
+    // The name typed differently is the same subject, kept as first typed.
+    assert_eq!(study["subjects"].as_array().unwrap().len(), 1);
+    assert_eq!(study["subjects"][0]["name"], "System design");
+    assert_eq!((&study["subjects"][0]["minutes"], &study["subjects"][0]["sessions"]), (&json!(122), &json!(2)));
+
+    // Sent again, even changed, it is the same session.
+    let mut altered = questions;
+    altered["active_s"] = json!(10);
+    altered["subject"] = json!("Something else");
+    let again = h.record_study(&token, altered).await;
+    assert_eq!(again["study"], after["study"]);
+    let subjects: i64 = sqlx::query_scalar("select count(*) from study_subjects")
+        .fetch_one(&h.state.pool)
+        .await
+        .unwrap();
+    assert_eq!(subjects, 1);
+    // The gym and breath training are untouched by it.
+    assert_eq!((&after["gym"]["done"], &after["breath"]["done"]), (&json!(0), &json!(0)));
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_build_session_counts_with_its_explain_back_and_two_a_week(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+
+    let unexplained = h
+        .record_study(&token, study_session(1, "2026-11-16T12:00:00Z", 120, "lyfe", "build"))
+        .await;
+    assert_eq!(unexplained["study"]["sessions"][0]["not_counted"], "not_explained");
+    assert_eq!(unexplained["study"]["done"], 0);
+
+    for (n, day) in [(2, "2026-11-16T22:00:00Z"), (3, "2026-11-17T12:00:00Z"), (4, "2026-11-17T13:00:00Z")] {
+        let mut build = study_session(n, day, 60, "lyfe", "build");
+        build["explain_back"] = json!("  The study timer, worked out from the clock so a locked phone cannot stop it.  ");
+        h.record_study(&token, build).await;
+    }
+    let (_, home) = h.get("/v1/home", Some(&token)).await;
+    let study = &home["study"];
+    // Monday's second and Tuesday's first count; Tuesday's second is a third.
+    assert_eq!((&study["builds"], &study["done"]), (&json!(2), &json!(2)));
+    let marks: Vec<&Value> = study["sessions"].as_array().unwrap().iter().map(|s| &s["not_counted"]).collect();
+    assert_eq!(marks, [&json!("not_explained"), &Value::Null, &Value::Null, &json!("builds_used")]);
+    let kept: String = sqlx::query_scalar("select explain_back from study_sessions where kind = 'build' and explain_back is not null limit 1")
+        .fetch_one(&h.state.pool)
+        .await
+        .unwrap();
+    assert!(kept.starts_with("The study timer"), "{kept}");
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_study_session_that_makes_no_sense_is_refused(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    let good = study_session(1, "2026-11-17T12:00:00Z", 60, "System design", "questions");
+
+    let (status, _) = h.post("/v1/study/sessions", None, Some(good.clone())).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let with = |field: &str, value: Value| {
+        let mut bad = good.clone();
+        bad[field] = value;
+        bad
+    };
+    let bads = [
+        with("ended_at", json!("2026-11-17T11:00:00Z")),
+        with("active_s", json!(3661 + 60)),
+        with("subject", json!("   ")),
+        with("subject", json!("x".repeat(61))),
+        with("kind", json!("nap")),
+        with("answered", json!(1001)),
+        with("right_first", json!(3)),
+        with("ended_at", json!("2026-11-18T13:00:00Z")),
+        with("started_at", json!("2026-11-19T12:00:00Z")),
+        with("explain_back", json!("x".repeat(4001))),
+    ];
+    for bad in bads {
+        let (status, body) = h.post("/v1/study/sessions", Some(&token), Some(bad.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad} {body}");
+    }
+    let mut more_right = good.clone();
+    more_right["answered"] = json!(5);
+    more_right["right_first"] = json!(6);
+    let (status, _) = h.post("/v1/study/sessions", Some(&token), Some(more_right)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (_, home) = h.get("/v1/home", Some(&token)).await;
+    assert_eq!(home["study"]["sessions"], json!([]));
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn study_weeks_build_a_streak_and_prompt_when_every_day_is_needed(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    register_device(&h, &token).await;
+    // Weeks 45 and 46 kept, Monday and Tuesday of week 47 done.
+    h.study_weeks(&token, &["2026-11-02", "2026-11-09"]).await;
+    for (n, day) in [(1, "2026-11-16T23:00:00Z"), (2, "2026-11-17T23:00:00Z")] {
+        h.record_study(&token, study_session(n, day, 50, "System design", "questions")).await;
+    }
+    let (_, home) = h.get("/v1/home", Some(&token)).await;
+    assert_eq!((&home["study"]["streak"]["weeks"], &home["study"]["streak"]["state"]), (&json!(2), &json!("on_track")));
+    let apple = MockServer::start().await;
+    apple_answers(&apple, "dev", 200, None).await;
+    let notifier = notifier(&h, &apple);
+
+    // Friday 08:00 in San Juan: three days left for two sessions.
+    assert_eq!(notifier.tick(at("2026-11-20T12:00:00Z")).await.unwrap(), Outcome::NothingDue);
+    // Saturday 08:00: today and Sunday are both needed.
+    assert_eq!(
+        notifier.tick(at("2026-11-21T12:00:00Z")).await.unwrap(),
+        Outcome::Sent {
+            title: "Study: 2 more by Sunday".into(),
+            body: "Study today to keep your 2-week streak. It takes every day left this week.".into(),
+            devices: 1,
+        }
+    );
+    assert_eq!(notifier.tick(at("2026-11-21T12:05:00Z")).await.unwrap(), Outcome::AlreadySent);
+    let requests = apple.received_requests().await.unwrap();
+    assert_eq!(requests[0].headers.get("apns-collapse-id").unwrap(), "study_train_today");
+}
+
+// --- Goals ---------------------------------------------------------------
+
+fn goal_id(n: u32) -> String {
+    format!("00000000-0000-4000-c000-{n:012}")
+}
+
+impl Harness {
+    async fn set_goal(&self, token: &str, n: u32, body: Value) -> Value {
+        let (status, answer) = self.put(&format!("/v1/goals/{}", goal_id(n)), Some(token), body).await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        answer
+    }
+
+    async fn goal_status(&self, token: &str, n: u32, status: &str) -> (StatusCode, Value) {
+        self.post(&format!("/v1/goals/{}/status", goal_id(n)), Some(token), Some(json!({ "status": status }))).await
+    }
+}
+
+fn goal_in<'a>(home: &'a Value, n: u32) -> &'a Value {
+    home["goals"]["goals"].as_array().unwrap().iter().find(|g| g["id"] == goal_id(n)).unwrap()
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_study_goal_moves_as_sessions_on_its_subject_are_timed(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    let (_, before) = h.get("/v1/home", Some(&token)).await;
+    assert_eq!(before["goals"], json!({"limit": 3, "goals": []}));
+
+    // Eighty hours on one subject by 4 January.
+    let home = h
+        .set_goal(&token, 1, json!({"reading": "study_minutes", "subject": "cloud certification", "target_value": 4800, "due_on": "2027-01-04"}))
+        .await;
+    let goal = goal_in(&home, 1);
+    assert_eq!((&goal["title"], &goal["shape"], &goal["status"]), (&json!("Study · cloud certification"), &json!("total"), &json!("active")));
+    assert_eq!((&goal["start_on"], &goal["start_value"], &goal["moved_by"]), (&json!("2026-11-17"), &json!(0.0), &json!("study")));
+    assert_eq!(goal["standing"]["current"], 0.0);
+    assert_eq!(goal["days_left"], 48);
+
+    // A session on it moves it; one on another subject does not.
+    h.record_study(&token, study_session(1, "2026-11-17T12:00:00Z", 92, "Cloud Certification", "questions")).await;
+    let after = h.record_study(&token, study_session(2, "2026-11-17T14:00:00Z", 50, "System design", "reading")).await;
+    let standing = &goal_in(&after, 1)["standing"];
+    assert_eq!(standing["current"], 92.0);
+    assert_eq!(standing["reached"], false);
+    // The subject named in the goal is the one sessions found by name.
+    assert_eq!(after["study"]["subjects"].as_array().unwrap().len(), 2);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_hold_goal_starts_at_the_best_hold_and_a_weight_goal_needs_a_weight(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    h.record_breath(&token, breath_session(1, "2026-11-16T14:30:00Z", 240, GOOD_HOLDS)).await;
+    let home = h
+        .set_goal(&token, 1, json!({"title": "Three-minute hold", "reading": "breath_hold", "target_value": 180, "due_on": "2027-06-01"}))
+        .await;
+    let goal = goal_in(&home, 1);
+    assert_eq!((&goal["start_value"], &goal["standing"]["current"]), (&json!(132.0), &json!(132.0)));
+    assert_eq!((&goal["shape"], &goal["moved_by"]), (&json!("reach"), &json!("breath")));
+    assert_eq!(goal["standing"]["ahead_by"], 0.0);
+
+    let (status, body) = h
+        .put(&format!("/v1/goals/{}", goal_id(2)), Some(&token), json!({"reading": "weight", "target_value": 78000, "due_on": "2027-06-01"}))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["detail"], "lyfe has no reading of that yet");
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn three_goals_are_active_and_changes_are_kept(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    for n in 1..=4 {
+        h.set_goal(&token, n, json!({"reading": "study_minutes", "target_value": 600 * n, "due_on": "2027-03-01"})).await;
+    }
+    let (_, home) = h.get("/v1/home", Some(&token)).await;
+    let statuses: Vec<&Value> = (1..=4).map(|n| &goal_in(&home, n)["status"]).collect();
+    assert_eq!(statuses, [&json!("active"), &json!("active"), &json!("active"), &json!("parked")]);
+
+    // A fourth cannot be made active until one is parked.
+    let (status, body) = h.goal_status(&token, 4, "active").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(h.goal_status(&token, 1, "parked").await.0, StatusCode::OK);
+    let (status, home) = h.goal_status(&token, 4, "active").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(goal_in(&home, 4)["status"], "active");
+
+    // Moving the figure and the date keeps what they were; sending the same
+    // again changes nothing.
+    let moved = json!({"target_value": 900, "due_on": "2027-04-01"});
+    h.set_goal(&token, 2, moved.clone()).await;
+    let home = h.set_goal(&token, 2, moved).await;
+    let changes = &goal_in(&home, 2)["changes"];
+    assert_eq!(
+        changes,
+        &json!([
+            {"on": "2026-11-17", "what": "target", "was": "1200", "now": "900"},
+            {"on": "2026-11-17", "what": "due", "was": "2027-03-01", "now": "2027-04-01"}
+        ])
+    );
+    assert_eq!(goal_in(&home, 2)["start_on"], "2026-11-17");
+
+    // Dropped, with a line why: kept, ended today, and last in the list.
+    let (status, home) = h
+        .post(&format!("/v1/goals/{}/status", goal_id(3)), Some(&token), Some(json!({"status": "dropped", "note": "  Not this year. "})))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let dropped = goal_in(&home, 3);
+    assert_eq!((&dropped["status"], &dropped["ended_on"], &dropped["note"]), (&json!("dropped"), &json!("2026-11-17"), &json!("Not this year.")));
+    assert_eq!(home["goals"]["goals"].as_array().unwrap().last().unwrap()["id"], goal_id(3));
+    // A goal can be taken up again.
+    let (_, home) = h.goal_status(&token, 3, "parked").await;
+    assert_eq!((&goal_in(&home, 3)["status"], &goal_in(&home, 3)["ended_on"]), (&json!("parked"), &Value::Null));
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_goal_that_makes_no_sense_is_refused(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    let uri = format!("/v1/goals/{}", goal_id(1));
+    let (status, _) = h.put(&uri, None, json!({"reading": "study_minutes", "target_value": 600, "due_on": "2027-01-04"})).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    for bad in [
+        json!({"reading": "study_minutes", "target_value": 600, "due_on": "2026-11-17"}),
+        json!({"reading": "study_minutes", "target_value": 600, "due_on": "2037-01-04"}),
+        json!({"reading": "study_minutes", "target_value": 10, "due_on": "2027-01-04"}),
+        json!({"reading": "net_worth", "target_value": 600, "due_on": "2027-01-04"}),
+        json!({"reading": "breath_hold", "subject": "Breath", "target_value": 180, "due_on": "2027-01-04"}),
+        json!({"reading": "breath_hold", "target_value": 5000, "due_on": "2027-01-04"}),
+        json!({"title": "   ", "reading": "study_minutes", "target_value": 600, "due_on": "2027-01-04"}),
+        json!({"target_value": 600, "due_on": "2027-01-04"}),
+    ] {
+        let (status, body) = h.put(&uri, Some(&token), bad.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad} {body}");
+    }
+    h.set_goal(&token, 1, json!({"reading": "study_minutes", "target_value": 600, "due_on": "2027-01-04"})).await;
+    let (status, _) = h.put(&uri, Some(&token), json!({"reading": "breath_hold", "target_value": 180, "due_on": "2027-01-04"})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = h.goal_status(&token, 9, "parked").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = h.goal_status(&token, 1, "won").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+fn an_exam() -> Value {
+    json!({
+        "name": "Solutions  architect",
+        "scale_max": 1000,
+        "pass_mark": 720,
+        "ready_margin": 30,
+        "ready_runs": 3,
+        "valid_months": 36,
+        "domains": [
+            {"name": "Secure", "weight_pct": 30},
+            {"name": "Resilient", "weight_pct": 26},
+            {"name": "High-performing", "weight_pct": 24},
+            {"name": "Cost-optimized", "weight_pct": 20}
+        ]
+    })
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn an_exam_is_got_ready_for_with_practice_scores_and_ended_by_its_result(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    let home = h
+        .set_goal(&token, 1, json!({"reading": "exam", "subject": "Cloud certification", "due_on": "2027-01-04", "exam": an_exam()}))
+        .await;
+    let goal = goal_in(&home, 1);
+    assert_eq!((&goal["title"], &goal["shape"], &goal["moved_by"]), (&json!("Solutions architect"), &json!("result"), &json!("study")));
+    assert_eq!((&goal["target_value"], &goal["standing"]), (&json!(720.0), &Value::Null));
+    let exam = &goal["exam"];
+    assert_eq!((&exam["ready_at"], &exam["in_a_row"], &exam["ready"]), (&json!(750), &json!(0), &json!(false)));
+    assert_eq!(exam["domains"].as_array().unwrap().len(), 4);
+
+    // Study on its subject counts toward it.
+    h.record_study(&token, study_session(1, "2026-11-17T12:00:00Z", 92, "cloud certification", "questions")).await;
+
+    let score = |n: u32, day: &str, score: u32, domains: Value| {
+        json!({"id": format!("00000000-0000-4000-d000-{n:012}"), "taken_on": day, "score": score, "domains": domains})
+    };
+    let uri = format!("/v1/goals/{}/scores", goal_id(1));
+    for (n, day, points) in [(1, "2026-11-10", 640), (2, "2026-11-13", 760), (3, "2026-11-15", 755)] {
+        let (status, body) = h.post(&uri, Some(&token), Some(score(n, day, points, json!([])))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let last = score(4, "2026-11-17", 790, json!([{"name": "secure", "pct": 78}, {"name": "Resilient", "pct": 64}]));
+    let (_, home) = h.post(&uri, Some(&token), Some(last.clone())).await;
+    // Sent again, it is kept once.
+    let (_, again) = h.post(&uri, Some(&token), Some(last)).await;
+    assert_eq!(goal_in(&again, 1), goal_in(&home, 1));
+    let exam = &goal_in(&home, 1)["exam"];
+    assert_eq!((&exam["in_a_row"], &exam["ready"]), (&json!(3), &json!(true)));
+    assert_eq!(exam["practice"].as_array().unwrap().len(), 4);
+    assert_eq!(exam["domains"][0]["latest_pct"], 78);
+    assert_eq!(exam["weakest"], "Resilient");
+    assert_eq!(exam["minutes"], 92);
+
+    for bad in [
+        score(5, "2026-11-18", 700, json!([])),
+        score(6, "2026-11-16", 1001, json!([])),
+        score(7, "2026-11-16", 700, json!([{"name": "Networking", "pct": 50}])),
+        score(8, "2026-11-16", 700, json!([{"name": "Secure", "pct": 101}])),
+    ] {
+        let (status, body) = h.post(&uri, Some(&token), Some(bad.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad} {body}");
+    }
+
+    // Not passed the first time: still active, and its date moved by the owner.
+    let result = format!("/v1/goals/{}/result", goal_id(1));
+    let (status, home) = h.post(&result, Some(&token), Some(json!({"outcome": "failed", "on": "2026-11-16", "score": 701}))).await;
+    assert_eq!(status, StatusCode::OK, "{home}");
+    assert_eq!(goal_in(&home, 1)["status"], "active");
+    assert_eq!(goal_in(&home, 1)["exam"]["result"], json!({"outcome": "failed", "on": "2026-11-16", "score": 701}));
+    // Passed: reached, and valid for three years from the day.
+    let (_, home) = h.post(&result, Some(&token), Some(json!({"outcome": "passed", "on": "2026-11-17", "score": 801}))).await;
+    let goal = goal_in(&home, 1);
+    assert_eq!((&goal["status"], &goal["ended_on"]), (&json!("reached"), &json!("2026-11-17")));
+    assert_eq!(goal["exam"]["expires_on"], "2029-11-17");
+    assert_eq!(goal["changes"].as_array().unwrap().last().unwrap()["now"], "reached");
+
+    // A figure goal has no practice or result.
+    h.set_goal(&token, 2, json!({"reading": "study_minutes", "target_value": 600, "due_on": "2027-01-04"})).await;
+    let (status, _) = h.post(&format!("/v1/goals/{}/scores", goal_id(2)), Some(&token), Some(score(9, "2026-11-16", 700, json!([])))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn an_exam_that_does_not_hang_together_is_refused(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    let uri = format!("/v1/goals/{}", goal_id(1));
+    let with = |field: &str, value: Value| {
+        let mut exam = an_exam();
+        exam[field] = value;
+        json!({"reading": "exam", "due_on": "2027-01-04", "exam": exam})
+    };
+    for bad in [
+        with("pass_mark", json!(990)),
+        with("name", json!("  ")),
+        with("ready_runs", json!(0)),
+        with("domains", json!([{"name": "Secure", "weight_pct": 30}, {"name": "secure", "weight_pct": 20}])),
+        json!({"reading": "exam", "due_on": "2027-01-04"}),
+        json!({"reading": "study_minutes", "target_value": 600, "due_on": "2027-01-04", "exam": an_exam()}),
+    ] {
+        let (status, body) = h.put(&uri, Some(&token), bad.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad} {body}");
+    }
+    // Its pass mark and parts can be changed once set, keeping practice.
+    h.set_goal(&token, 1, json!({"reading": "exam", "due_on": "2027-01-04", "exam": an_exam()})).await;
+    let mut changed = an_exam();
+    changed["pass_mark"] = json!(700);
+    changed["domains"] = json!([{"name": "Everything", "weight_pct": 100}]);
+    let home = h.set_goal(&token, 1, json!({"due_on": "2027-02-01", "exam": changed})).await;
+    let goal = goal_in(&home, 1);
+    assert_eq!((&goal["target_value"], &goal["exam"]["pass_mark"]), (&json!(700.0), &json!(700)));
+    assert_eq!(goal["exam"]["domains"][0]["name"], "Everything");
+    let whats: Vec<&Value> = goal["changes"].as_array().unwrap().iter().map(|c| &c["what"]).collect();
+    assert_eq!(whats, [&json!("target"), &json!("due")]);
 }
 
 // --- Weigh-ins -----------------------------------------------------------

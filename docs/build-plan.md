@@ -10,9 +10,11 @@ Money update (2026-11-23, built and tested on this Mac): money moved ahead of st
 
 Worth and FIRE update (2026-11-24, built and tested on this Mac, not installed): Money has three sections, MONTH, WORTH and FIRE (ADR 0009). The import now also stores what each investment account holds, as the bridge lists it, and keeps every account's balance once a day. Worth shows net worth, the line it has drawn since it began being kept, what it is made of, the holdings with what they have grown by, and the accounts, which moved there from the month. FIRE shows what was kept of what came in over the months held whole, the FI number and the years to it, the coast number, the runway, and the plan it is worked out from, which the owner sets. It was tried in the simulator against a local backend and the stand-in bridge, which now has a broker: an import, Worth with its line, an account set aside from Worth, FIRE, and the plan changed and saved. Not installed on the Spark or the phone. Its checks there are still to do: what `money-check` says of the real investment accounts (how many holdings are read, and that they come to about the whole balance), net worth set against the banks' own figures, and the months FIRE counts set against the statements. The net worth line starts the day it is installed.
 
+Study update (2026-11-24, built and tested on this Mac): goals and study were designed from research on goal pursuit, study and net-worth tracking (ADR 0010), and steps 11 to 15 were added. Step 11 is the Worth and FIRE update above, built alongside. Step 12 is built: study sessions are timed in the app on a subject and counted by the backend, with the week prompt. It was tried in the simulator against a local backend: a 92-minute session was recorded with its figures and Home showed the week. It is not installed on the Spark or the phone; its check on the real phone (a week of study, one session timed with the phone locked) is still to do. Steps 13 and 14 are built and tested on this Mac, in the backend's tests and the simulator's galleries: goals on a breath hold, the weight trend, body fat and study hours, against their pace, three active, with their changes kept; and exams, with practice scores, readiness by the owner's rule and the exam's parts, and the result. Net worth is not yet a goal: step 11 now keeps the daily balances it needs, and it is one reading to add. Neither is installed.
+
 An iPhone app in the Poster style that keeps three routines going: gym, breath training and food logging. It shows streaks with a recovery rule, pushes breath-hold progression, holds you to calorie and protein targets, and takes as little typing as possible. The backend runs on the Spark and is reached over Tailscale.
 
-Not in the first version: study sessions, a watch app.
+Not in the first version: a watch app. Study sessions and goals were added after it (steps 11 to 15, ADR 0010).
 
 ## How the work is cut
 
@@ -31,6 +33,10 @@ Each step below works end to end, from capture to a screen you can look at, befo
 | 9 | Use the same data from the Mac, and let an AI assistant read and act through MCP | 1 to 8 |
 | 10 | See a month's spending across every account by category, without typing any of it | 1, and the banks connected at SimpleFIN Bridge |
 | 11 | See what everything comes to and what the investments are in, and how far off financial independence is | 10 |
+| 12 | Run a study session on a subject, see the week on Home, keep the streak | 1 |
+| 13 | Set a goal on net worth, a breath hold, the weight trend or study hours, and see it against its pace | 11, 12 |
+| 14 | Set up a certification, type practice scores, and see readiness by the exam's domains | 12, 13 |
+| 15 | Sit a marked mock interview every four weeks | 12, and the Spark's marking checked against the owner's |
 
 ## The steps
 
@@ -55,6 +61,14 @@ Each step below works end to end, from capture to a screen you can look at, befo
 **10. Money.** Backend: a job that asks SimpleFIN Bridge for balances and posted transactions a few times a day and stores them under the bank's own ids; the rules for what an entry is (an expense, a refund, money in, money moved) as one tested module, with card payments paired and kept out of spending; the owner's word on a payee kept and applied to every entry from it. App: the Money screen with the month's figure, categories, entries and accounts, the sorting screen, and a strip on Home. Check: connect the banks, and a month's spending by category matches the statements, with no card payment counted.
 
 **11. Worth and FIRE.** Backend: the import stores what each investment account holds and keeps every account's balance once a day; net worth and the holdings as one tested module, and the way to financial independence as another (what is kept over whole months, the FI number, the years to it, the coast number, the runway), worked out from a plan the owner sets. App: Money in three sections, with the net worth line, the holdings and what they have grown by, what came in and was spent a month at a time, the line ahead, and the plan's entry. Check: the holdings and net worth match the banks' own figures, and the months counted match the statements.
+
+**12. Study sessions.** App: a timer on a subject, worked out from the clock so a locked phone or a closed app does not stop it, with pause, a start moved back up to two hours, and a stop by itself at three hours that asks when the owner really stopped; afterwards, what it was (questions, reading or a build), the questions answered and right first time, or a build's explain-back. Backend: a session counts once past 45 minutes, a day counts once, four days keep the week with the gym's recovery rule, builds count for at most two a week with an explain-back; the week prompt as for the gym. Check: a week of study on the phone, one session timed with the phone locked.
+
+**13. Goals.** Backend: goals in three shapes (a figure to reach, a total to build up, a result to get), each worked out from what is already stored, with its pace and what would now be needed; three active, the rest parked; changes recorded. App: a Goals tab. Check: a goal on study hours moves as sessions are timed, and one on a hold as holds are recorded.
+
+**14. Certifications.** A result to get, with the exam's published pass mark, domains and their weights, and how long it stays valid; practice scores typed after each test; readiness by a rule the owner sets; the expiry held once passed.
+
+**15. Mock interviews.** Only after about twenty answers marked by the model on the Spark are set against the owner's own marking.
 
 ## Rules that apply to every step
 

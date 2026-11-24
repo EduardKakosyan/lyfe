@@ -10,9 +10,12 @@ use uuid::Uuid;
 use crate::money::{self, fire, ledger, worth};
 use crate::routines::breath;
 use crate::routines::food::{self, Detail, Figures, Label, PhotoDetail, Quantity, Slot};
+use crate::routines::exam;
+use crate::routines::goals;
 use crate::routines::illustration;
 use crate::routines::photo::{self, Oil};
 use crate::routines::product::{self, Origin, Product};
+use crate::routines::study;
 use crate::routines::gym::Activity;
 use crate::routines::weight::{self, Unit};
 
@@ -400,6 +403,372 @@ pub async fn breath_sessions(pool: &PgPool, timezone: chrono_tz::Tz) -> sqlx::Re
             }
         })
         .collect())
+}
+
+// --- Study sessions ------------------------------------------------------
+
+/// A study session as the phone timed it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredStudySession {
+    pub id: Uuid,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: DateTime<Utc>,
+    pub active_s: i32,
+    /// The subject's name, as tidied by `study::subject_name`.
+    pub subject: String,
+    pub kind: study::Kind,
+    pub answered: Option<i32>,
+    pub right_first: Option<i32>,
+    pub explain_back: Option<String>,
+}
+
+/// Stores a session, and its subject when the name is new. Returns false,
+/// and changes nothing, when a session with this id is already stored.
+pub async fn insert_study_session(
+    pool: &PgPool,
+    session: &StoredStudySession,
+    device_session_id: i64,
+) -> sqlx::Result<bool> {
+    let mut tx = pool.begin().await?;
+    let known: bool = sqlx::query_scalar("select exists (select 1 from study_sessions where id = $1)")
+        .bind(session.id)
+        .fetch_one(&mut *tx)
+        .await?;
+    if known {
+        return Ok(false);
+    }
+    sqlx::query("insert into study_subjects (name) values ($1) on conflict ((lower(name))) do nothing")
+        .bind(&session.subject)
+        .execute(&mut *tx)
+        .await?;
+    let subject_id: Uuid = sqlx::query_scalar("select id from study_subjects where lower(name) = lower($1)")
+        .bind(&session.subject)
+        .fetch_one(&mut *tx)
+        .await?;
+    let inserted = sqlx::query(
+        "insert into study_sessions
+            (id, started_at, ended_at, active_s, subject_id, kind, answered, right_first, explain_back, device_session_id)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         on conflict (id) do nothing",
+    )
+    .bind(session.id)
+    .bind(session.started_at)
+    .bind(session.ended_at)
+    .bind(session.active_s)
+    .bind(subject_id)
+    .bind(session.kind.as_str())
+    .bind(session.answered)
+    .bind(session.right_first)
+    .bind(&session.explain_back)
+    .bind(device_session_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        == 1;
+    tx.commit().await?;
+    Ok(inserted)
+}
+
+/// Every study session, oldest first, with its start read in the owner's
+/// time zone.
+pub async fn study_sessions(pool: &PgPool, timezone: chrono_tz::Tz) -> sqlx::Result<Vec<study::Session>> {
+    let rows = sqlx::query(
+        "select s.id, s.started_at, s.active_s, s.subject_id, sub.name as subject, s.kind,
+                s.answered, s.right_first, s.explain_back
+         from study_sessions s
+         join study_subjects sub on sub.id = s.subject_id
+         order by s.started_at, s.id",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let started_at: DateTime<Utc> = r.get("started_at");
+            let kind: String = r.get("kind");
+            study::Session {
+                id: r.get("id"),
+                started_local: started_at.with_timezone(&timezone).naive_local(),
+                active_s: r.get::<i32, _>("active_s").max(0) as u32,
+                subject_id: r.get("subject_id"),
+                subject: r.get("subject"),
+                kind: study::Kind::parse(&kind).unwrap_or(study::Kind::Reading),
+                answered: r.get::<Option<i32>, _>("answered").map(|n| n.max(0) as u32),
+                right_first: r.get::<Option<i32>, _>("right_first").map(|n| n.max(0) as u32),
+                explain_back: r.get("explain_back"),
+            }
+        })
+        .collect())
+}
+
+// --- Goals ---------------------------------------------------------------
+
+/// Every goal with its changes, in no particular order.
+pub async fn goals(conn: &mut sqlx::PgConnection) -> sqlx::Result<Vec<goals::Goal>> {
+    let rows = sqlx::query(
+        "select g.id, g.title, g.reading, g.subject_id, s.name as subject, g.start_on, g.start_value,
+                g.target_value, g.due_on, g.status, g.ended_on, g.note
+         from goals g left join study_subjects s on s.id = g.subject_id
+         order by g.created_at, g.id",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    let changes = sqlx::query("select goal_id, changed_on, what, was, became from goal_changes order by id")
+        .fetch_all(&mut *conn)
+        .await?;
+    let mut exams = exams(conn).await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| {
+            let id: Uuid = r.get("id");
+            let reading: String = r.get("reading");
+            let status: String = r.get("status");
+            Some(goals::Goal {
+                id,
+                title: r.get("title"),
+                reading: goals::Reading::parse(&reading)?,
+                subject_id: r.get("subject_id"),
+                subject: r.get("subject"),
+                start_on: r.get("start_on"),
+                start_value: r.get("start_value"),
+                target_value: r.get("target_value"),
+                due_on: r.get("due_on"),
+                status: goals::Status::parse(&status)?,
+                ended_on: r.get("ended_on"),
+                note: r.get("note"),
+                changes: changes
+                    .iter()
+                    .filter(|c| c.get::<Uuid, _>("goal_id") == id)
+                    .map(|c| goals::Change {
+                        on: c.get("changed_on"),
+                        what: c.get("what"),
+                        was: c.get("was"),
+                        now: c.get("became"),
+                    })
+                    .collect(),
+                exam: exams.remove(&id),
+            })
+        })
+        .collect())
+}
+
+/// Every exam with its parts, practice and result, by its goal.
+async fn exams(conn: &mut sqlx::PgConnection) -> sqlx::Result<std::collections::HashMap<Uuid, exam::Exam>> {
+    let rows = sqlx::query(
+        "select goal_id, name, scale_max, pass_mark, ready_margin, ready_runs, valid_months, result, result_on, result_score
+         from exams",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    let domains = sqlx::query("select goal_id, name, weight_pct from exam_domains order by goal_id, position")
+        .fetch_all(&mut *conn)
+        .await?;
+    let practice = sqlx::query("select id, goal_id, taken_on, score from practice_scores order by taken_on, id")
+        .fetch_all(&mut *conn)
+        .await?;
+    let parts = sqlx::query("select score_id, domain, pct from practice_domain_scores order by score_id, domain")
+        .fetch_all(&mut *conn)
+        .await?;
+    let count = |r: &sqlx::postgres::PgRow, column: &str| r.get::<i32, _>(column).max(0) as u32;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let goal_id: Uuid = r.get("goal_id");
+            let result: Option<String> = r.get("result");
+            let exam = exam::Exam {
+                name: r.get("name"),
+                scale_max: count(&r, "scale_max"),
+                pass_mark: count(&r, "pass_mark"),
+                ready_margin: count(&r, "ready_margin"),
+                ready_runs: count(&r, "ready_runs"),
+                valid_months: r.get::<Option<i32>, _>("valid_months").map(|m| m.max(0) as u32),
+                domains: domains
+                    .iter()
+                    .filter(|d| d.get::<Uuid, _>("goal_id") == goal_id)
+                    .map(|d| exam::Domain { name: d.get("name"), weight_pct: count(d, "weight_pct") })
+                    .collect(),
+                result: result.as_deref().and_then(exam::Outcome::parse).map(|outcome| exam::Sitting {
+                    outcome,
+                    on: r.get("result_on"),
+                    score: r.get::<Option<i32>, _>("result_score").map(|n| n.max(0) as u32),
+                }),
+                practice: practice
+                    .iter()
+                    .filter(|p| p.get::<Uuid, _>("goal_id") == goal_id)
+                    .map(|p| {
+                        let id: Uuid = p.get("id");
+                        exam::Practice {
+                            id,
+                            taken_on: p.get("taken_on"),
+                            score: count(p, "score"),
+                            domains: parts
+                                .iter()
+                                .filter(|d| d.get::<Uuid, _>("score_id") == id)
+                                .map(|d| (d.get("domain"), count(d, "pct")))
+                                .collect(),
+                        }
+                    })
+                    .collect(),
+            };
+            (goal_id, exam)
+        })
+        .collect())
+}
+
+/// Stores what an exam is held to, its parts replaced by these. Its
+/// practice and result are left alone.
+pub async fn save_exam(conn: &mut sqlx::PgConnection, goal_id: Uuid, exam: &exam::Exam) -> sqlx::Result<()> {
+    sqlx::query(
+        "insert into exams (goal_id, name, scale_max, pass_mark, ready_margin, ready_runs, valid_months)
+         values ($1, $2, $3, $4, $5, $6, $7)
+         on conflict (goal_id) do update set name = excluded.name, scale_max = excluded.scale_max,
+            pass_mark = excluded.pass_mark, ready_margin = excluded.ready_margin,
+            ready_runs = excluded.ready_runs, valid_months = excluded.valid_months",
+    )
+    .bind(goal_id)
+    .bind(&exam.name)
+    .bind(exam.scale_max as i32)
+    .bind(exam.pass_mark as i32)
+    .bind(exam.ready_margin as i32)
+    .bind(exam.ready_runs as i32)
+    .bind(exam.valid_months.map(|m| m as i32))
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query("delete from exam_domains where goal_id = $1").bind(goal_id).execute(&mut *conn).await?;
+    for (index, domain) in exam.domains.iter().enumerate() {
+        sqlx::query("insert into exam_domains (goal_id, position, name, weight_pct) values ($1, $2, $3, $4)")
+            .bind(goal_id)
+            .bind(index as i32 + 1)
+            .bind(&domain.name)
+            .bind(domain.weight_pct as i32)
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Stores a practice test with how each part went. Returns false, and
+/// changes nothing, when one with this id is already stored.
+pub async fn insert_practice(conn: &mut sqlx::PgConnection, goal_id: Uuid, practice: &exam::Practice) -> sqlx::Result<bool> {
+    let inserted = sqlx::query(
+        "insert into practice_scores (id, goal_id, taken_on, score) values ($1, $2, $3, $4) on conflict (id) do nothing",
+    )
+    .bind(practice.id)
+    .bind(goal_id)
+    .bind(practice.taken_on)
+    .bind(practice.score as i32)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected()
+        == 1;
+    if inserted {
+        for (domain, pct) in &practice.domains {
+            sqlx::query("insert into practice_domain_scores (score_id, domain, pct) values ($1, $2, $3)")
+                .bind(practice.id)
+                .bind(domain)
+                .bind(*pct as i32)
+                .execute(&mut *conn)
+                .await?;
+        }
+    }
+    Ok(inserted)
+}
+
+pub async fn set_exam_result(conn: &mut sqlx::PgConnection, goal_id: Uuid, sitting: &exam::Sitting) -> sqlx::Result<()> {
+    sqlx::query("update exams set result = $2, result_on = $3, result_score = $4 where goal_id = $1")
+        .bind(goal_id)
+        .bind(sitting.outcome.as_str())
+        .bind(sitting.on)
+        .bind(sitting.score.map(|n| n as i32))
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// Holds every other change to goals back until this transaction ends, so
+/// two at once cannot both make a fourth goal active.
+pub async fn lock_goals(conn: &mut sqlx::PgConnection) -> sqlx::Result<()> {
+    sqlx::query("lock table goals in share row exclusive mode").execute(conn).await?;
+    Ok(())
+}
+
+pub async fn active_goals(conn: &mut sqlx::PgConnection, other_than: Uuid) -> sqlx::Result<i64> {
+    sqlx::query_scalar("select count(*) from goals where status = 'active' and id <> $1")
+        .bind(other_than)
+        .fetch_one(conn)
+        .await
+}
+
+/// The id of a study subject by its name whatever the case, made when new.
+pub async fn study_subject(conn: &mut sqlx::PgConnection, name: &str) -> sqlx::Result<Uuid> {
+    sqlx::query("insert into study_subjects (name) values ($1) on conflict ((lower(name))) do nothing")
+        .bind(name)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query_scalar("select id from study_subjects where lower(name) = lower($1)")
+        .bind(name)
+        .fetch_one(conn)
+        .await
+}
+
+pub async fn insert_goal(conn: &mut sqlx::PgConnection, goal: &goals::Goal) -> sqlx::Result<()> {
+    sqlx::query(
+        "insert into goals (id, title, reading, subject_id, start_on, start_value, target_value, due_on, status)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+    )
+    .bind(goal.id)
+    .bind(&goal.title)
+    .bind(goal.reading.as_str())
+    .bind(goal.subject_id)
+    .bind(goal.start_on)
+    .bind(goal.start_value)
+    .bind(goal.target_value)
+    .bind(goal.due_on)
+    .bind(goal.status.as_str())
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// Stores a goal's title, figure, date, status and note as they now are,
+/// and the changes that led there.
+pub async fn update_goal(
+    conn: &mut sqlx::PgConnection,
+    goal: &goals::Goal,
+    changes: &[goals::Change],
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "update goals set title = $2, target_value = $3, due_on = $4, status = $5, ended_on = $6, note = $7
+         where id = $1",
+    )
+    .bind(goal.id)
+    .bind(&goal.title)
+    .bind(goal.target_value)
+    .bind(goal.due_on)
+    .bind(goal.status.as_str())
+    .bind(goal.ended_on)
+    .bind(&goal.note)
+    .execute(&mut *conn)
+    .await?;
+    for change in changes {
+        sqlx::query("insert into goal_changes (goal_id, changed_on, what, was, became) values ($1, $2, $3, $4, $5)")
+            .bind(goal.id)
+            .bind(change.on)
+            .bind(&change.what)
+            .bind(&change.was)
+            .bind(&change.now)
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(())
+}
+
+/// The latest body-fat estimate on or before `day`.
+pub async fn latest_body_fat(conn: &mut sqlx::PgConnection, day: NaiveDate) -> sqlx::Result<Option<f64>> {
+    sqlx::query_scalar("select estimate from tape_entries where day <= $1 order by day desc, id desc limit 1")
+        .bind(day)
+        .fetch_optional(conn)
+        .await
 }
 
 // --- Weigh-ins -----------------------------------------------------------

@@ -298,6 +298,7 @@ struct World {
     let addresses: MemoryServerAddressStore
     let cache = HomeCache(directory: Fixture.temporaryDirectory())
     let breath = BreathStore(directory: Fixture.temporaryDirectory())
+    let study = StudyStore(directory: Fixture.temporaryDirectory())
     let weighIns = WeighInStore(directory: Fixture.temporaryDirectory())
     let food = FoodStore(directory: Fixture.temporaryDirectory())
     let captures = CaptureStore(directory: Fixture.temporaryDirectory())
@@ -322,7 +323,8 @@ struct World {
     func launch(transport: (any HTTPTransport)? = nil, ownerCheck: any OwnerCheck = NoOwnerCheck()) -> AppModel {
         let time = time
         return AppModel(
-            tokens: tokens, addresses: addresses, cache: cache, breath: breath, weighIns: weighIns, food: food,
+            tokens: tokens, addresses: addresses, cache: cache, breath: breath, study: study, weighIns: weighIns,
+            food: food,
             captures: captures, drafts: drafts, illustrations: illustrations, foodIcons: icons,
             transport: transport ?? backend,
             deviceName: "Test iPhone", ownerCheck: ownerCheck, now: { time.now })
