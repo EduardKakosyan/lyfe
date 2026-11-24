@@ -888,7 +888,10 @@ struct BreathAgainstARealBackendTests {
             session.tap()
         }
         let run = try #require(session.run)
-        await eventually { model.unsentBreath.isEmpty }
+        // A real server answers in real time, not within so many yields.
+        for _ in 0..<100 where !model.unsentBreath.isEmpty {
+            try await Task.sleep(for: .milliseconds(50))
+        }
         #expect(model.unsentBreath.isEmpty, "\(model.breathProblem ?? model.offlineReason ?? "")")
 
         let after = try #require(model.home?.breath)

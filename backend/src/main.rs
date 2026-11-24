@@ -8,13 +8,18 @@ use clap::{Parser, Subcommand};
 
 use lyfe_server::api::{self, AppState};
 use lyfe_server::auth::{self, SignInThrottle};
-use lyfe_server::config::{DatabaseConfig, GarminConfig, ServeConfig};
+use lyfe_server::config::{DatabaseConfig, GarminConfig, IllustrationConfig, MoneyConfig, PhotoConfig, ServeConfig};
 use lyfe_server::db;
+use lyfe_server::estimator::Estimator;
+use lyfe_server::illustrator::Illustrator;
 use lyfe_server::garmin::sync::{parse_activity, Syncer};
 use lyfe_server::garmin::GarminClient;
+use lyfe_server::money::sync::Importer;
+use lyfe_server::money::{self, BridgeClient};
 use lyfe_server::push::apns::{Alert, ApnsClient};
 use lyfe_server::push::notifier::Notifier;
 use lyfe_server::routines::gym::{self, Week};
+use lyfe_server::routines::{photo, product};
 use lyfe_server::routines::streak::{Mark, State};
 
 #[derive(Parser)]
@@ -47,6 +52,57 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         days: i64,
     },
+    /// Connect lyfe to SimpleFIN Bridge: asks for a setup token made there
+    /// (typed hidden), trades it for the access address and writes that to
+    /// the access file. Done once; the banks themselves are connected at
+    /// the bridge.
+    MoneyConnect {
+        #[command(flatten)]
+        money: MoneyConfig,
+    },
+    /// Ask the bridge for the last week and print counts only. Touches no
+    /// database; use it to confirm the access file works. It uses one of
+    /// the day's requests.
+    MoneyCheck {
+        #[command(flatten)]
+        money: MoneyConfig,
+    },
+    /// Import accounts and transactions now, without waiting for the next
+    /// time one is due, and print counts only. It uses one of the day's
+    /// requests.
+    MoneyImport(Box<ServeConfig>),
+    /// Read the Open Food Facts export (tab separated, unzipped) from
+    /// standard input and make it the food database barcodes are looked up
+    /// in, replacing the last one.
+    ImportFoodDb {
+        #[command(flatten)]
+        database: DatabaseConfig,
+    },
+    /// Ask the vision model to estimate one meal photo and print what it
+    /// answers. Stores nothing; use it to check the model works.
+    PhotoCheck {
+        #[command(flatten)]
+        photo: PhotoConfig,
+        /// A JPEG of the meal.
+        jpeg: Option<std::path::PathBuf>,
+        /// The one line that goes with it.
+        #[arg(long, default_value = "")]
+        note: String,
+    },
+    /// Draw one meal photo as a Poster illustration with the image model and
+    /// write it out. Stores nothing; use it to check the illustrator works.
+    IllustrationCheck {
+        #[command(flatten)]
+        illustration: IllustrationConfig,
+        /// A JPEG of the meal.
+        jpeg: std::path::PathBuf,
+        /// The one line that goes with it.
+        #[arg(long, default_value = "")]
+        note: String,
+        /// Where to write the illustration (a PNG).
+        #[arg(long, default_value = "illustration.png")]
+        out: std::path::PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -64,6 +120,14 @@ async fn main() -> anyhow::Result<()> {
         Command::GymWeeks(config) => gym_weeks(*config).await,
         Command::PushTest(config) => push_test(*config).await,
         Command::GarminCheck { garmin, days } => garmin_check(garmin, days).await,
+        Command::MoneyConnect { money } => money_connect(money).await,
+        Command::MoneyCheck { money } => money_check(money).await,
+        Command::MoneyImport(config) => money_import(*config).await,
+        Command::ImportFoodDb { database } => import_food_db(database).await,
+        Command::PhotoCheck { photo, jpeg, note } => photo_check(photo, jpeg, note).await,
+        Command::IllustrationCheck { illustration, jpeg, note, out } => {
+            illustration_check(illustration, jpeg, note, out).await
+        }
     }
 }
 
@@ -81,6 +145,17 @@ fn garmin_syncer(config: &ServeConfig, pool: &sqlx::PgPool) -> anyhow::Result<Ar
         garmin_client(&config.garmin)?,
         config.garmin.garmin_backfill_days,
         config.garmin.garmin_window_days,
+    )))
+}
+
+fn money_importer(config: &ServeConfig, pool: &sqlx::PgPool) -> anyhow::Result<Arc<Importer>> {
+    let client = config.money.simplefin_access_file.clone().map(BridgeClient::new).transpose()?;
+    Ok(Arc::new(Importer::new(
+        pool.clone(),
+        client,
+        config.timezone,
+        i64::from(config.money.money_backfill_days),
+        i64::from(config.money.money_window_days),
     )))
 }
 
@@ -111,6 +186,8 @@ fn notifier(config: &ServeConfig, pool: &sqlx::PgPool, syncer: Arc<Syncer>) -> a
         gym_rules: Arc::new(config.gym_rules()),
         from_hour: push.notify_from_hour,
         until_hour: push.notify_until_hour,
+        weight: config.weight_settings(),
+        food: config.food_settings(),
     }))
 }
 
@@ -139,6 +216,8 @@ async fn serve(config: ServeConfig) -> anyhow::Result<()> {
                 tracing::info!(
                     from_hour = notifier.from_hour,
                     until_hour = notifier.until_hour,
+                    weigh_in_at = ?notifier.weight.prompt_at.map(|at| at.format("%H:%M").to_string()),
+                    food_prompt_at = ?notifier.food.prompt_at.map(|at| at.format("%H:%M").to_string()),
                     "notifications are on"
                 );
                 tokio::spawn(Arc::new(notifier).run_forever(Duration::from_secs(300)));
@@ -155,6 +234,58 @@ async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         }
     };
 
+    let importer = money_importer(&config, &pool)?;
+    if importer.is_configured() {
+        tracing::info!(every_hours = config.money.money_sync_hours, "accounts and transactions are imported from SimpleFIN Bridge");
+    } else {
+        tracing::warn!("LYFE_SIMPLEFIN_ACCESS_FILE is not set; no accounts or transactions will be imported");
+    }
+    tokio::spawn(
+        importer
+            .clone()
+            .run_forever(Duration::from_secs(u64::from(config.money.money_sync_hours) * 3600)),
+    );
+
+    let estimator_wake = Arc::new(tokio::sync::Notify::new());
+    let illustrator_wake = Arc::new(tokio::sync::Notify::new());
+    let estimator = Arc::new(
+        Estimator::new(pool.clone(), config.photo.estimator_settings(), estimator_wake.clone())?
+            .waking(illustrator_wake.clone()),
+    );
+    match &estimator.settings().ollama_url {
+        Some(url) => tracing::info!(
+            ollama = %url,
+            model = %estimator.settings().model,
+            context = estimator.settings().context,
+            min_free_gb = estimator.settings().min_free_gb,
+            "photo meals are estimated on this machine"
+        ),
+        None => tracing::warn!("LYFE_OLLAMA_URL is off; photo meals are not estimated and are typed in by hand"),
+    }
+    tokio::spawn(estimator.run_forever());
+
+    let illustrator =
+        Arc::new(Illustrator::new(pool.clone(), config.illustration.illustrator_settings(), illustrator_wake.clone()));
+    match &illustrator.settings().program {
+        Some(program) if std::path::Path::new(&program[0]).exists() => tracing::info!(
+            program = %program[0],
+            min_free_gb = illustrator.settings().min_free_gb,
+            "meal photos are illustrated on this machine"
+        ),
+        Some(program) => tracing::warn!(
+            program = %program[0],
+            "the illustrator is not installed (see lyfe-illustrator-setup); meals keep their photos until it is"
+        ),
+        None => tracing::warn!("LYFE_ILLUSTRATOR is off; meals keep their photos"),
+    }
+    if illustrator.settings().program.is_some() {
+        let redrawn = db::redraw_older_looks(&pool).await?;
+        if redrawn > 0 {
+            tracing::info!(redrawn, "meals drawn in an older look will be drawn again");
+        }
+    }
+    tokio::spawn(illustrator.run_forever());
+
     let state = AppState {
         pool,
         syncer,
@@ -162,7 +293,13 @@ async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         timezone: config.timezone,
         gym_rules: Arc::new(config.gym_rules()),
         breath_rules: Arc::new(config.breath_rules()),
+        weight: config.weight_settings(),
         push_ready,
+        estimate_range_pct: config.photo.photo_range_percent,
+        estimator_wake,
+        illustrator_wake,
+        money: importer,
+        money_currency: config.money.money_currency.clone(),
         now: Arc::new(Utc::now),
     };
     let listener = tokio::net::TcpListener::bind(config.listen_addr)
@@ -303,6 +440,7 @@ async fn push_test(config: ServeConfig) -> anyhow::Result<()> {
         body: "Test notification. Prompts will arrive like this.".to_string(),
         collapse_id: "test".to_string(),
         expires_at: now + chrono::Duration::minutes(10),
+        category: None,
     };
     let delivered = notifier.deliver(&targets, &alert, now).await;
     println!("Apple accepted the test for {delivered} of {} devices.", targets.len());
@@ -339,5 +477,193 @@ async fn garmin_check(config: GarminConfig, days: i64) -> anyhow::Result<()> {
     for ((year, week), count) in by_week {
         println!("  {year} week {week}: {count} activities");
     }
+    Ok(())
+}
+
+fn access_file(config: &MoneyConfig) -> anyhow::Result<std::path::PathBuf> {
+    config
+        .simplefin_access_file
+        .clone()
+        .context("set LYFE_SIMPLEFIN_ACCESS_FILE or pass --simplefin-access-file")
+}
+
+async fn money_connect(config: MoneyConfig) -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let path = access_file(&config)?;
+    if path.exists() {
+        bail!(
+            "{} already holds an access address; lyfe is connected. To start over, revoke it at the bridge and delete the file",
+            path.display()
+        );
+    }
+    // Opened before the token is spent, so a place that cannot be written
+    // does not cost a token. Only this account can read it.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("could not create {}", path.display()))?;
+    let token = if std::io::stdin().is_terminal() {
+        rpassword::prompt_password("SimpleFIN setup token (hidden): ")?
+    } else {
+        let mut line = String::new();
+        std::io::stdin().lock().read_line(&mut line)?;
+        line
+    };
+    let access = match money::claim(&token).await {
+        Ok(access) => access,
+        Err(error) => {
+            let _ = std::fs::remove_file(&path);
+            bail!("{error}");
+        }
+    };
+    file.write_all(access.as_bytes()).and_then(|()| file.sync_all()).with_context(|| {
+        format!("the token was spent but {} could not be written; revoke it at the bridge and make a new one", path.display())
+    })?;
+    println!("Connected. The access address is in {}.", path.display());
+    println!("Check it with `lyfe-server money-check`, then restart lyfe-server.");
+    Ok(())
+}
+
+async fn money_check(config: MoneyConfig) -> anyhow::Result<()> {
+    let client = BridgeClient::new(access_file(&config)?)?;
+    let now = Utc::now();
+    let set = client.accounts(now - chrono::Duration::days(7), now + chrono::Duration::days(1)).await?;
+    println!(
+        "The bridge returned {} accounts under {} connections ({} unreadable).",
+        set.accounts.len(),
+        set.connections.len(),
+        set.unreadable_accounts
+    );
+    for (index, account) in set.accounts.iter().enumerate() {
+        println!(
+            "  account {}: {} posted in the last week ({} unreadable), balance as of {}",
+            index + 1,
+            account.transactions.len(),
+            account.unreadable,
+            account.balance_at.format("%Y-%m-%d %H:%M UTC")
+        );
+    }
+    for trouble in &set.troubles {
+        println!("  the bridge says: {}", trouble.text);
+    }
+    Ok(())
+}
+
+async fn money_import(config: ServeConfig) -> anyhow::Result<()> {
+    let pool = db::connect(&config.database.database_url)
+        .await
+        .context("could not open the database")?;
+    let importer = money_importer(&config, &pool)?;
+    let Some(result) = importer.import_once(Utc::now()).await else {
+        bail!("set LYFE_SIMPLEFIN_ACCESS_FILE to the file `lyfe-server money-connect` wrote; see the README");
+    };
+    let report = result?;
+    println!(
+        "Imported {} accounts, asking the bridge {} time(s): {} posted transactions, {} new, {} changed by the bank, {} unreadable.",
+        report.accounts, report.requests, report.fetched, report.new, report.changed, report.unreadable
+    );
+    println!("{} entries were sorted again; the bridge reported {} problems.", report.resorted, report.troubles);
+    Ok(())
+}
+
+async fn import_food_db(database: DatabaseConfig) -> anyhow::Result<()> {
+    let pool = db::connect(&database.database_url)
+        .await
+        .context("could not open the database")?;
+    let mut lines = std::io::stdin().lock().lines();
+    let header = lines.next().context("nothing came in on standard input")??;
+    let columns = product::Columns::from_header(&header).map_err(anyhow::Error::msg)?;
+    let mut import = db::ProductImport::begin(&pool).await?;
+    let (mut read, mut skipped) = (0u64, 0u64);
+    let mut batch = Vec::with_capacity(5_000);
+    for line in lines {
+        // A line that is not text is skipped like any other unusable line.
+        let Ok(line) = line else {
+            skipped += 1;
+            continue;
+        };
+        read += 1;
+        match columns.product(&line) {
+            Some(found) => batch.push(found),
+            None => skipped += 1,
+        }
+        if batch.len() == 5_000 {
+            import.add(&batch).await?;
+            batch.clear();
+        }
+        if read % 500_000 == 0 {
+            eprintln!("  {read} lines read, {} products so far", import.stored + batch.len() as u64);
+        }
+    }
+    import.add(&batch).await?;
+    let stored = import.finish().await?;
+    println!("Food database replaced: {stored} products from {read} lines ({skipped} without a name, energy or protein).");
+    Ok(())
+}
+
+async fn photo_check(config: PhotoConfig, jpeg: Option<std::path::PathBuf>, note: String) -> anyhow::Result<()> {
+    let settings = config.estimator_settings();
+    if settings.ollama_url.is_none() {
+        bail!("LYFE_OLLAMA_URL is off");
+    }
+    let jpeg = jpeg.map(std::fs::read).transpose().context("could not read the photo")?;
+    if jpeg.is_none() && note.trim().is_empty() {
+        bail!("give a photo, a --note, or both");
+    }
+    // No database: nothing is stored.
+    let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://unused")?;
+    let estimator = Estimator::new(pool, settings, Arc::new(tokio::sync::Notify::new()))?;
+    let started = std::time::Instant::now();
+    let estimate = estimator.ask(&note, jpeg).await.map_err(anyhow::Error::msg)?;
+    println!("Answered in {:.1} s.", started.elapsed().as_secs_f64());
+    for item in &estimate.items {
+        println!("  {:<30} {:>6.0} g {:>6.0} kcal {:>6.1} g protein", item.name, item.grams, item.kcal_seen, item.protein_g_seen);
+    }
+    let amount = photo::amount(&estimate.items, estimate.oil_asked, None);
+    let (low, high) = photo::range(amount.kcal, config.photo_range_percent);
+    println!(
+        "Total {} kcal ({low} to {high}), {:.1} g protein{}.",
+        amount.kcal,
+        amount.protein_g(),
+        if estimate.oil_asked { ", with some oil counted: it would ask about oil" } else { "" }
+    );
+    Ok(())
+}
+
+async fn illustration_check(
+    config: IllustrationConfig,
+    jpeg: std::path::PathBuf,
+    note: String,
+    out: std::path::PathBuf,
+) -> anyhow::Result<()> {
+    let settings = config.illustrator_settings();
+    if settings.program.is_none() {
+        bail!("LYFE_ILLUSTRATOR is off");
+    }
+    let jpeg = std::fs::read(&jpeg).context("could not read the photo")?;
+    if !photo::is_jpeg(&jpeg) {
+        bail!("the photo must be a JPEG");
+    }
+    if let Some(free_gb) = lyfe_server::estimator::free_memory_gb(&settings.meminfo)
+        && free_gb < f64::from(settings.min_free_gb)
+    {
+        bail!("only {free_gb:.0} GB of memory are free, and the illustrator needs {}", settings.min_free_gb);
+    }
+    // No database: nothing is stored.
+    let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://unused")?;
+    let illustrator = Illustrator::new(pool, settings, Arc::new(tokio::sync::Notify::new()));
+    let (png, loading, drawing) = illustrator.check(&note, jpeg).await.map_err(anyhow::Error::msg)?;
+    std::fs::write(&out, &png).with_context(|| format!("could not write {}", out.display()))?;
+    println!(
+        "Loaded in {:.1} s, drew in {:.1} s. Wrote {} ({} kB).",
+        loading.as_secs_f64(),
+        drawing.as_secs_f64(),
+        out.display(),
+        png.len() / 1024
+    );
     Ok(())
 }

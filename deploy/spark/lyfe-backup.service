@@ -1,0 +1,12 @@
+# One backup: an encrypted copy of the database, sent off the Spark.
+# Started nightly by lyfe-backup.timer; run it by hand with
+#   systemctl --user start lyfe-backup.service
+[Unit]
+Description=lyfe backup
+After=lyfe-postgres.service
+Requires=lyfe-postgres.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/bin/lyfe-backup
+NoNewPrivileges=yes

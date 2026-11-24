@@ -6,6 +6,8 @@ status: accepted
 
 The owner wants each logged meal to get a generated illustration in the app's Poster style, in the first version, rather than a filter applied to the photo. lyfe will generate these on Spark with FLUX.2 klein 4B, using the meal photo as the edit input and the meal's one-line description in a fixed "pictogram on off-white" prompt, then snap the result to the five Poster colours with dithering off. The larger FLUX.2 klein 9B was the first candidate from research, but it is gated behind a non-commercial licence that the owner would have to accept and read; the 4B model is Apache-licensed, ungated, and in a test on the owner's Spark with four stock photos it produced results the owner judged good, at about seven seconds per image and 17 GB of GPU memory.
 
+The look described here, the pictogram prompt and the snap to five colours, was replaced on 2026-11-19 by ADR 0006, after it lost the meal on the owner's own photos. The model, where it runs and the consequences below about loading and memory stand.
+
 ## Consequences
 
 - Generation never blocks logging: the meal is saved first, the illustration is attached afterwards, and the plain photo is shown if generation fails or Spark has too little free memory.

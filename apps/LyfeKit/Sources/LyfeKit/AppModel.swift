@@ -42,6 +42,79 @@ public final class AppModel {
     /// Set when the backend answered but would not take a saved session.
     public private(set) var breathProblem: String?
 
+    /// Weights typed on this phone that the backend has not confirmed yet,
+    /// oldest first.
+    public private(set) var unsentWeighIns: [UUID]
+    /// Set when the backend would not take a weight that was typed.
+    public private(set) var weighInProblem: String?
+
+    /// Meals tapped on this phone that the backend has not confirmed yet,
+    /// oldest first.
+    public private(set) var unsentFood: [MealTap]
+    /// Set when the backend would not take a meal that was tapped.
+    public private(set) var foodProblem: String?
+    /// The meal being built or the saved meal being changed, while the
+    /// builder is on screen.
+    public private(set) var mealDraft: MealDraft?
+    /// A meal being built that was left with parts in it, kept to carry on
+    /// with. It outlasts closing lyfe.
+    public private(set) var parkedMeal: MealDraft?
+    /// True when the builder was opened to type a food, so it opens with
+    /// its typing form out.
+    public private(set) var builderStartsTyping = false
+    /// True while the targets entry is on screen.
+    public private(set) var isEnteringTargets = false
+    /// Photo and barcode meals logged on this phone that the backend has
+    /// not confirmed yet, oldest first.
+    public private(set) var unsentCaptures: [FoodCapture]
+    /// The photo or barcode screen over Food, while one is open.
+    public private(set) var foodFlow: FoodFlow?
+
+    /// The screens a part is added on and a logged meal is looked into.
+    public enum FoodFlow: Equatable, Sendable {
+        /// A photo and a line as a part: of the meal being built, or with
+        /// `into` of a meal already logged.
+        case photo(into: UUID?)
+        /// A photo's estimate, to check and correct.
+        case estimate(UUID)
+        /// Scanning a barcode and saying how much was eaten: for the meal
+        /// being built, or with `into` for a meal already logged.
+        case scan(into: UUID?)
+        /// Typing the label of a code lyfe does not know, for a meal
+        /// already logged with it or about to be.
+        case label(code: String)
+        /// A meal logged from parts: to correct them, add to them, take
+        /// one out, or save the meal for one tap.
+        case meal(UUID)
+    }
+
+    /// The screens other than Home, for a signed-in owner.
+    public enum Screen: Equatable, Sendable {
+        case home
+        case progress
+        case food
+        case money
+    }
+
+    /// True while lyfe is waiting for Face ID. Set when it is opened and
+    /// each time it leaves the screen; everything it shows is behind it.
+    /// A weight typed into the morning prompt does not need it.
+    public private(set) var isLocked = false
+    private var isUnlocking = false
+
+    public private(set) var screen: Screen = .home
+
+    /// The month of money on screen, as the backend last answered. Kept
+    /// only while lyfe runs: money is not stored on the phone.
+    public private(set) var money: MoneyMonth?
+    /// What went wrong fetching or changing it, in words for the owner.
+    public private(set) var moneyProblem: String?
+    public private(set) var isLoadingMoney = false
+    /// The entry whose sorting screen is open.
+    public private(set) var sortingEntry: UUID?
+    /// True while the weight entry is on screen.
+    public private(set) var isEnteringWeight = false
+
     /// Where Apple delivers notifications for this install, once known.
     private var apnsToken: String?
     /// The token the backend has for the current session.
@@ -53,6 +126,25 @@ public final class AppModel {
     private let addresses: any ServerAddressStore
     private let cache: HomeCache
     private let breath: BreathStore
+    private let weighIns: WeighInStore
+    private var isSendingWeighIns = false
+    private let food: FoodStore
+    private let captures: CaptureStore
+    private let drafts: DraftStore
+    private(set) var recentPortions: [[Ingredient]] = []
+    struct MealReceipt: Identifiable {
+        let id: UUID
+        let day: CalendarDay?
+        let name: String
+    }
+    private(set) var receipt: MealReceipt?
+
+    func dismissReceipt(_ id: UUID) {
+        if receipt?.id == id { receipt = nil }
+    }
+    private let illustrations: IllustrationStore
+    private var isSendingFood = false
+    private let ownerCheck: any OwnerCheck
     private let makeCues: @MainActor () -> any BreathCues
     private var isSendingBreath = false
     private let transport: any HTTPTransport
@@ -64,9 +156,15 @@ public final class AppModel {
         addresses: any ServerAddressStore,
         cache: HomeCache,
         breath: BreathStore,
+        weighIns: WeighInStore,
+        food: FoodStore,
+        captures: CaptureStore? = nil,
+        drafts: DraftStore? = nil,
+        illustrations: IllustrationStore? = nil,
         transport: any HTTPTransport,
         deviceName: String,
         defaultServerAddress: String = "",
+        ownerCheck: any OwnerCheck = NoOwnerCheck(),
         cues: @escaping @MainActor () -> any BreathCues = { SilentCues() },
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
@@ -74,6 +172,20 @@ public final class AppModel {
         self.addresses = addresses
         self.cache = cache
         self.breath = breath
+        self.weighIns = weighIns
+        self.food = food
+        // Tests that do not care keep them in a folder of their own.
+        self.captures =
+            captures
+            ?? CaptureStore(directory: FileManager.default.temporaryDirectory.appending(path: "lyfe-\(UUID().uuidString)"))
+        self.drafts =
+            drafts
+            ?? DraftStore(directory: FileManager.default.temporaryDirectory.appending(path: "lyfe-\(UUID().uuidString)"))
+        self.illustrations =
+            illustrations
+            ?? IllustrationStore(
+                directory: FileManager.default.temporaryDirectory.appending(path: "lyfe-\(UUID().uuidString)"))
+        self.ownerCheck = ownerCheck
         makeCues = cues
         self.transport = transport
         self.deviceName = deviceName
@@ -90,19 +202,48 @@ public final class AppModel {
         home = hasSession ? cached?.snapshot : nil
         homeFetchedAt = hasSession ? cached?.fetchedAt : nil
         unsentBreath = breath.outbox().map(\.id)
+        unsentWeighIns = weighIns.outbox().map(\.id)
+        unsentFood = food.outbox()
+        recentPortions = hasSession ? self.drafts.recentPortions() : []
+        if let kept = self.drafts.load() {
+            if !kept.parts.isEmpty, now().timeIntervalSince(kept.startedAt) < Self.draftKeptFor {
+                parkedMeal = kept
+            } else {
+                // Too old to be the meal in front of anyone: it goes, and
+                // the photos waiting to be sent for it with it.
+                self.drafts.save(nil)
+                for capture in self.captures.outbox() where capture.partOf == kept.id {
+                    self.captures.remove(capture.id, forget: true)
+                }
+            }
+        }
+        unsentCaptures = self.captures.outbox()
+        self.captures.prunePhotos(olderThan: 3 * 86_400, now: now())
         pickUpBreathSession()
+        lock()
     }
 
+    /// How long a meal left half built is kept to carry on with.
+    static let draftKeptFor: TimeInterval = 3 * 86_400
+
     /// The app wired to the real Keychain, disk and network.
-    public static func live(deviceName: String, defaultServerAddress: String = "") -> AppModel {
+    public static func live(
+        deviceName: String, defaultServerAddress: String = "", ownerCheck: any OwnerCheck = DeviceOwnerCheck()
+    ) -> AppModel {
         AppModel(
             tokens: KeychainTokenStore(),
             addresses: DefaultsServerAddressStore(),
             cache: .standard(),
             breath: .standard(),
+            weighIns: .standard(),
+            food: .standard(),
+            captures: .standard(),
+            drafts: .standard(),
+            illustrations: .standard(),
             transport: TailnetTransport.live(),
             deviceName: deviceName,
             defaultServerAddress: defaultServerAddress,
+            ownerCheck: ownerCheck,
             cues: { ToneCues() }
         )
     }
@@ -171,6 +312,31 @@ public final class AppModel {
         forgetSession()
     }
 
+    // MARK: The lock
+
+    /// Puts lyfe behind Face ID. Called when it starts and whenever it
+    /// leaves the screen. Not while signed out, where the password is the
+    /// lock; not on a device that cannot check; and not while a breath
+    /// session is running, whose next tap must not wait for a face.
+    public func lock() {
+        guard phase == .signedIn, ownerCheck.isAvailable, breathSession?.isRunning != true else { return }
+        isLocked = true
+    }
+
+    /// Asks for Face ID and opens lyfe if it is the owner.
+    public func unlock() async {
+        guard isLocked, !isUnlocking else { return }
+        isUnlocking = true
+        defer { isUnlocking = false }
+        guard ownerCheck.isAvailable else {
+            isLocked = false
+            return
+        }
+        if await ownerCheck.confirm(reason: "Open lyfe") {
+            isLocked = false
+        }
+    }
+
     // MARK: Notifications
 
     /// Called when Apple hands the app its device token, which happens on
@@ -204,6 +370,9 @@ public final class AppModel {
     }
 
     private func forgetSession() {
+        receipt = nil
+        recentPortions = []
+        drafts.saveRecent([])
         token = nil
         apnsTokenSent = nil
         tokens.clear()
@@ -214,6 +383,17 @@ public final class AppModel {
         offlineReason = nil
         refreshProblem = nil
         breathProblem = nil
+        weighInProblem = nil
+        foodProblem = nil
+        setAside()
+        isEnteringTargets = false
+        foodFlow = nil
+        money = nil
+        moneyProblem = nil
+        sortingEntry = nil
+        screen = .home
+        isEnteringWeight = false
+        isLocked = false
         phase = .signedOut
     }
 
@@ -227,6 +407,8 @@ public final class AppModel {
         defer { isRefreshing = false }
         await sendPushToken()
         await sendUnsentBreath()
+        await sendUnsentWeighIns()
+        await sendUnsentFood()
         guard phase == .signedIn else { return }
         do {
             try await loadHome(api, token)
@@ -251,6 +433,22 @@ public final class AppModel {
 
     private func loadHome(_ api: LyfeAPI, _ token: String) async throws {
         show(try await api.home(token: token))
+    }
+
+    /// Fetches Home again without asking Garmin: for following an estimate
+    /// while its screen is open. Quiet when it cannot reach the backend.
+    public func reloadHome() async {
+        guard phase == .signedIn, !isRefreshing, let api, let token else { return }
+        do {
+            try await loadHome(api, token)
+        } catch LyfeAPIError.unauthorized {
+            forgetSession()
+        } catch LyfeAPIError.unreachable(let why) {
+            isOffline = true
+            offlineReason = why
+        } catch {
+            // Kept as shown; the next refresh says what is wrong.
+        }
     }
 
     /// Takes an answer from the backend as the current state.
@@ -358,5 +556,847 @@ public final class AppModel {
     private func confirmed(_ id: UUID) {
         breath.remove(id)
         unsentBreath.removeAll { $0 == id }
+    }
+
+    // MARK: Money
+
+    /// Opens Money on the current month, showing the last answer until the
+    /// new one arrives.
+    public func openMoney() {
+        screen = .money
+        Task { await loadMoney(month: nil) }
+    }
+
+    public func closeMoney() {
+        sortingEntry = nil
+        screen = .home
+        // Home's strip says how many are left to sort.
+        Task { await reloadHome() }
+    }
+
+    /// Fetches a month ("2026-11"), or the current one. Money needs the
+    /// backend: with no connection the month already on screen stays.
+    public func loadMoney(month: String?) async {
+        guard phase == .signedIn, !isLoadingMoney else { return }
+        isLoadingMoney = true
+        defer { isLoadingMoney = false }
+        moneyProblem = await changeMoney("fetch the month") { api, token in
+            try await api.money(token: token, month: month)
+        }
+    }
+
+    /// Opens the sorting screen on an entry of the month shown.
+    public func openSorting(_ id: UUID) {
+        guard money?.entries.contains(where: { $0.id == id }) == true else { return }
+        sortingEntry = id
+    }
+
+    /// Opens the sorting screen on the oldest entry still waiting.
+    public func openSortingNext() {
+        sortingEntry = money?.waiting.first?.id
+    }
+
+    public func closeSorting() {
+        sortingEntry = nil
+    }
+
+    /// Says what an entry is. An entry that was waiting is followed by the
+    /// next one waiting, so a month is gone through without going back to
+    /// the list; one sorted again closes. Returns what went wrong, or nil.
+    @discardableResult
+    public func sortMoney(_ id: UUID, to choice: MoneyChoice, onlyThis: Bool) async -> String? {
+        guard let money, let entry = money.entries.first(where: { $0.id == id }) else { return "That entry is gone." }
+        let wasWaiting = entry.toSort
+        let after = money.waiting.drop { $0.id != id }.dropFirst().map(\.id)
+        let problem = await changeMoney("sort it") { api, token in
+            try await api.sortMoneyEntry(token: token, id: id, to: choice, onlyThis: onlyThis, month: money.month)
+        }
+        guard problem == nil else { return problem }
+        if sortingEntry == id {
+            // The next one that is still waiting: a payee sorted once may
+            // have taken several of them with it.
+            let waiting = Set(self.money?.waiting.map(\.id) ?? [])
+            sortingEntry = wasWaiting ? (after.first(where: waiting.contains) ?? self.money?.waiting.first?.id) : nil
+        }
+        return nil
+    }
+
+    /// Sets an account aside, or brings it back. Returns what went wrong.
+    @discardableResult
+    public func setAside(account id: UUID, _ aside: Bool) async -> String? {
+        guard let month = money?.month else { return "Open the month first." }
+        return await changeMoney("change the account") { api, token in
+            try await api.setMoneyAccount(token: token, id: id, setAside: aside, month: month)
+        }
+    }
+
+    /// Asks the backend about money and shows the month it answers with.
+    /// `what` finishes "Could not …". Returns what went wrong, or nil.
+    private func changeMoney(
+        _ what: String, _ change: (LyfeAPI, String) async throws -> MoneyMonth
+    ) async -> String? {
+        guard phase == .signedIn, let api, let token else { return "Sign in first." }
+        do {
+            money = try await change(api, token)
+            isOffline = false
+            offlineReason = nil
+            return nil
+        } catch LyfeAPIError.unauthorized {
+            forgetSession()
+            return "Signed out."
+        } catch LyfeAPIError.unreachable(let why) {
+            isOffline = true
+            offlineReason = why
+            return "Could not \(what): can't reach the server (\(why))."
+        } catch LyfeAPIError.unreadableResponse {
+            return "The server's answer could not be read. The app may be older than the server."
+        } catch LyfeAPIError.server(let status) where (400..<500).contains(status) {
+            return "The server would not \(what) (\(status))."
+        } catch LyfeAPIError.server(let status) {
+            return "Could not \(what): the server answered with an error (\(status))."
+        } catch {
+            return "Could not \(what)."
+        }
+    }
+
+    // MARK: Progress and weigh-ins
+
+    private(set) var startsOnTraining = false
+
+    func openTraining() {
+        openProgress()
+        startsOnTraining = true
+    }
+
+    public func openProgress() {
+        startsOnTraining = false
+        screen = .progress
+    }
+
+    public func closeProgress() {
+        isEnteringWeight = false
+        screen = .home
+    }
+
+    /// Opens the weight entry over Progress. Also what tapping the morning
+    /// prompt itself does, rather than typing into it.
+    public func openWeighIn() {
+        startsOnTraining = false
+        screen = .progress
+        isEnteringWeight = true
+    }
+
+    public func closeWeighIn() {
+        isEnteringWeight = false
+    }
+
+    /// The unit lyfe shows weights in, as the backend last said.
+    public var weightUnit: String {
+        home?.weight?.unit ?? "lb"
+    }
+
+    /// Takes a weight the owner typed, into the morning prompt or the app.
+    /// It is kept on this phone before anything is sent, then sent at once;
+    /// with no connection it waits for the next refresh. Says what became
+    /// of it, so a reply that was not a weight can be asked for again.
+    @discardableResult
+    public func recordWeight(_ text: String) async -> WeighInOutcome {
+        guard let typed = TypedWeight(text, unit: weightUnit) else { return .unreadable }
+        let weighIn = WeighIn(measuredAt: now(), value: typed.value, unit: typed.unit)
+        weighIns.enqueue(weighIn)
+        unsentWeighIns.append(weighIn.id)
+        let refused = await sendUnsentWeighIns()
+        if refused.contains(weighIn.id) { return .refused }
+        return unsentWeighIns.contains(weighIn.id) ? .saved : .sent
+    }
+
+    /// Sends every weigh-in the backend has not confirmed, oldest first,
+    /// and shows the state it answers with. Each carries its own id, so one
+    /// that was received but whose answer was lost is not stored twice.
+    /// Returns the ones the backend refused, which are dropped: sending
+    /// them again would never work.
+    @discardableResult
+    public func sendUnsentWeighIns() async -> Set<UUID> {
+        guard phase == .signedIn, !isSendingWeighIns, let api, let token else { return [] }
+        isSendingWeighIns = true
+        defer { isSendingWeighIns = false }
+        var refused: Set<UUID> = []
+        for weighIn in weighIns.outbox() {
+            do {
+                show(try await api.recordWeighIn(token: token, weighIn: weighIn))
+                confirmedWeighIn(weighIn.id)
+                weighInProblem = nil
+            } catch LyfeAPIError.unreadableResponse {
+                // The backend took it; only its answer could not be read.
+                confirmedWeighIn(weighIn.id)
+                refreshProblem = "The server's answer could not be read. The app may be older than the server."
+            } catch LyfeAPIError.unauthorized {
+                forgetSession()
+                break
+            } catch LyfeAPIError.unreachable(let why) {
+                isOffline = true
+                offlineReason = why
+                break
+            } catch LyfeAPIError.server(let status) where (400..<500).contains(status) {
+                confirmedWeighIn(weighIn.id)
+                refused.insert(weighIn.id)
+                weighInProblem = "The server would not take the weight \(WeightText.number(weighIn.value)) \(weighIn.unit) (\(status))."
+            } catch LyfeAPIError.server(let status) {
+                weighInProblem = "The server could not store a weight just now (\(status)). It stays on this phone."
+                break
+            } catch {
+                break
+            }
+        }
+        return refused
+    }
+
+    private func confirmedWeighIn(_ id: UUID) {
+        weighIns.remove(id)
+        unsentWeighIns.removeAll { $0 == id }
+    }
+
+    // MARK: Food
+
+    public func openFood() {
+        screen = .food
+    }
+
+    public func closeFood() {
+        setAside()
+        isEnteringTargets = false
+        foodFlow = nil
+        screen = .home
+    }
+
+    /// What is on this phone that is a meal of the day once sent:
+    /// everything but the photos sent ahead of a meal not logged yet.
+    public var unsentMeals: [FoodCapture] {
+        unsentCaptures.filter { capture in
+            guard let meal = capture.partOf else { return true }
+            return home?.food?.entries.contains { $0.id == meal } == true
+        }
+    }
+
+    /// The saved meal the Food screen's bar offers: the one for the next
+    /// main meal still open today. Nil when there is nothing to tap.
+    public var nextMeal: SavedMeal? {
+        guard let food = home?.food,
+            case .log(let meal) = FoodText.bar(food, unsent: unsentFood, captures: unsentMeals).action
+        else {
+            return nil
+        }
+        return meal
+    }
+
+    /// Logs a saved meal: one tap, one portion unless another is chosen.
+    /// The tap is kept on this phone before anything is sent, then sent at
+    /// once; with no connection it waits for the next refresh and still
+    /// counts for the day it was tapped on.
+    @discardableResult
+    public func logMeal(_ meal: SavedMeal, servings: Double = 1) async -> MealLogOutcome {
+        let tap = MealTap(eatenAt: now(), meal: meal, servings: servings)
+        food.enqueue(tap)
+        unsentFood.append(tap)
+        let refused = await sendUnsentFood()
+        if refused.contains(tap.id) { return .refused }
+        if phase == .signedIn { receipt = MealReceipt(id: tap.id, day: home?.today, name: meal.name) }
+        return unsentFood.contains { $0.id == tap.id } ? .saved : .sent
+    }
+
+    /// Sends every tap the backend has not confirmed, oldest first, and
+    /// shows the state it answers with. Each carries its own id, so one
+    /// that was received but whose answer was lost is not logged twice.
+    /// Returns the ones the backend refused, which are dropped: sending
+    /// them again would never work.
+    @discardableResult
+    public func sendUnsentFood() async -> Set<UUID> {
+        guard phase == .signedIn, !isSendingFood, let api, let token else { return [] }
+        isSendingFood = true
+        defer { isSendingFood = false }
+        var refused: Set<UUID> = []
+        var tried: Set<UUID> = []
+        // Set when sending stopped for a reason that would stop the rest too.
+        var stopped = false
+        // Read again each time round: a meal tapped while another is on
+        // its way goes out in the same pass.
+        while let tap = food.outbox().first(where: { !tried.contains($0.id) }) {
+            tried.insert(tap.id)
+            do {
+                show(try await api.recordFoodEntry(token: token, tap: tap))
+                confirmedFood(tap.id)
+                foodProblem = nil
+            } catch LyfeAPIError.unreadableResponse {
+                // The backend took it; only its answer could not be read.
+                confirmedFood(tap.id)
+                refreshProblem = "The server's answer could not be read. The app may be older than the server."
+            } catch LyfeAPIError.unauthorized {
+                forgetSession()
+                stopped = true
+                break
+            } catch LyfeAPIError.unreachable(let why) {
+                isOffline = true
+                offlineReason = why
+                stopped = true
+                break
+            } catch LyfeAPIError.server(let status) where (400..<500).contains(status) {
+                confirmedFood(tap.id)
+                refused.insert(tap.id)
+                foodProblem = "The server would not log \(tap.name) (\(status))."
+            } catch LyfeAPIError.server(let status) {
+                foodProblem = "The server could not log a meal just now (\(status)). It stays on this phone."
+                stopped = true
+                break
+            } catch {
+                stopped = true
+                break
+            }
+        }
+        guard !stopped else { return refused }
+        // In the order kept: a photo sent ahead goes before its meal.
+        while let capture = captures.outbox().first(where: { !tried.contains($0.id) }) {
+            tried.insert(capture.id)
+            do {
+                let snapshot =
+                    switch capture.kind {
+                    case .photo:
+                        try await api.recordPhotoEntry(token: token, capture: capture, jpeg: captures.photo(capture.id))
+                    case .barcode:
+                        try await api.recordBarcodeEntry(token: token, capture: capture)
+                    case .typed:
+                        try await api.recordTypedEntry(token: token, capture: capture)
+                    case .built:
+                        try await api.recordBuiltMeal(token: token, capture: capture)
+                    }
+                show(snapshot)
+                confirmedCapture(capture.id)
+                foodProblem = nil
+            } catch LyfeAPIError.unreadableResponse {
+                confirmedCapture(capture.id)
+                refreshProblem = "The server's answer could not be read. The app may be older than the server."
+            } catch LyfeAPIError.unauthorized {
+                forgetSession()
+                stopped = true
+                break
+            } catch LyfeAPIError.unreachable(let why) {
+                isOffline = true
+                offlineReason = why
+                stopped = true
+                break
+            } catch LyfeAPIError.server(let status) where (400..<500).contains(status) {
+                confirmedCapture(capture.id, forget: true)
+                // A photo refused is no part of the meal it was sent for.
+                takeOutOfDraft(capture.id)
+                refused.insert(capture.id)
+                foodProblem = "The server would not log \(capture.name) (\(status))."
+            } catch LyfeAPIError.server(let status) {
+                foodProblem = "The server could not log a meal just now (\(status)). It stays on this phone."
+                break
+            } catch {
+                break
+            }
+        }
+        return refused
+    }
+
+    private func confirmedFood(_ id: UUID) {
+        food.remove(id)
+        unsentFood.removeAll { $0.id == id }
+    }
+
+    private func confirmedCapture(_ id: UUID, forget: Bool = false) {
+        captures.remove(id, forget: forget)
+        unsentCaptures.removeAll { $0.id == id }
+    }
+
+    /// Takes a logged meal back, for a tap that was a slip, or takes one
+    /// part out of a meal. One still waiting on this phone is simply
+    /// dropped; one the backend has needs a connection. Returns what went
+    /// wrong, or nil.
+    @discardableResult
+    public func takeBackMeal(_ id: UUID) async -> String? {
+        if isSendingFood { return "Syncing this meal. Try again in a moment." }
+        if unsentFood.contains(where: { $0.id == id }) {
+            confirmedFood(id)
+            dismissReceipt(id)
+            return nil
+        }
+        if let capture = unsentCaptures.first(where: { $0.id == id }) {
+            confirmedCapture(id, forget: true)
+            dismissReceipt(id)
+            takeOutOfDraft(id)
+            if case .built(_, let parts) = capture.kind {
+                await dropPhotos(of: parts)
+            }
+            return nil
+        }
+        let problem = await changeFood("take that back") { api, token in
+            try await api.removeFoodEntry(token: token, id: id)
+        }
+        if problem == nil {
+            dismissReceipt(id)
+            takeOutOfDraft(id)
+        }
+        return problem
+    }
+
+    /// Takes a part out of the meal being built, on the builder or set
+    /// aside.
+    private func takeOutOfDraft(_ part: UUID) {
+        changeDraft { $0.parts.removeAll { $0.id == part } }
+        if parkedMeal?.parts.contains(where: { $0.id == part }) == true {
+            parkedMeal?.parts.removeAll { $0.id == part }
+            keepDraft()
+        }
+    }
+
+    /// Drops the photos of a meal that will not be logged from them: the
+    /// ones still on this phone at once, the ones already sent ahead on
+    /// the backend when it can be reached. One it cannot be told about is
+    /// dropped there by itself, a week on.
+    private func dropPhotos(of parts: [MealPart]) async {
+        for part in parts {
+            guard case .photo = part.kind else { continue }
+            if unsentCaptures.contains(where: { $0.id == part.id }) {
+                confirmedCapture(part.id, forget: true)
+            } else if phase == .signedIn, let api, let token,
+                let snapshot = try? await api.removeFoodEntry(token: token, id: part.id)
+            {
+                show(snapshot)
+            }
+        }
+    }
+
+    // MARK: Building a meal
+
+    /// Opens the builder on the meal being built, or on a new one: what was
+    /// eaten, added part by part, to log now, save for one tap, or both.
+    public func openMealBuilder(typing: Bool = false) {
+        screen = .food
+        isEnteringTargets = false
+        foodFlow = nil
+        builderStartsTyping = typing
+        guard mealDraft?.purpose != .log else { return }
+        mealDraft = parkedMeal ?? MealDraft(slot: .likely(at: now()), purpose: .log, startedAt: now())
+        parkedMeal = nil
+        keepDraft()
+    }
+
+    /// Opens the builder on a new saved meal, or on a saved one to change.
+    public func openMealEditor(_ meal: SavedMeal? = nil) {
+        screen = .food
+        isEnteringTargets = false
+        foodFlow = nil
+        setAside()
+        mealDraft = meal.map { MealDraft(editing: $0) } ?? MealDraft(startedAt: now())
+    }
+
+    /// Opens the builder on a meal already logged from parts, to save it
+    /// for one tap. False while a part's figures are not known.
+    @discardableResult
+    public func openMealEditor(savingLogged id: UUID) -> Bool {
+        guard let entry = home?.food?.entries.first(where: { $0.id == id }), let draft = MealDraft(saving: entry) else {
+            return false
+        }
+        screen = .food
+        isEnteringTargets = false
+        foodFlow = nil
+        setAside()
+        mealDraft = draft
+        return true
+    }
+
+    /// Leaves the builder. A meal being built with parts in it is set
+    /// aside to carry on with; a recipe being typed is dropped.
+    public func closeMealEditor() {
+        let dropped = mealDraft
+        setAside()
+        if let dropped, parkedMeal?.id != dropped.id {
+            Task { await dropPhotos(of: dropped.parts) }
+        }
+    }
+
+    /// Takes the builder off the screen, keeping a meal being built that
+    /// has parts and was not saved instead.
+    private func setAside() {
+        if let draft = mealDraft, draft.purpose == .log, !draft.parts.isEmpty, !draft.isSaved {
+            parkedMeal = draft
+        }
+        mealDraft = nil
+        keepDraft()
+    }
+
+    /// Writes the meal being built to this phone, or forgets it.
+    private func keepDraft() {
+        drafts.save(mealDraft?.purpose == .log ? mealDraft : parkedMeal)
+    }
+
+    /// Changes the meal on the builder. One that was saved for one tap and
+    /// is changed again is no longer what was saved.
+    public func changeDraft(_ change: (inout MealDraft) -> Void) {
+        guard var draft = mealDraft else { return }
+        change(&draft)
+        guard draft != mealDraft else { return }
+        draft.isSaved = false
+        mealDraft = draft
+        keepDraft()
+    }
+
+    /// Adds a part, typed or scanned, to the meal on the builder.
+    public func addPart(_ part: MealPart) {
+        changeDraft { draft in
+            if draft.parts.count < MealDraft.maxParts { draft.parts.append(part) }
+        }
+    }
+
+    /// Adds a scanned food to the meal on the builder and goes back to it.
+    /// A code nothing could be found for is looked up when the meal is sent.
+    public func addScan(code: String, grams: Double, product: Product?) {
+        addPart(.scanned(code: code, grams: grams, product: product))
+        foodFlow = nil
+    }
+
+    /// Adds a photo and its line to the meal on the builder, and sends it
+    /// ahead to be estimated while the rest is added. Without a connection
+    /// it is kept and sent before the meal is.
+    @discardableResult
+    public func addPhoto(note: String, photo: Data?) async -> MealLogOutcome {
+        guard let draft = mealDraft, draft.parts.count < MealDraft.maxParts else { return .refused }
+        let note = note.trimmingCharacters(in: .whitespacesAndNewlines)
+        let part = MealPart(.photo(note: note, hasPhoto: photo != nil))
+        addPart(part)
+        foodFlow = nil
+        let capture = FoodCapture(
+            id: part.id, eatenAt: now(), slot: draft.slot, kind: .photo(note: note, hasPhoto: photo != nil),
+            partOf: draft.id)
+        return await log(capture, jpeg: photo)
+    }
+
+    /// The backend's entry for each photo of the meal being built, once it
+    /// has one: being estimated, estimated, or left to be typed.
+    public var draftEstimates: [UUID: FoodDay.Entry] {
+        guard let draft = mealDraft ?? parkedMeal, let sent = home?.food?.drafts else { return [:] }
+        var found: [UUID: FoodDay.Entry] = [:]
+        for part in draft.parts {
+            if case .photo = part.kind, let entry = sent.first(where: { $0.id == part.id }) {
+                found[part.id] = entry
+            }
+        }
+        return found
+    }
+
+    /// Logs the meal on the builder as one meal and closes the builder. It
+    /// is kept on this phone before anything is sent, like every meal, and
+    /// does not wait for a photo still being estimated: that part fills in
+    /// afterwards. A meal saved for one tap in this sitting is logged as
+    /// that tap. Returns what went wrong, or nil.
+    @discardableResult
+    public func logMealDraft() async -> String? {
+        guard let draft = mealDraft else { return nil }
+        guard !draft.parts.isEmpty else { return "Add what you ate first." }
+        guard draft.name.trimmingCharacters(in: .whitespacesAndNewlines).count <= MealDraft.maxNameLength else {
+            return "The name is too long."
+        }
+        if draft.isSaved, let meal = home?.food?.meals.first(where: { $0.id == draft.mealId }) {
+            mealDraft = nil
+            keepDraft()
+            let outcome = await logMeal(meal)
+            await dropPhotos(of: draft.parts)
+            return outcome == .refused ? foodProblem : nil
+        }
+        let capture = FoodCapture(
+            id: draft.id, eatenAt: now(), slot: draft.slot, kind: .built(name: draft.name, parts: draft.parts))
+        let portion = draft.ingredients(estimates: draftEstimates)
+        mealDraft = nil
+        keepDraft()
+        if await log(capture, jpeg: nil) == .refused {
+            // Nothing was logged; the meal is still there to put right.
+            mealDraft = draft
+            keepDraft()
+            return foodProblem ?? "The server would not log the meal."
+        }
+        if phase == .signedIn {
+            receipt = MealReceipt(id: capture.id, day: home?.today, name: capture.name)
+            if let portion, !portion.isEmpty {
+                recentPortions = Array(([portion] + recentPortions.filter { $0 != portion }).prefix(6))
+                drafts.saveRecent(recentPortions)
+            }
+        }
+        return nil
+    }
+
+    /// Saves the meal on the builder for one tap. Needs a connection, and
+    /// every part's figures: a photo's estimate is saved as it stands, and
+    /// stays an estimate each time the meal is logged. A recipe being
+    /// typed closes; a meal being built stays, to be logged as well.
+    /// Returns what went wrong, or nil.
+    @discardableResult
+    public func saveMeal() async -> String? {
+        guard let draft = mealDraft else { return nil }
+        let estimates = draftEstimates
+        if let missing = draft.missing(estimates: estimates) { return missing + "." }
+        guard let ingredients = draft.ingredients(estimates: estimates) else { return nil }
+        let problem = await changeFood("save the meal") { api, token in
+            try await api.saveMeal(
+                token: token, id: draft.mealId, name: draft.name, slot: draft.slot, portions: draft.portions,
+                ingredients: ingredients)
+        }
+        guard problem == nil else { return problem }
+        if draft.purpose == .recipe {
+            mealDraft = nil
+            await dropPhotos(of: draft.parts)
+        } else if mealDraft?.id == draft.id {
+            mealDraft?.isSaved = true
+            mealDraft?.isNew = false
+            keepDraft()
+        }
+        return nil
+    }
+
+    /// Throws away the meal on the builder, and the photos sent for it.
+    public func discardMeal() async {
+        guard let draft = mealDraft else { return }
+        mealDraft = nil
+        keepDraft()
+        await dropPhotos(of: draft.parts)
+    }
+
+    /// Takes a saved meal out of the list and closes the editor. What was
+    /// logged from it stays. Returns what went wrong, or nil.
+    @discardableResult
+    public func removeMeal(_ id: UUID) async -> String? {
+        let problem = await changeFood("remove the meal") { api, token in
+            try await api.removeMeal(token: token, id: id)
+        }
+        if problem == nil { mealDraft = nil }
+        return problem
+    }
+
+    public func openTargets() {
+        screen = .food
+        setAside()
+        isEnteringTargets = true
+    }
+
+    public func closeTargets() {
+        isEnteringTargets = false
+    }
+
+    /// Sets the calorie and protein targets from today on and closes the
+    /// entry. Only the owner sets them. Returns what went wrong, or nil.
+    @discardableResult
+    public func setFoodTargets(_ targets: FoodTargets) async -> String? {
+        let problem = await changeFood("set the targets") { api, token in
+            try await api.setFoodTargets(token: token, targets: targets)
+        }
+        if problem == nil { isEnteringTargets = false }
+        return problem
+    }
+
+    // MARK: Parts: photos, barcodes and typed food
+
+    func recordProgress(_ entry: ProgressEntry) async -> String? {
+        await changeFood("save progress") { api, token in try await api.recordProgress(token: token, entry: entry) }
+    }
+
+    /// Opens the photo screen: for the meal being built, starting one when
+    /// there is none, or with `into` for a meal already logged.
+    public func openPhotoMeal(into meal: UUID? = nil) {
+        if meal == nil, mealDraft == nil { openMealBuilder() }
+        screen = .food
+        isEnteringTargets = false
+        foodFlow = .photo(into: meal)
+    }
+
+    /// Opens a photo's estimate, to check and correct it.
+    public func openEstimate(_ id: UUID) {
+        screen = .food
+        foodFlow = .estimate(id)
+    }
+
+    /// Opens the barcode scanner: for the meal being built, starting one
+    /// when there is none, or with `into` for a meal already logged.
+    public func openScan(into meal: UUID? = nil) {
+        if meal == nil, mealDraft == nil { openMealBuilder() }
+        screen = .food
+        isEnteringTargets = false
+        foodFlow = .scan(into: meal)
+    }
+
+    /// Opens the label entry for a code lyfe does not know.
+    public func openLabel(code: String) {
+        screen = .food
+        foodFlow = .label(code: code)
+    }
+
+    /// Opens a meal logged from parts.
+    public func openMeal(_ id: UUID) {
+        screen = .food
+        foodFlow = .meal(id)
+    }
+
+    /// Leaves a part's screen for where it was opened from: the logged
+    /// meal it belongs to, or else the builder or Food.
+    public func closeFoodFlow() {
+        switch foodFlow {
+        case .estimate(let id):
+            foodFlow = (home?.food?.meal(holding: id)).map { .meal($0.id) }
+        case .photo(let meal?), .scan(let meal?):
+            foodFlow = .meal(meal)
+        default:
+            foodFlow = nil
+        }
+    }
+
+    /// Logs a photo and one line: as a meal of its own, or with `partOf`
+    /// as a part joining a meal already logged. It is kept on this phone
+    /// before anything is sent, then sent at once; with no connection it
+    /// waits for the next refresh and still counts for the day it was
+    /// eaten on. Once the backend has it, its estimate opens, to follow
+    /// and correct.
+    @discardableResult
+    public func logPhotoMeal(note: String, photo: Data?, slot: MealSlot, partOf meal: UUID? = nil) async
+        -> MealLogOutcome
+    {
+        let capture = FoodCapture(
+            eatenAt: now(), slot: slot,
+            kind: .photo(note: note.trimmingCharacters(in: .whitespacesAndNewlines), hasPhoto: photo != nil),
+            partOf: meal)
+        let outcome = await log(capture, jpeg: photo)
+        foodFlow = outcome == .sent ? .estimate(capture.id) : meal.map { .meal($0) }
+        return outcome
+    }
+
+    /// Logs packaged food by its barcode and the grams eaten: as a meal of
+    /// its own, or with `partOf` as a part joining a meal already logged.
+    /// Kept on this phone before it is sent, like every meal. A code the
+    /// backend does not know is logged too, and its label is asked for.
+    @discardableResult
+    public func logBarcode(code: String, grams: Double, slot: MealSlot, product: Product?, partOf meal: UUID? = nil)
+        async -> MealLogOutcome
+    {
+        let capture = FoodCapture(
+            eatenAt: now(), slot: slot, kind: .barcode(code: code, grams: grams, product: product), partOf: meal)
+        let outcome = await log(capture, jpeg: nil)
+        foodFlow = meal.map { .meal($0) }
+        return outcome
+    }
+
+    /// Logs a food typed by hand, weighed or whole: as a meal of its own,
+    /// or with `partOf` as a part joining a meal already logged.
+    @discardableResult
+    public func logTyped(_ food: Ingredient, slot: MealSlot, partOf meal: UUID? = nil) async -> MealLogOutcome {
+        await log(FoodCapture(eatenAt: now(), slot: slot, kind: .typed(food), partOf: meal), jpeg: nil)
+    }
+
+    /// Keeps a meal or a part on this phone, sends it, and says what
+    /// became of it.
+    private func log(_ capture: FoodCapture, jpeg: Data?) async -> MealLogOutcome {
+        captures.enqueue(capture, jpeg: jpeg)
+        unsentCaptures.append(capture)
+        let refused = await sendUnsentFood()
+        return refused.contains(capture.id) ? .refused : unsentCaptures.contains { $0.id == capture.id } ? .saved : .sent
+    }
+
+    /// What lyfe knows of a barcode.
+    public enum ProductLookup: Equatable, Sendable {
+        case found(Product)
+        /// Neither the owner's labels nor the food database have it.
+        case notFound
+        /// The backend could not be asked, and this phone has not seen it.
+        case offline
+    }
+
+    /// Looks a code up: packaged food logged lately is known on this phone
+    /// without a connection; anything else is asked of the backend.
+    public func lookUp(code: String) async -> ProductLookup {
+        if let known = home?.food?.products?.first(where: { Self.sameCode($0.code, code) }) {
+            return .found(known)
+        }
+        guard phase == .signedIn, let api, let token else { return .offline }
+        do {
+            return try await api.product(token: token, code: code).map(ProductLookup.found) ?? .notFound
+        } catch LyfeAPIError.unauthorized {
+            forgetSession()
+            return .offline
+        } catch LyfeAPIError.unreachable(let why) {
+            isOffline = true
+            offlineReason = why
+            return .offline
+        } catch {
+            return .offline
+        }
+    }
+
+    /// A 12-digit UPC and the 13-digit EAN with a 0 in front are one code.
+    static func sameCode(_ a: String, _ b: String) -> Bool {
+        func long(_ code: String) -> String { code.count == 12 ? "0" + code : code }
+        return long(a) == long(b)
+    }
+
+    /// Stores a label typed for a barcode; meals waiting for it get their
+    /// figures. Returns what went wrong, or nil.
+    @discardableResult
+    public func setLabel(_ product: Product) async -> String? {
+        await changeFood("save the label") { api, token in
+            try await api.setProduct(token: token, product: product)
+        }
+    }
+
+    /// Corrects a photo meal's estimate. Returns what went wrong, or nil.
+    @discardableResult
+    public func correctEstimate(_ id: UUID, _ change: LyfeAPI.EstimateChange) async -> String? {
+        await changeFood("change the estimate") { api, token in
+            try await api.correctEstimate(token: token, id: id, change: change)
+        }
+    }
+
+    /// The photo of a meal: the copy on this phone while it is kept, else
+    /// the backend's.
+    public func mealPhoto(_ id: UUID) async -> Data? {
+        if let local = captures.photo(id) { return local }
+        guard phase == .signedIn, let api, let token else { return nil }
+        return try? await api.foodPhoto(token: token, id: id)
+    }
+
+    /// A meal's photo drawn as a Poster illustration: the copy on this
+    /// phone, else the backend's, kept here once fetched. Nil while it has
+    /// not been drawn, or cannot be fetched now.
+    public func mealIllustration(_ illustration: Illustration) async -> Data? {
+        if let kept = illustrations.picture(illustration) { return kept }
+        guard phase == .signedIn, let api, let token else { return nil }
+        guard let png = try? await api.foodIllustration(token: token, illustration) else { return nil }
+        illustrations.keep(png, for: illustration)
+        return png
+    }
+
+    /// Makes a change to food that needs the backend now, and shows the
+    /// state it answers with. `what` finishes "Could not …". Returns what
+    /// went wrong in words for the owner, or nil.
+    private func changeFood(
+        _ what: String, _ change: (LyfeAPI, String) async throws -> HomeSnapshot
+    ) async -> String? {
+        guard phase == .signedIn, let api, let token else { return "Sign in first." }
+        do {
+            show(try await change(api, token))
+            return nil
+        } catch LyfeAPIError.unreadableResponse {
+            // The backend made the change; only its answer could not be read.
+            refreshProblem = "The server's answer could not be read. The app may be older than the server."
+            return nil
+        } catch LyfeAPIError.unauthorized {
+            forgetSession()
+            return "Signed out."
+        } catch LyfeAPIError.unreachable(let why) {
+            isOffline = true
+            offlineReason = why
+            return "Could not \(what): can't reach the server (\(why))."
+        } catch LyfeAPIError.server(let status) where (400..<500).contains(status) {
+            return "The server would not \(what) (\(status))."
+        } catch LyfeAPIError.server(let status) {
+            return "Could not \(what): the server answered with an error (\(status))."
+        } catch {
+            return "Could not \(what)."
+        }
     }
 }

@@ -6,12 +6,9 @@ import UIKit
 struct LyfeApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @Environment(\.scenePhase) private var scenePhase
-    @State private var model = AppModel.live(
-        deviceName: UIDevice.current.name,
-        // Set per machine in Local.xcconfig, so the address is not in the
-        // repository and does not have to be typed on the phone.
-        defaultServerAddress: Bundle.main.object(forInfoDictionaryKey: "LyfeDefaultServer") as? String ?? ""
-    )
+    /// Owned by the app delegate, which also takes weights typed into the
+    /// morning prompt while lyfe has no screen.
+    private var model: AppModel { delegate.model }
 
     var body: some Scene {
         WindowGroup {
@@ -19,9 +16,6 @@ struct LyfeApp: App {
                 // Once signed in, and again whenever the app comes forward,
                 // since notifications can be switched off in Settings.
                 .task(id: "\(model.phase) \(scenePhase == .active)") {
-                    delegate.onDeviceToken = { token in
-                        Task { await model.setPushToken(token) }
-                    }
                     if model.phase == .signedIn, scenePhase == .active, !runsItself {
                         await enableNotifications(for: model)
                     }
@@ -31,6 +25,7 @@ struct LyfeApp: App {
                         await reportConnectionFromEnvironment()
                         await signInFromEnvironment()
                         await runBreathFromEnvironment()
+                        await openFromEnvironment()
                     }
                 #endif
         }
@@ -52,6 +47,12 @@ struct LyfeApp: App {
                 StreakGallery(skipping: Int(gallery) ?? 0)
             } else if let screen = ProcessInfo.processInfo.environment["LYFE_DEBUG_BREATH"] {
                 BreathGallery(screen: screen)
+            } else if let screen = ProcessInfo.processInfo.environment["LYFE_DEBUG_PROGRESS"] {
+                ProgressGallery(screen: screen)
+            } else if let screen = ProcessInfo.processInfo.environment["LYFE_DEBUG_FOOD"] {
+                FoodGallery(screen: screen)
+            } else if let screen = ProcessInfo.processInfo.environment["LYFE_DEBUG_MONEY"] {
+                MoneyGallery(screen: screen)
             } else {
                 RootView(model: model)
             }
@@ -109,6 +110,62 @@ struct LyfeApp: App {
                     session.tap()
                 }
                 try? await Task.sleep(for: .milliseconds(100))
+            }
+        }
+
+        /// With LYFE_DEBUG_OPEN set to `food`, `meal`, `build`, `targets`,
+        /// `photo`, `scan`, `progress` or `money`, a signed-in development build opens that
+        /// screen by itself once Home has arrived. With LYFE_DEBUG_FOOD_TAP
+        /// set as well it first logs the meal the Food screen's bar offers,
+        /// as one tap would; with LYFE_DEBUG_FOOD_PHOTO set to a line it
+        /// logs a made-up plate as a photo meal with that line and opens its
+        /// estimate, or with `build` adds it to the meal being built as a
+        /// part. Use either against a local backend, since the meal is
+        /// recorded. With `money` and LYFE_DEBUG_MONEY_SORT set to a
+        /// category it sorts the oldest entry waiting into it, which is
+        /// recorded too.
+        private func openFromEnvironment() async {
+            let environment = ProcessInfo.processInfo.environment
+            guard let screen = environment["LYFE_DEBUG_OPEN"] else { return }
+            for _ in 0..<100 where model.home?.food == nil {
+                try? await Task.sleep(for: .milliseconds(200))
+            }
+            if environment["LYFE_DEBUG_FOOD_TAP"] != nil, let meal = model.nextMeal {
+                await model.logMeal(meal)
+            }
+            if let line = environment["LYFE_DEBUG_FOOD_PHOTO"], screen == "build" {
+                model.openMealBuilder()
+                await model.addPhoto(note: line, photo: DebugSample.plate())
+                return
+            }
+            if let line = environment["LYFE_DEBUG_FOOD_PHOTO"] {
+                model.openFood()
+                await model.logPhotoMeal(note: line, photo: DebugSample.plate(), slot: .dinner)
+                return
+            }
+            switch screen {
+            case "food": model.openFood()
+            case "photo": model.openPhotoMeal()
+            case "scan": model.openScan()
+            case "meal": model.openMealEditor(model.home?.food?.meals.first)
+            case "build": model.openMealBuilder()
+            case "targets": model.openTargets()
+            case "progress": model.openProgress()
+            case "money":
+                model.openMoney()
+                // With LYFE_DEBUG_MONEY_SORT set to a category, the oldest
+                // entry waiting is sorted into it, as one tap would, and
+                // the sorting screen is left on the next one.
+                if let category = environment["LYFE_DEBUG_MONEY_SORT"] {
+                    for _ in 0..<50 where model.money == nil {
+                        try? await Task.sleep(for: .milliseconds(200))
+                    }
+                    model.openSortingNext()
+                    if let entry = model.sortingEntry {
+                        await model.sortMoney(entry, to: .category(category), onlyThis: false)
+                    }
+                }
+            default: break
             }
         }
 

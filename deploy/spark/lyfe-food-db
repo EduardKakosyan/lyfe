@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Downloads the Open Food Facts export and makes it the food database that
+# barcodes are looked up in, replacing the last one. Runs as the `lyfe`
+# account; run it once after installing step 6, and again whenever you want
+# newer products (it is not scheduled).
+#
+#   lyfe-food-db
+#
+# About 1.5 GB to download, kept in ~/.cache/lyfe until the next run. The
+# file is checked whole before anything is imported, so a broken download
+# never replaces a good database. Labels you typed in the app are kept
+# apart and are not touched.
+#
+# Open Food Facts is published under the Open Database License. lyfe uses
+# it privately and does not pass it on.
+set -euo pipefail
+umask 077
+
+URL=${LYFE_FOOD_DB_URL:-https://static.openfoodfacts.org/data/en.openfoodfacts.org.products.csv.gz}
+CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/lyfe
+FILE=$CACHE/openfoodfacts-products.csv.gz
+
+set -a
+. "${LYFE_ENV:-$HOME/.config/lyfe/lyfe.env}"
+set +a
+
+mkdir -p "$CACHE"
+echo "Downloading the Open Food Facts export..."
+# --time-cond: only when it is newer than the copy already here.
+curl -fL --retry 3 --progress-bar --time-cond "$FILE" -o "$FILE.part" "$URL"
+if [ -s "$FILE.part" ]; then
+    mv "$FILE.part" "$FILE"
+else
+    rm -f "$FILE.part"
+    echo "The copy here is already the newest."
+fi
+[ -s "$FILE" ] || { echo "lyfe-food-db: nothing was downloaded" >&2; exit 1; }
+
+echo "Checking it is whole..."
+gzip -t "$FILE"
+
+echo "Importing (a few minutes)..."
+gunzip -c "$FILE" | ~/bin/lyfe-server import-food-db

@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 150 150">
+  <title>lyfe - Pick Up</title>
+  <rect width="150" height="150" fill="#111"/>
+  <g transform="translate(15 30)" fill="#fff">
+    <path d="M4 67Q22 66 39 43L53 24 62 29 48 51Q31 77 9 79z"/>
+    <path d="M61 15Q73 3 85 8q12 5 15 24 3 17 17 14-10 12-20 5-7-5-11-19-3-12-9-13-5-1-10 3z"/>
+  </g>
+</svg>

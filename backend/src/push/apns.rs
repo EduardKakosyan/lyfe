@@ -56,6 +56,9 @@ pub struct Alert {
     pub collapse_id: String,
     /// Apple stops trying to deliver after this.
     pub expires_at: DateTime<Utc>,
+    /// The kind of notification, as the app registered it: decides which
+    /// actions it offers, such as a field to type a reply into.
+    pub category: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -151,12 +154,15 @@ impl ApnsClient {
             Environment::Development => &self.development_url,
             Environment::Production => &self.production_url,
         };
-        let payload = json!({
+        let mut payload = json!({
             "aps": {
                 "alert": { "title": alert.title, "body": alert.body },
                 "sound": "default",
             }
         });
+        if let Some(category) = &alert.category {
+            payload["aps"]["category"] = json!(category);
+        }
         let response = self
             .http
             .post(format!("{base}/3/device/{device_token}"))

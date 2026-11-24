@@ -1,6 +1,6 @@
 # lyfe
 
-lyfe is a private app that keeps one person's routines going.
+lyfe is a private app that keeps one person's routines going and shows them where their money went.
 
 ## Language
 
@@ -17,3 +17,84 @@ Measured improvement in a capability, such as breath-hold time, which lyfe track
 **Recovery**:
 Keeping a streak alive after a single missed period by completing the very next one. It never requires make-up sessions; two missed periods in a row end the streak.
 _Avoid_: Catch-up, make-up session, streak freeze
+
+**Weigh-in**:
+A weight the owner types, normally into the morning prompt without opening lyfe. A day's weight is the last one typed that day. Not a streak: a missed morning costs nothing, and there is no second reminder.
+_Avoid_: Weight streak, daily weight log
+
+**Saved meal**:
+A meal the owner eats repeatedly, defined once from its ingredients with the number of portions the recipe makes: typed as weighed from scratch, or saved from a meal that was built. Logging it is one tap. Its numbers are measured, except what a photo was estimated at, which stays estimated each time.
+_Avoid_: Recipe (for the saved meal itself), favourite, template
+
+**Part**:
+One thing in a meal that is built rather than tapped: a packet scanned by its barcode with the grams eaten, a food typed by hand, or a photo and one line. A meal is what its parts add up to, and each part is measured or estimated by itself.
+_Avoid_: Item (that is a food a model saw in a photo), component, ingredient (that is what goes into a saved meal)
+
+**Food log**:
+The meals logged on a day, each under a part of the day: breakfast, lunch, dinner or snack. A meal is a saved meal tapped, or a meal built from parts. A main meal with nothing logged is unknown, never zero, so the day's total is only what was logged.
+_Avoid_: Calorie count (for the log), diary
+
+**Photo meal**:
+A meal, or a part of one, logged with a photo and a one-line description, whose calories and protein a model estimates afterwards. It is sent to be estimated as soon as it is added, counts for the day once its meal is logged, and its figures join the total once estimated. The owner can correct each item's grams, say how much oil or sauce went in, or type the figures instead.
+_Avoid_: AI meal, scanned meal
+
+**Estimate**:
+A photo meal's figures as the model judged them, always shown with a range either way. Estimated figures are kept apart from measured ones: a weighed ingredient, a label or figures typed by hand are measured, a photo is estimated, also as a part of a meal or an ingredient of a saved one.
+_Avoid_: Guess (in the app), approximation
+
+**Illustration**:
+A meal photo redrawn on the Spark as the meal it shows: the food in its own colours, black ink outlines, and its dish in a Poster colour, shown in the photo's place once it is ready. It only ever adds to a meal: the meal counts without it, and the photo stays if it never comes.
+_Avoid_: Filter, AI image, thumbnail, pictogram (that was the first look, which lost the meal)
+
+**Label**:
+The calories and protein per 100 g printed on packaged food, found by its barcode in the downloaded food database or typed once by the owner. A meal logged from a label is measured.
+_Avoid_: Nutrition facts (as a term in lyfe), product entry
+
+**Target**:
+The calories and protein the owner holds a day to. The owner sets it; lyfe shows each day against it and never changes it without the owner's approval. A target counts from the day it is set.
+_Avoid_: Goal, budget, limit
+
+**Seven-day average**:
+The mean of the day's weights over the last seven days that have one, given once at least three do. It is the weight trend; a single morning's reading is not.
+_Avoid_: Weight trend line (as a separate figure), moving average
+
+
+**Bridge**:
+SimpleFIN Bridge, the outside service the owner connects their banks to. It holds the bank sign-ins and hands lyfe a read-only view of the accounts. lyfe asks it; it never calls lyfe.
+_Avoid_: Aggregator (as a term in lyfe), bank API, sync provider
+
+**Connection**:
+One sign-in at one bank, held at the bridge. It can break until the owner signs in again there; its accounts then stop updating and lyfe says so.
+_Avoid_: Link, integration, login
+
+**Entry**:
+One posted transaction in an account, imported from the bank under the bank's own id for it, so importing it again never counts it twice. It is an expense, a refund, money in, or money moved. Pending transactions are not entries.
+_Avoid_: Transaction (in the app), line item, charge
+
+**Spending**:
+Expenses less refunds over a month, in every everyday account together. Money moved between the owner's own accounts is never spending, so a card payment is not: the purchases it pays for already were.
+_Avoid_: Outflow, total debits, burn
+
+**Refund**:
+Money back for something bought. It comes off the category it was bought under, not onto income.
+_Avoid_: Credit, reversal, negative expense
+
+**Money moved**:
+The same money leaving one of the owner's accounts and arriving in another: a card payment, a transfer to savings. lyfe pairs the two halves by amount when both accounts are connected; otherwise the owner says so.
+_Avoid_: Transfer (in the app), internal transaction, payment (for a card payment as if it were spending)
+
+**Payee**:
+Who an entry was paid to or came from, as the bank names it. The same shop is the same payee whatever branch number follows its name.
+_Avoid_: Merchant, vendor, counterparty
+
+**Sorting**:
+The owner saying what an entry is: a category, money in, or money moved. Said once it holds for the payee, for every entry past and to come, unless the owner sorts one entry by itself. Until then the entry waits, and counts in the month as spending not sorted yet.
+_Avoid_: Categorising, tagging, labelling, reviewing
+
+**Category**:
+One of twelve fixed kinds of spending an expense or refund is sorted into. The owner picks it; lyfe never guesses one.
+_Avoid_: Tag, budget line, envelope
+
+**Set aside**:
+An account the owner has marked as savings or investments. Its balance is shown; nothing that moves in it counts as spending or waits to be sorted. Every other account is an everyday account.
+_Avoid_: Hidden account, excluded account, savings (for the mark itself)

@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# Sends an encrypted copy of the lyfe database off the Spark, to a bucket
+# reached over the S3 protocol (Supabase Storage, or anything that speaks
+# it). Runs as the `lyfe` account, nightly from lyfe-backup.timer.
+#
+#   lyfe-backup                 dump, encrypt, upload, and check it arrived
+#   lyfe-backup list            the backups in the bucket, oldest first
+#   lyfe-backup fetch NAME OUT  download one and decrypt it to the file OUT
+#   lyfe-backup ready           say whether the settings are complete (no network)
+#
+# The dump is encrypted here, before it leaves, with a passphrase only you
+# hold: the bucket's owner sees a file it cannot read. Keep a copy of the
+# passphrase somewhere other than the Spark, or a lost Spark takes the
+# backups with it.
+#
+# Settings are in ~/.config/lyfe/backup.env. The two secrets are files it
+# points at, never values in it, and never arguments on a command line,
+# where other accounts on this machine could read them.
+set -euo pipefail
+umask 077
+
+die() {
+    echo "lyfe-backup: $*" >&2
+    exit 1
+}
+
+CONFIG=${LYFE_BACKUP_ENV:-$HOME/.config/lyfe/backup.env}
+[ -f "$CONFIG" ] || die "no settings at $CONFIG"
+set -a
+# The database address comes from the backend's own settings.
+[ -f "${LYFE_ENV:-$HOME/.config/lyfe/lyfe.env}" ] && . "${LYFE_ENV:-$HOME/.config/lyfe/lyfe.env}"
+. "$CONFIG"
+set +a
+
+ENDPOINT=${LYFE_BACKUP_S3_ENDPOINT:-}
+ENDPOINT=${ENDPOINT%/}
+REGION=${LYFE_BACKUP_S3_REGION:-}
+BUCKET=${LYFE_BACKUP_BUCKET:-}
+KEY_FILE=${LYFE_BACKUP_S3_KEY_FILE:-$HOME/.config/lyfe/backup-s3-key}
+PASSPHRASE_FILE=${LYFE_BACKUP_PASSPHRASE_FILE:-$HOME/.config/lyfe/backup-passphrase}
+
+# What is still missing before a backup can run, one per line.
+missing() {
+    [ -n "$ENDPOINT" ] || echo "LYFE_BACKUP_S3_ENDPOINT is not set in $CONFIG"
+    [ -n "$REGION" ] || echo "LYFE_BACKUP_S3_REGION is not set in $CONFIG"
+    [ -n "$BUCKET" ] || echo "LYFE_BACKUP_BUCKET is not set in $CONFIG"
+    [ -n "${LYFE_DATABASE_URL:-}" ] || echo "LYFE_DATABASE_URL is not set (it comes from lyfe.env)"
+    [ -s "$KEY_FILE" ] || echo "no S3 access key at $KEY_FILE (line 1 the key ID, line 2 the secret)"
+    [ -s "$PASSPHRASE_FILE" ] || echo "no passphrase at $PASSPHRASE_FILE"
+    for tool in curl gpg; do
+        command -v "$tool" >/dev/null || echo "$tool is not installed"
+    done
+    return 0
+}
+
+if [ "${1:-}" = ready ]; then
+    problems=$(missing)
+    [ -z "$problems" ] && exit 0
+    echo "$problems"
+    exit 1
+fi
+problems=$(missing)
+[ -z "$problems" ] || die "not set up yet:"$'\n'"$problems"
+
+case "$ENDPOINT" in
+    # Plain http only to this machine itself, for trying it out.
+    https://* | http://127.0.0.1:* | http://localhost:*) ;;
+    *) die "LYFE_BACKUP_S3_ENDPOINT must be https" ;;
+esac
+
+{
+    read -r S3_ID
+    read -r S3_SECRET
+} <"$KEY_FILE" || true
+[ -n "${S3_ID:-}" ] && [ -n "${S3_SECRET:-}" ] || die "$KEY_FILE needs the key ID on line 1 and the secret on line 2"
+
+WORK=$(mktemp -d)
+# gpg keeps its state in its own throwaway folder, so nothing of the
+# passphrase's handling outlives the run.
+export GNUPGHOME="$WORK/gnupg"
+mkdir -m 700 "$GNUPGHOME"
+cleanup() {
+    gpgconf --kill gpg-agent >/dev/null 2>&1 || true
+    rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+# One signed request to the bucket. The key goes to curl on its standard
+# input, not on its command line.
+#   s3 METHOD OBJECT-OR-QUERY [more curl arguments]
+s3() {
+    local method=$1 target=$2
+    shift 2
+    curl --silent --show-error --fail-with-body --max-time 900 --config - "$@" <<CONFIG
+request = "$method"
+url = "$ENDPOINT/$BUCKET$target"
+aws-sigv4 = "aws:amz:$REGION:s3"
+user = "$S3_ID:$S3_SECRET"
+CONFIG
+}
+
+gpg_quiet() {
+    gpg --batch --yes --quiet --no-tty --pinentry-mode loopback --passphrase-file "$PASSPHRASE_FILE" "$@"
+}
+
+# Names and sizes of the backups, oldest first: "NAME BYTES".
+list() {
+    s3 GET "?list-type=2&prefix=lyfe-" \
+        | tr '<' '\n' \
+        | awk -F'>' '$1 == "Key" { key = $2 } $1 == "Size" { print key, $2 }' \
+        | sort
+}
+
+size_of() {
+    wc -c <"$1" | tr -d ' '
+}
+
+case "${1:-run}" in
+    list)
+        list
+        ;;
+
+    fetch)
+        name=${2:-}
+        out=${3:-}
+        [ -n "$name" ] && [ -n "$out" ] || die "usage: lyfe-backup fetch NAME OUT"
+        [ ! -e "$out" ] || die "$out already exists"
+        s3 GET "/$name" --output "$WORK/fetched.gpg"
+        gpg_quiet --decrypt --output "$out" "$WORK/fetched.gpg"
+        echo "Wrote $out ($(size_of "$out") bytes), a pg_dump archive. To look inside:  pg_restore --list $out"
+        echo "To restore it into an empty database:  pg_restore --no-owner --dbname=<database> $out"
+        ;;
+
+    run)
+        PG_BIN=$(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V | tail -1 || true)
+        PG_DUMP=${PG_BIN:+$PG_BIN/}pg_dump
+        command -v "$PG_DUMP" >/dev/null || die "pg_dump is not installed"
+
+        name="lyfe-$(date -u +%Y%m%dT%H%M%SZ).dump.gpg"
+        # The downloaded food database is left out: it is large, and
+        # lyfe-food-db fetches it again. Its table is still made on restore.
+        "$PG_DUMP" --format=custom --no-owner --dbname="$LYFE_DATABASE_URL" --file="$WORK/lyfe.dump" \
+            --exclude-table-data=barcode_products --exclude-table-data=barcode_products_next
+        # pg_dump has already compressed it.
+        gpg_quiet --symmetric --cipher-algo AES256 --compress-algo none --output "$WORK/$name" "$WORK/lyfe.dump"
+        rm -f "$WORK/lyfe.dump"
+        sent=$(size_of "$WORK/$name")
+
+        s3 PUT "/$name" --upload-file "$WORK/$name" --header "Content-Type: application/octet-stream" >/dev/null
+
+        # Trust the bucket's own listing, not the upload's exit status.
+        stored=$(list | awk -v name="$name" '$1 == name { print $2 }')
+        [ "$stored" = "$sent" ] || die "$name was sent ($sent bytes) but the bucket lists ${stored:-nothing} for it"
+        echo "Backed up: $name, $sent bytes, encrypted, in bucket $BUCKET."
+        ;;
+
+    *)
+        die "unknown command: $1 (use run, list, fetch or ready)"
+        ;;
+esac

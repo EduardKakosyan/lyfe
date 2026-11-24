@@ -10,7 +10,7 @@ let package = Package(
         .library(name: "LyfeKit", targets: ["LyfeKit"])
     ],
     targets: [
-        .target(name: "LyfeKit"),
+        .target(name: "LyfeKit", resources: [.process("Food/Ingredients.json")]),
         .testTarget(name: "LyfeKitTests", dependencies: ["LyfeKit"]),
     ]
 )

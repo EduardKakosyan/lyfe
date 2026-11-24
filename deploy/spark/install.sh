@@ -50,7 +50,10 @@ fi
 echo "== Copying to $LYFE_SSH"
 ssh "${SSH_OPTS[@]}" "$LYFE_SSH" 'mkdir -p ~/bin ~/.config/lyfe ~/.config/systemd/user ~/.cache/lyfe-install && chmod 700 ~/.config/lyfe'
 scp -q "${SSH_OPTS[@]}" "$BINARY" "$LYFE_SSH:.cache/lyfe-install/lyfe-server"
-scp -q "${SSH_OPTS[@]}" lyfe-postgres.service lyfe-server.service lyfe.env.template "$LYFE_SSH:.cache/lyfe-install/"
+scp -q "${SSH_OPTS[@]}" lyfe-postgres.service lyfe-server.service lyfe.env.template \
+    lyfe-backup lyfe-backup.service lyfe-backup.timer backup.env.template lyfe-food-db \
+    lyfe-illustrate lyfe-illustrate.py lyfe-illustrator-setup \
+    "$LYFE_SSH:.cache/lyfe-install/"
 
 echo "== Installing"
 ssh "${SSH_OPTS[@]}" "$LYFE_SSH" "TIMEZONE='$TIMEZONE' bash -s" <<'REMOTE'
@@ -91,6 +94,42 @@ install -m 755 "$STAGE/lyfe-server" ~/bin/lyfe-server.new
 mv ~/bin/lyfe-server.new ~/bin/lyfe-server
 systemctl --user enable lyfe-server.service
 systemctl --user restart lyfe-server.service
+
+# The nightly backup. Its settings file is written once, never overwritten,
+# and the timer is switched on only once those settings are complete.
+if [ ! -e ~/.config/lyfe/backup.env ]; then
+    sed -e "s|@HOME@|$HOME|" "$STAGE/backup.env.template" > ~/.config/lyfe/backup.env
+    chmod 600 ~/.config/lyfe/backup.env
+fi
+install -m 755 "$STAGE/lyfe-backup" ~/bin/lyfe-backup
+install -m 755 "$STAGE/lyfe-food-db" ~/bin/lyfe-food-db
+# The meal illustrator. The program is updated here; its Python and the
+# model are set up once, by lyfe-illustrator-setup.
+mkdir -p ~/illustrator && chmod 700 ~/illustrator
+install -m 644 "$STAGE/lyfe-illustrate.py" ~/illustrator/lyfe-illustrate.py
+install -m 755 "$STAGE/lyfe-illustrate" ~/bin/lyfe-illustrate
+install -m 755 "$STAGE/lyfe-illustrator-setup" ~/bin/lyfe-illustrator-setup
+if [ ! -e ~/illustrator/ready ]; then
+    echo "Meals are not illustrated yet: run ~/bin/lyfe-illustrator-setup once as lyfe (about 21 GB; see the README)."
+fi
+# Money. The access address is written once, by `lyfe-server money-connect`.
+MONEY_FILE=$(sed -n 's/^LYFE_SIMPLEFIN_ACCESS_FILE=//p' ~/.config/lyfe/lyfe.env | tail -1)
+if [ -z "$MONEY_FILE" ]; then
+    echo "Money is off: LYFE_SIMPLEFIN_ACCESS_FILE is not set in ~/.config/lyfe/lyfe.env (see the README)."
+elif [ ! -s "$MONEY_FILE" ]; then
+    echo "No bank is connected yet: make a setup token at SimpleFIN Bridge, then run"
+    echo "  set -a; . ~/.config/lyfe/lyfe.env; set +a; ~/bin/lyfe-server money-connect"
+fi
+cp "$STAGE/lyfe-backup.service" "$STAGE/lyfe-backup.timer" ~/.config/systemd/user/
+systemctl --user daemon-reload
+if BACKUP_MISSING=$(~/bin/lyfe-backup ready); then
+    systemctl --user enable --now lyfe-backup.timer
+    echo "The nightly backup is on. Last run: $(systemctl --user show lyfe-backup.service -p ExecMainExitTimestamp --value | grep . || echo never)."
+else
+    systemctl --user disable --now lyfe-backup.timer >/dev/null 2>&1 || true
+    echo "NO BACKUP YET: the database on this machine is the only copy. Still to do (see the README):"
+    echo "$BACKUP_MISSING" | sed 's/^/  - /'
+fi
 rm -rf "$STAGE"
 
 for attempt in 1 2 3 4 5 6 7 8 9 10; do

@@ -39,7 +39,9 @@ import Testing
             AppModel(
                 tokens: MemoryTokenStore(), addresses: MemoryServerAddressStore(address: saved),
                 cache: HomeCache(directory: Fixture.temporaryDirectory()),
-                breath: BreathStore(directory: Fixture.temporaryDirectory()), transport: backend,
+                breath: BreathStore(directory: Fixture.temporaryDirectory()),
+                weighIns: WeighInStore(directory: Fixture.temporaryDirectory()),
+                food: FoodStore(directory: Fixture.temporaryDirectory()), transport: backend,
                 deviceName: "Test iPhone", defaultServerAddress: "built-in.example.ts.net:8444")
         }
 
@@ -257,7 +259,9 @@ import Testing
         let model = AppModel(
             tokens: BrokenTokenStore(), addresses: MemoryServerAddressStore(),
             cache: HomeCache(directory: Fixture.temporaryDirectory()),
-            breath: BreathStore(directory: Fixture.temporaryDirectory()), transport: backend,
+            breath: BreathStore(directory: Fixture.temporaryDirectory()),
+            weighIns: WeighInStore(directory: Fixture.temporaryDirectory()),
+                food: FoodStore(directory: Fixture.temporaryDirectory()), transport: backend,
             deviceName: "Test iPhone")
         model.serverAddress = "lyfe.example.ts.net"
         await model.signIn(password: "a long password")
