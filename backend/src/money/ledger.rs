@@ -529,7 +529,8 @@ pub struct MonthInput<'a> {
 /// Where the stored entries lie around a month.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct History {
-    /// The day of the oldest entry stored.
+    /// The day every bank's entries reach back to: a month from it on is
+    /// known whole.
     pub first: Option<NaiveDate>,
     /// The day of the last entry before the month.
     pub before: Option<NaiveDate>,

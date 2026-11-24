@@ -140,7 +140,7 @@ An account the owner has marked as savings or investments. Its balance is shown;
 _Avoid_: Hidden account, excluded account, savings (for the mark itself)
 
 **Investment account**:
-An account the bank lists holdings for. Its balance is invested, not money in the bank. That is the bank's to say, each time it is asked; whether the account is set aside is still the owner's, and it starts that way.
+An account the bank lists holdings for. Its balance is invested, not money in the bank. That is the bank's to say, each time it is asked; whether the account is set aside is still the owner's, and it starts that way the first time the bank lists what it holds.
 _Avoid_: Brokerage (as a term in lyfe), portfolio, trading account
 
 **Holding**:
@@ -152,7 +152,7 @@ Every account added up: what is in the bank and what is invested, less what is o
 _Avoid_: Balance (that is one account's), wealth, total assets
 
 **Whole month**:
-A finished month that the entries lyfe holds reach back to the first day of. Only whole months are compared with or averaged over, the last twelve at most; the month still running never is one.
+A finished month that every bank's entries reach back to the first day of. Only whole months are compared with or averaged over, the last twelve at most; the month still running never is one.
 _Avoid_: Full month, complete month, closed month
 
 **Kept**:
@@ -160,7 +160,7 @@ What came in less what was spent over the whole months counted. As a share of wh
 _Avoid_: Saved (set aside is the mark on an account), surplus, cash flow
 
 **Plan**:
-What the owner assumes when lyfe works out the way to financial independence: the withdrawal rate, growth above inflation, the age to coast by, and their birth year. The owner sets it; lyfe never changes it. Everything worked out from it is in today's money.
+What the owner assumes when lyfe works out the way to financial independence: the withdrawal rate, growth above inflation, the age to coast by, the emergency fund, and their birth year. The owner sets it; lyfe never changes it. Everything worked out from it is in today's money.
 _Avoid_: Settings, forecast, goal, target (that is food's)
 
 **Withdrawal rate**:
@@ -175,6 +175,10 @@ _Avoid_: FIRE number, retirement goal, nest egg
 What would have to be set aside today to grow to the FI number by a given age with nothing more added.
 _Avoid_: Coast FIRE (as a figure), halfway point
 
+**Emergency fund**:
+What the owner keeps in savings for the unexpected, a sum they set in the plan. It is held back from the savings set aside before they count towards financial independence, since it will not be invested, and never from investments. The rest of the savings set aside is money on its way to being invested.
+_Avoid_: Rainy-day fund, reserve, buffer
+
 **Runway**:
-How many months of spending the money on hand would cover: what is in the bank less what is owed, over a month's spending.
-_Avoid_: Emergency fund (lyfe does not know what the money is for), buffer, cushion (as a figure)
+How many months of spending the money on hand would cover: what is in the bank less what is owed, over a month's spending. The emergency fund is part of it.
+_Avoid_: Emergency fund (that is the part of savings held back, not this figure), buffer, cushion (as a figure)

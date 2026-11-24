@@ -95,7 +95,7 @@ struct FireSection: View {
             StripRow(left: "What this assumes", right: "Change →")
         }
         .buttonStyle(.plain)
-        .accessibilityHint("Opens the withdrawal rate, the growth, your birth year and the coast age")
+        .accessibilityHint("Opens the withdrawal rate, the growth, the coast age, the emergency fund and your birth year")
     }
 
     private func ahead(_ number: Int) -> some View {
@@ -184,7 +184,7 @@ struct LineSample: View {
 
 // MARK: What it assumes
 
-/// The plan: the four things the way to independence is worked out from,
+/// The plan: the five things the way to independence is worked out from,
 /// each the owner's to set. Nothing here is measured, so nothing here is
 /// right or wrong; it says what each does to the number.
 public struct PlanView: View {
@@ -250,6 +250,12 @@ public struct PlanView: View {
                         detail: "The coast number is what would grow to the FI number by this age with nothing more added.",
                         onLess: { step(\.coastAge, -MoneyPlan.coast.step, in: MoneyPlan.coast.range) },
                         onMore: { step(\.coastAge, MoneyPlan.coast.step, in: MoneyPlan.coast.range) })
+                    PosterRule(thickness: 1.5)
+                    StepRow(
+                        title: "Emergency fund", value: MoneyText.whole(draft.emergencyFundMinor),
+                        detail: "Kept in savings for the unexpected, so it is not counted towards independence. Savings set aside beyond it are money on its way to being invested and are counted; investments are never held back.",
+                        onLess: { step(\.emergencyFundMinor, -MoneyPlan.emergencyFund.step, in: MoneyPlan.emergencyFund.range) },
+                        onMore: { step(\.emergencyFundMinor, MoneyPlan.emergencyFund.step, in: MoneyPlan.emergencyFund.range) })
                     PosterRule(thickness: 1.5)
                     VStack(alignment: .leading, spacing: 6) {
                         HStack(alignment: .firstTextBaseline) {

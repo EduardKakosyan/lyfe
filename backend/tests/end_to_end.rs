@@ -4538,7 +4538,7 @@ async fn the_way_to_independence_is_worked_out_from_the_months_held_whole(pool: 
     // With no bank and nothing imported there is nothing to work out, and the plan is the careful one.
     let fire = h.fire(&token).await;
     assert_eq!((&fire["counted"], &fire["savings_rate_pct"], &fire["fi_number_minor"], &fire["ahead"]), (&json!(0), &json!(null), &json!(null), &json!([])));
-    assert_eq!(fire["plan"], json!({"withdrawal_bp": 350, "return_bp": 400, "birth_year": null, "coast_age": 65}));
+    assert_eq!(fire["plan"], json!({"withdrawal_bp": 350, "return_bp": 400, "birth_year": null, "coast_age": 65, "emergency_fund_minor": 0}));
 
     // September and October whole: 3,000 in and 1,200 spent in each. November is still running.
     let chequing = vec![
@@ -4591,6 +4591,7 @@ async fn the_way_to_independence_is_worked_out_from_the_months_held_whole(pool: 
     assert_eq!((&fire["yearly_spent_minor"], &fire["yearly_kept_minor"]), (&json!(1440000), &json!(2160000)));
     // What is set aside is the brokerage; 14,400 a year at 3.5% is the number.
     assert_eq!((&fire["set_aside_minor"], &fire["fi_number_minor"], &fire["progress_pct"]), (&json!(2000000), &json!(41142857), &json!(4.9)));
+    assert_eq!(fire["emergency_fund_minor"], 0);
     assert_eq!((&fire["years_to_fi"], &fire["fi_year"], &fire["reached"]), (&json!(13.5), &json!(2040), &json!(false)));
     // No birth year yet: no ages, and no coast number.
     assert_eq!((&fire["age"], &fire["fi_age"], &fire["coast"]), (&json!(null), &json!(null), &json!(null)));
@@ -4602,7 +4603,7 @@ async fn the_way_to_independence_is_worked_out_from_the_months_held_whole(pool: 
 
     // The owner says what to assume.
     let uri = "/v1/money/plan";
-    let plan = json!({"withdrawal_bp": 400, "return_bp": 500, "birth_year": 1990, "coast_age": 60});
+    let plan = json!({"withdrawal_bp": 400, "return_bp": 500, "birth_year": 1990, "coast_age": 60, "emergency_fund_minor": 0});
     let (status, _) = h.put(uri, None, plan.clone()).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     for wrong in [
@@ -4610,6 +4611,8 @@ async fn the_way_to_independence_is_worked_out_from_the_months_held_whole(pool: 
         json!({"withdrawal_bp": 400, "return_bp": 2000, "birth_year": 1990, "coast_age": 60}),
         json!({"withdrawal_bp": 400, "return_bp": 500, "birth_year": 2030, "coast_age": 60}),
         json!({"withdrawal_bp": 400, "return_bp": 500, "birth_year": 1990, "coast_age": 20}),
+        json!({"withdrawal_bp": 400, "return_bp": 500, "birth_year": 1990, "coast_age": 60, "emergency_fund_minor": -100}),
+        json!({"withdrawal_bp": 400, "return_bp": 500, "birth_year": 1990, "coast_age": 60, "emergency_fund_minor": 20000000}),
     ] {
         let (status, body) = h.put(uri, Some(&token), wrong.clone()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{wrong} {body}");
@@ -4629,7 +4632,19 @@ async fn the_way_to_independence_is_worked_out_from_the_months_held_whole(pool: 
     let (_, fire) = h.put(uri, Some(&token), json!({"withdrawal_bp": 400, "return_bp": 500, "coast_age": 60})).await;
     assert_eq!((&fire["plan"]["birth_year"], &fire["coast"]), (&json!(null), &json!(null)));
 
-    // An account the owner sets aside counts towards it, and what is in it is still money on hand.
+    // An emergency fund of 5,000. It is kept in savings, and the only
+    // account set aside is invested, so nothing is held back.
+    let (status, fire) = h
+        .put(uri, Some(&token), json!({"withdrawal_bp": 400, "return_bp": 500, "coast_age": 60, "emergency_fund_minor": 500000}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{fire}");
+    assert_eq!((&fire["set_aside_minor"], &fire["emergency_fund_minor"]), (&json!(2000000), &json!(0)));
+    // An app that does not know of the fund leaves it as it was.
+    let (_, fire) = h.put(uri, Some(&token), json!({"withdrawal_bp": 400, "return_bp": 500, "coast_age": 60})).await;
+    assert_eq!(fire["plan"]["emergency_fund_minor"], 500000);
+
+    // An account the owner sets aside counts towards it, less the part of
+    // the fund kept in it, and what is in it is still money on hand.
     let (status, _) = h.put(
         &format!("/v1/money/accounts/{}", account_named(&h.worth(&token).await, "Chequing")["id"].as_str().unwrap()),
         Some(&token),
@@ -4638,11 +4653,102 @@ async fn the_way_to_independence_is_worked_out_from_the_months_held_whole(pool: 
     .await;
     assert_eq!(status, StatusCode::OK);
     let fire = h.fire(&token).await;
-    assert_eq!((&fire["set_aside_minor"], &fire["on_hand_minor"]), (&json!(2250000), &json!(238000)));
+    // 2,500 in chequing is less than the fund: all of it is held back.
+    assert_eq!((&fire["set_aside_minor"], &fire["emergency_fund_minor"], &fire["on_hand_minor"]), (&json!(2000000), &json!(250000), &json!(238000)));
     // Nothing in an account set aside is spending, so with the chequing
     // account set aside there is no spending left to work a number from.
     assert_eq!(fire["monthly_spent_minor"], 0);
     assert_eq!((&fire["fi_number_minor"], &fire["runway_months"]), (&json!(null), &json!(null)));
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_month_is_whole_only_once_every_bank_reaches_back_to_its_first_day(pool: PgPool) {
+    let (h, bridge) = banked(pool).await;
+    let token = h.signed_in().await;
+    // The card's bank gives history from June; the bank pay lands in only
+    // from the end of August. A broker at a third gives no entries at all.
+    let card = (6..=11)
+        .map(|month| posted(&format!("C{month}"), &format!("2026-{month:02}-03"), "-1000.00", "Corner Grocer"))
+        .collect::<Vec<_>>();
+    let mut pay = vec![posted("P8", "2026-08-27", "-50.00", "Corner Grocer")];
+    pay.extend((9..=11).map(|month| posted(&format!("P{month}"), &format!("2026-{month:02}-15"), "4000.00", "Employer")));
+    let at_bank = |account: Value, bank: &str| {
+        let mut account = account;
+        account["conn_id"] = json!(bank);
+        account
+    };
+    bridge_answers(
+        &bridge,
+        json!({
+            "errlist": [],
+            "connections": [
+                {"conn_id": "CON-1", "name": "Card Bank", "org_id": "ORG-1", "sfin_url": "https://bridge.invalid"},
+                {"conn_id": "CON-2", "name": "Pay Bank", "org_id": "ORG-2", "sfin_url": "https://bridge.invalid"},
+                {"conn_id": "CON-3", "name": "Broker", "org_id": "ORG-3", "sfin_url": "https://bridge.invalid"},
+            ],
+            "accounts": [
+                at_bank(bank_account("ACT-1", "Card", "-1000.00", card), "CON-1"),
+                at_bank(bank_account("ACT-2", "Chequing", "9000.00", pay), "CON-2"),
+                at_bank(
+                    with_holdings(
+                        bank_account("ACT-3", "Brokerage", "20000.00", vec![]),
+                        json!([holding("H1", "WRLD", "Whole World Equity Fund", "400", "20000.00", "18000.00")]),
+                    ),
+                    "CON-3",
+                ),
+            ],
+        }),
+    )
+    .await;
+    h.import().await;
+
+    // June to August had the card and not the pay: they would read as
+    // months spent with nothing coming in. Only September and October are
+    // held whole.
+    let fire = h.fire(&token).await;
+    let months = fire["months"].as_array().unwrap().iter().map(|m| (m["month"].as_str().unwrap(), m["whole"].as_bool().unwrap())).collect::<Vec<_>>();
+    assert_eq!(months, [("2026-09", true), ("2026-10", true), ("2026-11", false)]);
+    assert_eq!((&fire["counted"], &fire["monthly_income_minor"], &fire["monthly_spent_minor"]), (&json!(2), &json!(400000), &json!(100000)));
+    assert_eq!((&fire["yearly_kept_minor"], &fire["savings_rate_pct"]), (&json!(3600000), &json!(75.0)));
+
+    // The month is compared with the one before only when that one is
+    // held whole too: October with September, and September with nothing.
+    let (_, october) = h.get("/v1/money?month=2026-10", Some(&token)).await;
+    assert_eq!(october["previous"]["month"], "2026-09");
+    let (_, september) = h.get("/v1/money?month=2026-09", Some(&token)).await;
+    assert_eq!(september["previous"], json!(null));
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn an_account_first_seen_holding_investments_is_set_aside_once(pool: PgPool) {
+    let (h, bridge) = banked(pool).await;
+    let token = h.signed_in().await;
+    let (chequing, card) = chequing_and_card();
+    let answer = |brokerage: Value| {
+        bridge_answer(
+            vec![bank_account("ACT-1", "Chequing", "2500.00", chequing.clone()), bank_account("ACT-2", "Card", "-120.00", card.clone()), brokerage],
+            json!([]),
+        )
+    };
+    // The bank says nothing of what the account holds at first.
+    bridge_answers(&bridge, answer(bank_account("ACT-3", "Brokerage", "20000.00", vec![]))).await;
+    h.import().await;
+    let brokerage = account_named(&h.worth(&token).await, "Brokerage").clone();
+    assert_eq!((&brokerage["invested"], &brokerage["set_aside"]), (&json!(false), &json!(false)));
+
+    // Then it lists holdings: it is an investment account, and set aside.
+    let holdings = json!([holding("H1", "WRLD", "Whole World Equity Fund", "400", "20000.00", "18000.00")]);
+    bridge_answers(&bridge, answer(with_holdings(bank_account("ACT-3", "Brokerage", "20000.00", vec![]), holdings.clone()))).await;
+    h.import().await;
+    let brokerage = account_named(&h.worth(&token).await, "Brokerage").clone();
+    assert_eq!((&brokerage["invested"], &brokerage["set_aside"]), (&json!(true), &json!(true)));
+
+    // From then on it is the owner's to say.
+    let (status, _) =
+        h.put(&format!("/v1/money/accounts/{}", brokerage["id"].as_str().unwrap()), Some(&token), json!({"set_aside": false})).await;
+    assert_eq!(status, StatusCode::OK);
+    h.import().await;
+    assert_eq!(account_named(&h.worth(&token).await, "Brokerage")["set_aside"], false);
 }
 
 #[tokio::test]

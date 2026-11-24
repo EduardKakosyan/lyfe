@@ -11,18 +11,23 @@ public struct MoneyPlan: Codable, Equatable, Sendable {
     public var birthYear: Int?
     /// The age the coast number is worked out for.
     public var coastAge: Int
+    /// What is kept in savings for the unexpected. It is held back from
+    /// the savings set aside, never from what is invested.
+    public var emergencyFundMinor: Int
 
-    public init(withdrawalBp: Int, returnBp: Int, birthYear: Int?, coastAge: Int) {
+    public init(withdrawalBp: Int, returnBp: Int, birthYear: Int?, coastAge: Int, emergencyFundMinor: Int = 0) {
         self.withdrawalBp = withdrawalBp
         self.returnBp = returnBp
         self.birthYear = birthYear
         self.coastAge = coastAge
+        self.emergencyFundMinor = emergencyFundMinor
     }
 
     /// What the backend takes, and the steps the entry moves in.
     public static let withdrawal = (range: 200...600, step: 25)
     public static let growth = (range: 0...1000, step: 50)
     public static let coast = (range: 40...80, step: 1)
+    public static let emergencyFund = (range: 0...10_000_000, step: 50_000)
 }
 
 /// How far off financial independence is, as the backend worked it out.
@@ -41,8 +46,11 @@ public struct MoneyFire: Codable, Equatable, Sendable {
     public var savingsRatePct: Double?
     public var yearlySpentMinor: Int?
     public var yearlyKeptMinor: Int?
-    /// What counts towards independence: every account set aside.
+    /// What counts towards independence: every account set aside, less
+    /// the emergency fund.
     public var setAsideMinor: Int
+    /// What was held back from it for the emergency fund.
+    public var emergencyFundMinor: Int
     /// A year's spending divided by the withdrawal rate.
     public var fiNumberMinor: Int?
     public var progressPct: Double?
@@ -213,6 +221,9 @@ public enum FireText {
             rows.append(("FI number · \(multiple(fire.plan))", MoneyText.amount(number)))
         }
         rows.append(("Set aside", MoneyText.amount(fire.setAsideMinor)))
+        if fire.emergencyFundMinor > 0 {
+            rows.append(("Emergency fund · held back", MoneyText.amount(fire.emergencyFundMinor)))
+        }
         if let kept = fire.yearlyKeptMinor {
             rows.append((kept < 0 ? "Short a year" : "Kept a year", MoneyText.amount(abs(kept))))
         }

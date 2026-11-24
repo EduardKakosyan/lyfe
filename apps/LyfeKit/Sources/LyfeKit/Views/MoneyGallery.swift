@@ -165,13 +165,13 @@
         /// A made-up year: pay twice a month with two months of three, and
         /// spending that moves about. Worked out the way the backend does.
         static func fire(_ screen: String) -> MoneyFire {
-            let plan = MoneyPlan(withdrawalBp: 350, returnBp: 400, birthYear: 1998, coastAge: 65)
+            let plan = MoneyPlan(withdrawalBp: 350, returnBp: 400, birthYear: 1998, coastAge: 65, emergencyFundMinor: 500_000)
             let running = MoneyFire.Month(month: "2026-11", spentMinor: 194_117, incomeMinor: 314_000, whole: false)
             if screen == "fire-new" {
                 return MoneyFire(
                     currency: "CAD", months: [running], counted: 0, monthlyIncomeMinor: nil, monthlySpentMinor: nil,
                     monthlyKeptMinor: nil, savingsRatePct: nil, yearlySpentMinor: nil, yearlyKeptMinor: nil,
-                    setAsideMinor: 3_859_430, fiNumberMinor: nil, progressPct: nil, reached: false, yearsToFi: nil,
+                    setAsideMinor: 3_859_430, emergencyFundMinor: 500_000, fiNumberMinor: nil, progressPct: nil, reached: false, yearsToFi: nil,
                     fiYear: nil, fiAge: nil, age: 28, coast: nil, onHandMinor: 1_486_562, runwayMonths: nil, ahead: [],
                     plan: plan, problems: [], source: source)
             }
@@ -204,7 +204,7 @@
                 monthlySpentMinor: monthlySpent, monthlyKeptMinor: monthlyIncome - monthlySpent,
                 savingsRatePct: (Double(monthlyIncome - monthlySpent) / Double(monthlyIncome) * 1_000).rounded() / 10,
                 yearlySpentMinor: yearlySpent, yearlyKeptMinor: yearlyKept, setAsideMinor: setAside,
-                fiNumberMinor: Int(number.rounded()), progressPct: (Double(setAside) / number * 1_000).rounded() / 10,
+                emergencyFundMinor: 500_000, fiNumberMinor: Int(number.rounded()), progressPct: (Double(setAside) / number * 1_000).rounded() / 10,
                 reached: reached, yearsToFi: years.map { ($0 * 10).rounded() / 10 },
                 fiYear: years.map { 2026 + Int(($0 + 0.9).rounded(.down)) }, fiAge: years.map { 28 + Int(($0 + 0.9).rounded(.down)) },
                 age: 28,
