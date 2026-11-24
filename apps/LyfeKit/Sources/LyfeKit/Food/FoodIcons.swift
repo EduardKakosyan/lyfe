@@ -22,6 +22,18 @@ public struct FoodIcon: Hashable, Sendable {
     }
 }
 
+/// The catalogue as the backend needs to know it to draw every icon ahead
+/// of time, so that none is waited for on the phone.
+public enum FoodCatalogue {
+    /// Every name an icon is asked for by, in the order to draw them: what
+    /// each category is drawn as, then the staples, which are the first
+    /// tiles shown, then the rest as the catalogue lists them.
+    public static var iconNames: [String] {
+        CommonIngredient.categories.compactMap { CommonIngredient.categoryPictures[$0] }
+            + CommonIngredient.library.map(\.name)
+    }
+}
+
 /// What asking for a food's icon came to.
 public enum FoodIconAnswer: Equatable, Sendable {
     case drawn(Data)

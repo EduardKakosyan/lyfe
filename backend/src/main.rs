@@ -103,6 +103,15 @@ enum Command {
         #[arg(long, default_value = "illustration.png")]
         out: std::path::PathBuf,
     },
+    /// Read food names from standard input, one a line, and queue the icon
+    /// of each to be drawn ahead of anyone looking at it. The running
+    /// server draws them in the background, in the order given, after any
+    /// meal photos and any icon the phone is asking for. Ones already drawn
+    /// are left alone, so it can be run again to see how far along it is.
+    QueueIcons {
+        #[command(flatten)]
+        database: DatabaseConfig,
+    },
     /// Draw the icon of one food with the image model, from its name alone,
     /// and write it out. Stores nothing; use it to see what an icon looks
     /// like.
@@ -141,6 +150,7 @@ async fn main() -> anyhow::Result<()> {
             illustration_check(illustration, Some(jpeg), note, out).await
         }
         Command::IconCheck { illustration, name, out } => illustration_check(illustration, None, name, out).await,
+        Command::QueueIcons { database } => queue_icons(database).await,
     }
 }
 
@@ -646,6 +656,37 @@ async fn photo_check(config: PhotoConfig, jpeg: Option<std::path::PathBuf>, note
         amount.kcal,
         amount.protein_g(),
         if estimate.oil_asked { ", with some oil counted: it would ask about oil" } else { "" }
+    );
+    Ok(())
+}
+
+async fn queue_icons(database: DatabaseConfig) -> anyhow::Result<()> {
+    use lyfe_server::routines::illustration;
+    let pool = db::connect(&database.database_url)
+        .await
+        .context("could not open the database")?;
+    let (mut read, mut queued, mut unusable) = (0i64, 0u64, 0u64);
+    for line in std::io::stdin().lock().lines() {
+        let Ok(name) = line else {
+            unusable += 1;
+            continue;
+        };
+        if name.trim().is_empty() {
+            continue;
+        }
+        read += 1;
+        match illustration::icon_key(&name) {
+            Some(key) if db::queue_food_icon(&pool, &key, &name, read).await? => queued += 1,
+            Some(_) => {}
+            None => unusable += 1,
+        }
+    }
+    let counts = db::food_icon_counts(&pool).await?;
+    println!("Read {read} names and queued {queued}; {unusable} were not names an icon is drawn for.");
+    println!(
+        "Icons now: {} drawn, {} waiting, {} given up on. The server draws the ones waiting in the background, \
+         about a second each once the model is loaded.",
+        counts.drawn, counts.waiting, counts.given_up
     );
     Ok(())
 }

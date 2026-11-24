@@ -39,6 +39,19 @@ struct FoodIconTests {
         #expect((staple.name, staple.category, staple.categoryPicture) == ("Pork tenderloin, roasted", "Pork", "raw pork chop"))
     }
 
+    @Test func theNamesToDrawAheadAreEveryNameATileAsksFor() {
+        let names = FoodCatalogue.iconNames
+        #expect(names.count == 17 + CommonIngredient.library.count)
+        #expect(Set(names.map { $0.lowercased() }).count == names.count)
+        // What is seen first is drawn first.
+        #expect(names.first == "dried beans and green peas")
+        #expect(names[17] == "Pork tenderloin, roasted")
+        #expect(names[17 + 20] == CommonIngredient.library[20].name)
+        // Every tile's two askings are among them.
+        let listed = Set(names)
+        #expect(CommonIngredient.library.allSatisfy { listed.contains($0.name) && listed.contains($0.categoryPicture ?? "") })
+    }
+
     @Test func anIconIsAskedForByNameUntilTheSparkHasDrawnItThenKept() async throws {
         let (world, model) = await world()
         world.backend.on(route, waiting, waiting, .ok("png bytes"))

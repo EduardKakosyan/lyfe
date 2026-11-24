@@ -55,7 +55,7 @@ The foods lyfe comes with, each with its figures per 100 g: twenty staples and t
 _Avoid_: Food database (that is the downloaded one barcodes are looked up in), library
 
 **Icon**:
-A small drawing of one food in the catalogue, drawn on the Spark from the food's name alone the first time it is looked at, and kept. Until a food's own icon has been drawn it is shown by its category's.
+A small drawing of one food in the catalogue, drawn on the Spark from the food's name alone and kept. Every food's is drawn ahead of time, so none is waited for; one not drawn yet is shown by its category's.
 _Avoid_: Emoji, stock image, thumbnail, illustration (that is a meal photo redrawn)
 
 **Label**:

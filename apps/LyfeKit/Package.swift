@@ -11,6 +11,9 @@ let package = Package(
     ],
     targets: [
         .target(name: "LyfeKit", resources: [.process("Food/Ingredients.json")]),
+        // Lists the catalogue's foods, for the Spark to draw their icons
+        // ahead of time. Run on the Mac; it is not part of the app.
+        .executableTarget(name: "lyfe-icon-names", dependencies: ["LyfeKit"]),
         .testTarget(name: "LyfeKitTests", dependencies: ["LyfeKit"]),
     ]
 )

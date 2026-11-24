@@ -1289,8 +1289,52 @@ pub async fn ask_food_icon(pool: &PgPool, key: &str, name: &str) -> sqlx::Result
     })
 }
 
+/// How many icons there are of each kind: drawn, waiting, given up on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IconCounts {
+    pub drawn: i64,
+    pub waiting: i64,
+    pub given_up: i64,
+}
+
+/// Puts a food's icon in the queue ahead of anyone asking for it, so that
+/// it is already drawn when the phone first shows the food. `place` is
+/// where it stands in the list being queued: icons queued this way are
+/// drawn in that order, and after any the phone is asking for now. One
+/// already drawn in the look of now, waiting, or given up on is left as it
+/// is. Returns whether it was queued.
+pub async fn queue_food_icon(pool: &PgPool, key: &str, name: &str, place: i64) -> sqlx::Result<bool> {
+    let queued: Option<bool> = sqlx::query_scalar(
+        "insert into food_icons (key, name, asked_at) values ($1, $2, to_timestamp(-$4::float8))
+         on conflict (key) do update set tries = 0, due_at = now(), asked_at = excluded.asked_at
+            where food_icons.due_at is null and coalesce(food_icons.look, 0) < $3
+         returning true",
+    )
+    .bind(key)
+    .bind(name.trim())
+    .bind(illustration::ICON_LOOK)
+    .bind(place)
+    .fetch_optional(pool)
+    .await?;
+    Ok(queued.is_some())
+}
+
+pub async fn food_icon_counts(pool: &PgPool) -> sqlx::Result<IconCounts> {
+    let row = sqlx::query(
+        "select count(*) filter (where png is not null and look = $1) as drawn,
+                count(*) filter (where due_at is not null) as waiting,
+                count(*) filter (where due_at is null and (png is null or look <> $1)) as given_up
+         from food_icons",
+    )
+    .bind(illustration::ICON_LOOK)
+    .fetch_one(pool)
+    .await?;
+    Ok(IconCounts { drawn: row.get("drawn"), waiting: row.get("waiting"), given_up: row.get("given_up") })
+}
+
 /// The icon whose turn has come that was asked for latest: the one the
-/// owner is looking at now, ahead of ones scrolled past earlier.
+/// owner is looking at now, ahead of ones scrolled past earlier, and
+/// those ahead of ones queued before anyone asked.
 pub async fn next_pending_food_icon(pool: &PgPool) -> sqlx::Result<Option<PendingIcon>> {
     let row = sqlx::query(
         "select id, name, tries from food_icons where due_at <= now() order by asked_at desc, key limit 1",

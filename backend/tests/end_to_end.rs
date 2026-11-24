@@ -3332,6 +3332,47 @@ async fn an_icon_from_an_older_look_is_drawn_again_when_it_is_next_asked_for(poo
 }
 
 #[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn icons_queued_ahead_are_drawn_in_order_after_any_the_phone_asks_for(pool: PgPool) {
+    use lyfe_server::db::{self, IconCounts};
+    use lyfe_server::illustrator::Outcome;
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    let pool = &h.state.pool;
+
+    // The catalogue, queued before anyone has looked at it.
+    for (place, name) in ["roast chicken", "Potato, baked", "Almonds"].into_iter().enumerate() {
+        let key = lyfe_server::routines::illustration::icon_key(name).unwrap();
+        assert!(db::queue_food_icon(pool, &key, name, place as i64 + 1).await.unwrap());
+    }
+    assert_eq!(db::food_icon_counts(pool).await.unwrap(), IconCounts { drawn: 0, waiting: 3, given_up: 0 });
+    // Queued twice, it is still queued once, and keeps its place.
+    assert!(!db::queue_food_icon(pool, "almonds", "Almonds", 1).await.unwrap());
+    // The phone asks for one that is nowhere in the list, and one that is.
+    assert_eq!(h.icon(Some(&token), "Butter").await.0, StatusCode::ACCEPTED);
+    assert_eq!(h.icon(Some(&token), "Almonds").await.0, StatusCode::ACCEPTED);
+
+    let drawer = Drawer::start(&h, 72, &[]).await;
+    assert_eq!(drawer.draw().await, Outcome::Drew(4));
+    let asked = drawer.asked();
+    let order: Vec<&str> = asked
+        .iter()
+        .map(|one| one["prompt"].as_str().unwrap().trim_start_matches("Flat vector illustration of a serving of ").split(", as a simple").next().unwrap())
+        .collect();
+    assert_eq!(order, ["Almonds", "Butter", "roast chicken", "Potato, baked"]);
+    assert_eq!(db::food_icon_counts(pool).await.unwrap(), IconCounts { drawn: 4, waiting: 0, given_up: 0 });
+
+    // Already drawn: the phone has it at its first asking, and queuing the
+    // list again draws nothing twice.
+    assert_eq!(h.icon(Some(&token), "Potato,%20baked").await.0, StatusCode::OK);
+    assert!(!db::queue_food_icon(pool, "potato, baked", "Potato, baked", 2).await.unwrap());
+    assert_eq!(drawer.draw().await, Outcome::Idle);
+    // Until the look moves on, when it is queued again.
+    sqlx::query("update food_icons set look = 0 where key = 'butter'").execute(pool).await.unwrap();
+    assert!(db::queue_food_icon(pool, "butter", "Butter", 9).await.unwrap());
+    assert_eq!(db::food_icon_counts(pool).await.unwrap(), IconCounts { drawn: 3, waiting: 1, given_up: 0 });
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
 async fn a_server_that_draws_nothing_says_so_and_queues_nothing(pool: PgPool) {
     let mut h = harness(pool).await;
     h.state.food_icons = false;
