@@ -1,7 +1,8 @@
 import SwiftUI
 
 /// The whole app: sign-in until there is a session, then Home, with the
-/// breath session taking the whole screen while one is open. Progress and
+/// breath session taking the whole screen while one is open, and the study
+/// screen while it is open (its timer runs on when it is closed). Progress and
 /// the weight entry open from Home or from the morning prompt; Food, with
 /// its meal builder and targets entry, from Home or from the logging
 /// prompt; Money, with its sorting screen, from Home. All of it is behind
@@ -26,7 +27,9 @@ public struct RootView: View {
                 case .signedOut:
                     SignInView(model: model)
                 case .signedIn:
-                    if model.isEnteringWeight, let today = model.home?.today {
+                    if model.isStudyOpen {
+                        StudySessionView(model: model)
+                    } else if model.isEnteringWeight, let today = model.home?.today {
                         WeighInView(
                             unit: model.weightUnit, latest: model.home?.weight?.latest, today: today,
                             onSave: { await model.recordWeight($0) }, onClose: { model.closeWeighIn() })
@@ -86,6 +89,29 @@ public struct RootView: View {
                                 onSort: { model.openSorting($0) }, onSortNext: { model.openSortingNext() },
                                 onSetAside: { await model.setAside(account: $0, $1) })
                         }
+                    } else if model.screen == .goals, let home = model.home {
+                        let goals = home.goals ?? GoalsView(limit: 3, goals: [])
+                        if let editing = model.goalEditor {
+                            let existing: Goal? =
+                                if case .change(let id) = editing { goals.goals.first { $0.id == id } } else { nil }
+                            GoalEditorView(
+                                existing: existing, home: home, weightUnit: model.weightUnit,
+                                subjects: model.studySubjects, today: home.today,
+                                onSave: { await model.saveGoal(id: editing.id, $0) },
+                                onClose: { model.closeGoalEditor() })
+                        } else if let id = model.openGoalId, let goal = goals.goals.first(where: { $0.id == id }) {
+                            GoalDetailView(
+                                goal: goal, goals: goals, home: home, weightUnit: model.weightUnit, today: home.today,
+                                onChange: { model.openGoalEditor(.change(id)) },
+                                onStatus: { await model.setGoalStatus(id, $0, note: $1) },
+                                onPractice: { await model.recordPractice(id, $0) },
+                                onResult: { await model.recordExamResult(id, passed: $0, on: $1, score: $2) },
+                                onBack: { model.closeGoal() })
+                        } else {
+                            GoalsScreen(
+                                goals: goals, home: home, weightUnit: model.weightUnit,
+                                onOpen: { model.openGoal($0) }, onNew: { model.openGoalEditor(.new(UUID())) })
+                        }
                     } else if model.screen == .progress, let home = model.home {
                         ProgressScreen(
                             weight: home.weight, today: home.today, home: home, save: model.recordProgress,
@@ -101,7 +127,7 @@ public struct RootView: View {
         .safeAreaInset(edge: .bottom, spacing: 0) {
             if model.phase == .signedIn, !model.isLocked, model.home != nil, model.breathSession == nil,
                 !model.isEnteringWeight, model.foodFlow == nil, model.mealDraft == nil,
-                !model.isEnteringTargets, model.sortingEntry == nil
+                !model.isEnteringTargets, model.sortingEntry == nil, !model.isStudyOpen, model.goalEditor == nil
             {
                 VStack(spacing: 0) {
                     PosterRule()
@@ -110,6 +136,7 @@ public struct RootView: View {
                         if model.home?.food != nil { tab(.food, "Food", "fork.knife") }
                         tab(.progress, "Progress", "chart.xyaxis.line")
                         tab(.money, "Money", "wallet.pass")
+                        tab(.goals, "Goals", "flag")
                     }
                 }.background(Poster.paper)
             }
@@ -148,12 +175,14 @@ public struct RootView: View {
             case .money: model.closeMoney()
             case .food: model.closeFood()
             case .progress: model.closeProgress()
+            case .goals: model.closeGoals()
             case .home: break
             }
             switch screen {
             case .money: model.openMoney()
             case .food: model.openFood()
             case .progress: model.openProgress()
+            case .goals: model.openGoals()
             case .home: break
             }
         } label: {

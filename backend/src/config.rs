@@ -11,6 +11,7 @@ use crate::push::apns::Environment;
 use crate::routines::breath::BreathRules;
 use crate::routines::food::FoodSettings;
 use crate::routines::gym::GymRules;
+use crate::routines::study::StudyRules;
 use crate::routines::weight::{Unit, WeightSettings};
 
 #[derive(Debug, Clone, Args)]
@@ -263,6 +264,18 @@ pub struct ServeConfig {
     #[arg(long, env = "LYFE_BREATH_STEP_SECONDS", default_value_t = BreathRules::DEFAULT_STEP_SECONDS, value_parser = clap::value_parser!(u32).range(1..=120))]
     pub breath_step_seconds: u32,
 
+    /// A study session counts once its timer passes this many minutes.
+    #[arg(long, env = "LYFE_STUDY_MIN_MINUTES", default_value_t = StudyRules::DEFAULT_MIN_MINUTES, value_parser = clap::value_parser!(u32).range(1..=240))]
+    pub study_min_minutes: u32,
+
+    /// What a study session aims at, in minutes; shown, never required.
+    #[arg(long, env = "LYFE_STUDY_TARGET_MINUTES", default_value_t = StudyRules::DEFAULT_TARGET_MINUTES, value_parser = clap::value_parser!(u32).range(1..=480))]
+    pub study_target_minutes: u32,
+
+    /// Build sessions that can count toward a week of study.
+    #[arg(long, env = "LYFE_STUDY_BUILDS_PER_WEEK", default_value_t = StudyRules::DEFAULT_BUILDS_PER_WEEK, value_parser = clap::value_parser!(u32).range(0..=4))]
+    pub study_builds_per_week: u32,
+
     /// The unit weights are typed and shown in: `kg` or `lb`. Weights are
     /// stored in grams, so changing it later changes only what is shown.
     #[arg(long, env = "LYFE_WEIGHT_UNIT", default_value = "lb", value_parser = parse_unit)]
@@ -305,6 +318,14 @@ impl ServeConfig {
             rounds: self.breath_rounds,
             advance_under_s: self.breath_advance_under_seconds,
             step_s: self.breath_step_seconds,
+        }
+    }
+
+    pub fn study_rules(&self) -> StudyRules {
+        StudyRules {
+            min_s: self.study_min_minutes * 60,
+            target_s: self.study_target_minutes.max(self.study_min_minutes) * 60,
+            builds_per_week: self.study_builds_per_week,
         }
     }
 

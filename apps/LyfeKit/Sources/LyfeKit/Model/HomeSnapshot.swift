@@ -9,6 +9,10 @@ public struct HomeSnapshot: Codable, Equatable, Sendable {
     public var gym: GymWeek
     /// Missing in answers cached before breath sessions existed.
     public var breath: BreathWeek?
+    /// Missing in answers cached before study sessions existed.
+    public var study: StudyWeek?
+    /// Missing in answers cached before goals existed.
+    public var goals: GoalsView?
     /// Missing in answers cached before weigh-ins existed.
     public var weight: WeightTrend?
     /// Missing in answers cached before food logging existed.

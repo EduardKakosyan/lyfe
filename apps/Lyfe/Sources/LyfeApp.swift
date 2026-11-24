@@ -25,6 +25,7 @@ struct LyfeApp: App {
                         await reportConnectionFromEnvironment()
                         await signInFromEnvironment()
                         await runBreathFromEnvironment()
+                        await runStudyFromEnvironment()
                         await openFromEnvironment()
                     }
                 #endif
@@ -53,6 +54,10 @@ struct LyfeApp: App {
                 FoodGallery(screen: screen)
             } else if let screen = ProcessInfo.processInfo.environment["LYFE_DEBUG_MONEY"] {
                 MoneyGallery(screen: screen)
+            } else if let screen = ProcessInfo.processInfo.environment["LYFE_DEBUG_STUDY"] {
+                StudyGallery(screen: screen)
+            } else if let screen = ProcessInfo.processInfo.environment["LYFE_DEBUG_GOALS"] {
+                GoalsGallery(screen: screen)
             } else {
                 RootView(model: model)
             }
@@ -113,8 +118,32 @@ struct LyfeApp: App {
             }
         }
 
+        /// With LYFE_DEBUG_STUDY_RUN set to a number of minutes, a signed-in
+        /// development build records a study session of that length by
+        /// itself, as if started that long ago and ended now: on the first
+        /// subject offered, or LYFE_DEBUG_STUDY_SUBJECT, as questions with 12
+        /// answered and 8 right first time. It is recorded, so use it against
+        /// a local backend.
+        private func runStudyFromEnvironment() async {
+            let environment = ProcessInfo.processInfo.environment
+            guard let text = environment["LYFE_DEBUG_STUDY_RUN"], let minutes = Int(text) else { return }
+            for _ in 0..<100 where model.home == nil {
+                try? await Task.sleep(for: .milliseconds(200))
+            }
+            let subject = environment["LYFE_DEBUG_STUDY_SUBJECT"] ?? model.studySubjects.first ?? "System design"
+            model.openStudy()
+            model.startStudy(subject: subject, kind: .questions)
+            model.startStudyEarlier(minutes: minutes)
+            model.endStudy()
+            model.changeStudy {
+                $0.answered = 12
+                $0.rightFirst = 8
+            }
+            await model.finishStudy()
+        }
+
         /// With LYFE_DEBUG_OPEN set to `food`, `meal`, `build`, `targets`,
-        /// `photo`, `scan`, `progress` or `money`, a signed-in development build opens that
+        /// `photo`, `scan`, `progress`, `money`, `study` or `goals`, a signed-in development build opens that
         /// screen by itself once Home has arrived. With LYFE_DEBUG_FOOD_TAP
         /// set as well it first logs the meal the Food screen's bar offers,
         /// as one tap would; with LYFE_DEBUG_FOOD_PHOTO set to a line it
@@ -151,6 +180,8 @@ struct LyfeApp: App {
             case "build": model.openMealBuilder()
             case "targets": model.openTargets()
             case "progress": model.openProgress()
+            case "study": model.openStudy()
+            case "goals": model.openGoals()
             case "money":
                 model.openMoney()
                 // With LYFE_DEBUG_MONEY_SORT set to a category, the oldest

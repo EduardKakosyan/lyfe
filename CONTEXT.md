@@ -1,6 +1,6 @@
 # lyfe
 
-lyfe is a private app that keeps one person's routines going and shows them where their money went.
+lyfe is a private app that keeps one person's routines going, holds them to the goals the routines serve, and shows them where their money went.
 
 ## Language
 
@@ -8,7 +8,7 @@ lyfe is a private app that keeps one person's routines going and shows them wher
 Following a planned exercise routine repeatedly over time, distinct from improvements in strength, endurance, or body composition.
 
 **Streak**:
-A count of consecutive periods in which a supporting routine was kept: weeks with four completed gym sessions, weeks with three completed breath-training sessions, or days on which a food log happened. Sessions count on whichever days they happen. A streak measures showing up; it is separate from progression.
+A count of consecutive periods in which a supporting routine was kept: weeks with four completed gym sessions, weeks with three completed breath-training sessions, weeks with four days of study, or days on which a food log happened. Sessions count on whichever days they happen. A streak measures showing up; it is separate from progression.
 _Avoid_: Daily gym streak, fixed-day streak
 
 **Progression**:
@@ -17,6 +17,34 @@ Measured improvement in a capability, such as breath-hold time, which lyfe track
 **Recovery**:
 Keeping a streak alive after a single missed period by completing the very next one. It never requires make-up sessions; two missed periods in a row end the streak.
 _Avoid_: Catch-up, make-up session, streak freeze
+
+**Study session**:
+A stretch of study timed in lyfe on one subject. It counts toward the week once its timer passes a minimum, and a day counts once. What it was (questions, reading or a build) and how it went are kept beside it and never decide whether it counted.
+_Avoid_: Study block, focus session, pomodoro
+
+**Subject**:
+What a study session was about, named by the owner. Every minute given to it is added up, counted or not.
+_Avoid_: Topic, course, track
+
+**Explain-back**:
+What the owner says, without looking it up, about what a build session built and why. A build session counts only with one, and no more than two a week count.
+_Avoid_: Reflection, journal entry, summary
+
+**Goal**:
+Where the owner means to get by a date: a figure lyfe already reads, reached (net worth, a breath hold, the weight trend); a total built up (hours on a subject); or a result got (a certification). It names the routine that moves it and is shown against its pace. Three are active at once; the rest are parked, never deleted. lyfe never moves a goal's date; it may suggest it.
+_Avoid_: Target (that is what a day is held to), objective, resolution, OKR
+
+**Exam**:
+A result to get, such as a certification: passed or not on the day it is sat, held to the pass mark its owner publishes. It has no pace; practice says whether the owner is ready.
+_Avoid_: Test (that is a practice test), certificate (that is what a pass gives)
+
+**Practice score**:
+The score of one practice test for an exam, typed after it, with each part's percentage where the test gave one. Ready is the owner's own rule: so many practice scores in a row at least so far over the pass mark.
+_Avoid_: Mock (that is the four-weekly interview), quiz score
+
+**Pace**:
+Where a goal would be today had it moved in a straight line from where it started to its figure on its date. Behind pace is an amount, and what would now be needed to make it, never a failure.
+_Avoid_: On track, off track (as states), schedule
 
 **Weigh-in**:
 A weight the owner types, normally into the morning prompt without opening lyfe. A day's weight is the last one typed that day. Not a streak: a missed morning costs nothing, and there is no second reminder.

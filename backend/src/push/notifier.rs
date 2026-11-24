@@ -2,8 +2,8 @@
 //!
 //! A prompt goes out only when a streak is at stake and today is a day to
 //! act on it (see `routines::weekly::prompt`), only inside the daytime
-//! window, and at most once for its period. Each weekly routine, the gym
-//! and breath training, is looked at on its own. Garmin is checked again
+//! window, and at most once for its period. Each weekly routine, the gym,
+//! breath training and study, is looked at on its own. Garmin is checked again
 //! just before a gym prompt, so a session recorded this morning is not
 //! nagged about.
 //!
@@ -33,6 +33,7 @@ use crate::money::Trouble;
 use crate::routines::breath;
 use crate::routines::food::{self, FoodSettings};
 use crate::routines::gym::{self, GymRules};
+use crate::routines::study::{self, StudyRules};
 use crate::routines::weekly::{self, Prompt, Week, Wording};
 use crate::routines::weight::{self, WeightSettings};
 
@@ -55,6 +56,7 @@ pub struct Notifier {
     pub default_environment: Environment,
     pub timezone: chrono_tz::Tz,
     pub gym_rules: Arc<GymRules>,
+    pub study_rules: Arc<StudyRules>,
     /// Prompts are sent from this hour of the owner's day...
     pub from_hour: u32,
     /// ...until this hour, and never outside it.
@@ -283,6 +285,11 @@ impl Notifier {
         let streak = breath::streak(today, &sessions);
         let done_today = breath::session_days(&sessions).contains(&today);
         due.extend(weekly::prompt(&streak, done_today).map(|prompt| (breath::WORDING, prompt)));
+
+        let sessions = db::study_sessions(&self.pool, self.timezone).await?;
+        let streak = study::streak(&self.study_rules, today, &sessions);
+        let done_today = study::session_days(&self.study_rules, &sessions).contains(&today);
+        due.extend(weekly::prompt(&streak, done_today).map(|prompt| (study::WORDING, prompt)));
 
         Ok(due)
     }
