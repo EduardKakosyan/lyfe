@@ -1,8 +1,10 @@
-//! Brings accounts and posted transactions from the bridge into the
-//! database. Safe to run as often as the bridge allows: a transaction is
-//! stored under the bank's own id, so importing the same days again
-//! refreshes it instead of adding it, and whatever the owner has sorted
-//! stays sorted.
+//! Brings accounts, posted transactions and what the investment accounts
+//! hold from the bridge into the database. Safe to run as often as the
+//! bridge allows: a transaction is stored under the bank's own id, so
+//! importing the same days again refreshes it instead of adding it, and
+//! whatever the owner has sorted stays sorted. Each import also keeps
+//! every account's balance for the day, which is what net worth over time
+//! is drawn from.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,7 +32,10 @@ pub struct ImportReport {
     pub new: usize,
     /// And how many the bank had changed since.
     pub changed: usize,
-    /// Accounts and transactions that could not be read and were left out.
+    /// What the investment accounts hold, as the bank lists it now.
+    pub holdings: usize,
+    /// Accounts, transactions and holdings that could not be read and were
+    /// left out.
     pub unreadable: usize,
     /// Things the bridge said were wrong.
     pub troubles: usize,
@@ -133,6 +138,7 @@ impl Importer {
                     unreadable = report.unreadable,
                     troubles = report.troubles,
                     resorted = report.resorted,
+                    holdings = report.holdings,
                     "money import finished"
                 ),
                 Some(Err(error)) => tracing::warn!(%error, "money import failed"),
@@ -209,6 +215,16 @@ impl Importer {
         for account in &set.accounts {
             let trouble = set.troubles.iter().find(|trouble| trouble.account_id.as_deref() == Some(account.id.as_str()));
             let account_id = db::upsert_money_account(&mut tx, account, trouble.map(|trouble| trouble.text.as_str())).await?;
+            // The balance and the holdings are the account as it is now,
+            // whatever days were asked for: kept once, from the newest answer.
+            if latest {
+                db::keep_money_balance(&mut tx, account_id, today, account.balance_minor).await?;
+                if let Some(holdings) = &account.holdings {
+                    db::replace_money_holdings(&mut tx, account_id, holdings).await?;
+                    report.holdings += holdings.len();
+                }
+                report.unreadable += account.unreadable_holdings;
+            }
             report.unreadable += account.unreadable;
             report.fetched += account.transactions.len();
             for transaction in &account.transactions {

@@ -4,8 +4,8 @@ import SwiftUI
 /// breath session taking the whole screen while one is open. Progress and
 /// the weight entry open from Home or from the morning prompt; Food, with
 /// its meal builder and targets entry, from Home or from the logging
-/// prompt; Money, with its sorting screen, from Home. All of it is behind
-/// Face ID each time lyfe is opened.
+/// prompt; Money, with its sorting screen and what FIRE assumes, from
+/// Home. All of it is behind Face ID each time lyfe is opened.
 public struct RootView: View {
     let model: AppModel
     @Environment(\.scenePhase) private var scenePhase
@@ -79,12 +79,19 @@ public struct RootView: View {
                                 entry: entry, categories: money.categoryNames, currency: money.currency,
                                 waiting: money.toSort, onSort: { await model.sortMoney(id, to: $0, onlyThis: $1) },
                                 onClose: { model.closeSorting() })
+                        } else if model.isEditingPlan, let fire = model.fire {
+                            PlanView(
+                                plan: fire.plan, thisYear: model.home?.today.year ?? fire.ahead.first?.year ?? 2100,
+                                onSave: { await model.setPlan($0) }, onClose: { model.closePlan() })
                         } else {
                             MoneyScreen(
-                                money: model.money, problem: model.moneyProblem, loading: model.isLoadingMoney,
+                                money: model.money, worth: model.worth, fire: model.fire, section: model.moneySection,
+                                problem: model.moneyProblem, loading: model.isFetchingMoney,
                                 onBack: { model.closeMoney() }, onMonth: { await model.loadMoney(month: $0) },
                                 onSort: { model.openSorting($0) }, onSortNext: { model.openSortingNext() },
-                                onSetAside: { await model.setAside(account: $0, $1) })
+                                onSetAside: { await model.setAside(account: $0, $1) },
+                                onSection: { model.showMoney($0) }, onReload: { await model.reloadMoneySection() },
+                                onPlan: { model.openPlan() })
                         }
                     } else if model.screen == .progress, let home = model.home {
                         ProgressScreen(
@@ -101,7 +108,7 @@ public struct RootView: View {
         .safeAreaInset(edge: .bottom, spacing: 0) {
             if model.phase == .signedIn, !model.isLocked, model.home != nil, model.breathSession == nil,
                 !model.isEnteringWeight, model.foodFlow == nil, model.mealDraft == nil,
-                !model.isEnteringTargets, model.sortingEntry == nil
+                !model.isEnteringTargets, model.sortingEntry == nil, !model.isEditingPlan
             {
                 VStack(spacing: 0) {
                     PosterRule()

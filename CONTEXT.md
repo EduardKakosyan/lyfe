@@ -1,6 +1,6 @@
 # lyfe
 
-lyfe is a private app that keeps one person's routines going and shows them where their money went.
+lyfe is a private app that keeps one person's routines going and shows them where their money went, what it all comes to, and how far off financial independence is.
 
 ## Language
 
@@ -108,5 +108,45 @@ One of twelve fixed kinds of spending an expense or refund is sorted into. The o
 _Avoid_: Tag, budget line, envelope
 
 **Set aside**:
-An account the owner has marked as savings or investments. Its balance is shown; nothing that moves in it counts as spending or waits to be sorted. Every other account is an everyday account.
+An account the owner has marked as savings or investments. Its balance is shown; nothing that moves in it counts as spending or waits to be sorted. Every other account is an everyday account. What is set aside is what counts towards financial independence.
 _Avoid_: Hidden account, excluded account, savings (for the mark itself)
+
+**Investment account**:
+An account the bank lists holdings for. Its balance is invested, not money in the bank. That is the bank's to say, each time it is asked; whether the account is set aside is still the owner's, and it starts that way.
+_Avoid_: Brokerage (as a term in lyfe), portfolio, trading account
+
+**Holding**:
+One thing an investment account is in: a fund or a share, with how many of it, what they are worth as the bank last priced them and, where the bank says, what was paid for them. The same fund in two accounts is one holding. lyfe looks no prices up.
+_Avoid_: Position, stock (for a holding), asset, ticker (that is only its symbol)
+
+**Net worth**:
+Every account added up: what is in the bank and what is invested, less what is owed. Kept once a day from the day lyfe began keeping it, which is as far back as its line goes.
+_Avoid_: Balance (that is one account's), wealth, total assets
+
+**Whole month**:
+A finished month that the entries lyfe holds reach back to the first day of. Only whole months are compared with or averaged over, the last twelve at most; the month still running never is one.
+_Avoid_: Full month, complete month, closed month
+
+**Kept**:
+What came in less what was spent over the whole months counted. As a share of what came in it is the savings rate. It is measured from pay as it lands in the bank, so what is taken off before that is in neither figure.
+_Avoid_: Saved (set aside is the mark on an account), surplus, cash flow
+
+**Plan**:
+What the owner assumes when lyfe works out the way to financial independence: the withdrawal rate, growth above inflation, the age to coast by, and their birth year. The owner sets it; lyfe never changes it. Everything worked out from it is in today's money.
+_Avoid_: Settings, forecast, goal, target (that is food's)
+
+**Withdrawal rate**:
+The share of what is set aside that could be spent each year for good. Part of the plan.
+_Avoid_: Safe withdrawal rate (nothing about it is certain), SWR, drawdown
+
+**FI number**:
+What would have to be set aside for the owner's spending to be covered for good: a year's spending divided by the withdrawal rate. Financial independence is having it. FIRE is the name of the screen that shows how far off that is.
+_Avoid_: FIRE number, retirement goal, nest egg
+
+**Coast number**:
+What would have to be set aside today to grow to the FI number by a given age with nothing more added.
+_Avoid_: Coast FIRE (as a figure), halfway point
+
+**Runway**:
+How many months of spending the money on hand would cover: what is in the bank less what is owed, over a month's spending.
+_Avoid_: Emergency fund (lyfe does not know what the money is for), buffer, cushion (as a figure)

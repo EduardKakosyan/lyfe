@@ -572,6 +572,23 @@ async fn money_check(config: MoneyConfig) -> anyhow::Result<()> {
             account.unreadable,
             account.balance_at.format("%Y-%m-%d %H:%M UTC")
         );
+        // Counts and a share only: what is held and what it is worth stay out of the terminal.
+        if let Some(holdings) = account.holdings.as_ref().filter(|_| account.holds_investments) {
+            let same_currency = holdings.iter().filter(|holding| holding.currency == account.currency);
+            let held: i64 = same_currency.clone().map(|holding| holding.value_minor).sum();
+            let of_balance = if same_currency.count() == holdings.len() && account.balance_minor > 0 {
+                format!(", coming to {}% of its balance", (held as f64 / account.balance_minor as f64 * 100.0).round())
+            } else {
+                String::new()
+            };
+            println!(
+                "    it lists {} holdings ({} unreadable, {} with what was paid){}",
+                holdings.len(),
+                account.unreadable_holdings,
+                holdings.iter().filter(|holding| holding.cost_minor.is_some()).count(),
+                of_balance
+            );
+        }
     }
     for trouble in &set.troubles {
         println!("  the bridge says: {}", trouble.text);
@@ -592,7 +609,10 @@ async fn money_import(config: ServeConfig) -> anyhow::Result<()> {
         "Imported {} accounts, asking the bridge {} time(s): {} posted transactions, {} new, {} changed by the bank, {} unreadable.",
         report.accounts, report.requests, report.fetched, report.new, report.changed, report.unreadable
     );
-    println!("{} entries were sorted again; the bridge reported {} problems.", report.resorted, report.troubles);
+    println!(
+        "{} entries were sorted again; the investment accounts list {} holdings; the bridge reported {} problems.",
+        report.resorted, report.holdings, report.troubles
+    );
     Ok(())
 }
 

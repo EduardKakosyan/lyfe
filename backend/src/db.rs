@@ -7,7 +7,7 @@ use sqlx::Row;
 
 use uuid::Uuid;
 
-use crate::money::{self, ledger};
+use crate::money::{self, fire, ledger, worth};
 use crate::routines::breath;
 use crate::routines::food::{self, Detail, Figures, Label, PhotoDetail, Quantity, Slot};
 use crate::routines::illustration;
@@ -1877,7 +1877,9 @@ pub async fn upsert_money_connection(
 /// Stores an account's name and balance as the bank has them now, and
 /// returns lyfe's id for it. A new account that holds investments starts
 /// set aside; after that, whether it is set aside is the owner's to say
-/// and is left alone.
+/// and is left alone. Whether it is an investment account is the bank's
+/// to say, each time it lists what the account holds; an answer with no
+/// such list leaves that as it was.
 pub async fn upsert_money_account(
     conn: &mut sqlx::PgConnection,
     account: &money::BankAccount,
@@ -1885,12 +1887,13 @@ pub async fn upsert_money_account(
 ) -> sqlx::Result<Uuid> {
     sqlx::query_scalar(
         "insert into money_accounts
-            (connection_id, provider_id, name, currency, balance_minor, available_minor, balance_at, problem, set_aside)
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            (connection_id, provider_id, name, currency, balance_minor, available_minor, balance_at, problem,
+             set_aside, invested)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, coalesce($10, false))
          on conflict (connection_id, provider_id) do update set
             name = excluded.name, currency = excluded.currency, balance_minor = excluded.balance_minor,
             available_minor = excluded.available_minor, balance_at = excluded.balance_at,
-            problem = excluded.problem, seen_at = now()
+            problem = excluded.problem, invested = coalesce($10, money_accounts.invested), seen_at = now()
          returning id",
     )
     .bind(&account.connection_id)
@@ -1902,8 +1905,66 @@ pub async fn upsert_money_account(
     .bind(account.balance_at)
     .bind(problem)
     .bind(account.holds_investments)
+    .bind(account.holdings.as_ref().map(|_| account.holds_investments))
     .fetch_one(conn)
     .await
+}
+
+/// Keeps what an account's balance was on `day`: the last one seen that
+/// day stands.
+pub async fn keep_money_balance(
+    conn: &mut sqlx::PgConnection,
+    account_id: Uuid,
+    day: NaiveDate,
+    balance_minor: i64,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "insert into money_balances (account_id, day, balance_minor) values ($1, $2, $3)
+         on conflict (account_id, day) do update set balance_minor = excluded.balance_minor",
+    )
+    .bind(account_id)
+    .bind(day)
+    .bind(balance_minor)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// Makes what an account holds what the bank lists now: a holding it no
+/// longer lists was sold and goes, and the rest are brought up to date.
+pub async fn replace_money_holdings(
+    conn: &mut sqlx::PgConnection,
+    account_id: Uuid,
+    holdings: &[money::BankHolding],
+) -> sqlx::Result<()> {
+    let listed: Vec<&str> = holdings.iter().map(|holding| holding.id.as_str()).collect();
+    sqlx::query("delete from money_holdings where account_id = $1 and provider_id <> all($2)")
+        .bind(account_id)
+        .bind(&listed)
+        .execute(&mut *conn)
+        .await?;
+    for holding in holdings {
+        sqlx::query(
+            "insert into money_holdings
+                (account_id, provider_id, symbol, name, currency, shares_micro, value_minor, cost_minor)
+             values ($1, $2, $3, $4, $5, $6, $7, $8)
+             on conflict (account_id, provider_id) do update set
+                symbol = excluded.symbol, name = excluded.name, currency = excluded.currency,
+                shares_micro = excluded.shares_micro, value_minor = excluded.value_minor,
+                cost_minor = excluded.cost_minor, seen_at = now()",
+        )
+        .bind(account_id)
+        .bind(&holding.id)
+        .bind(&holding.symbol)
+        .bind(&holding.name)
+        .bind(&holding.currency)
+        .bind(holding.shares_micro)
+        .bind(holding.value_minor)
+        .bind(holding.cost_minor)
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(())
 }
 
 /// What storing one transaction came to.
@@ -2103,17 +2164,33 @@ pub async fn money_history(pool: &PgPool, from: NaiveDate, to: NaiveDate) -> sql
     Ok(ledger::History { first: row.get("first"), before: row.get("before"), after: row.get("after") })
 }
 
-/// The accounts the bridge still lists, a bank at a time. One whose
-/// connection was deleted at the bridge drops out; what was imported from
-/// it stays in its months.
+/// True of a connection `c` the bridge still lists: one seen in the last
+/// import. One deleted at the bridge drops out.
+const MONEY_LISTED: &str = "c.seen_at >= (select max(seen_at) from money_connections) - interval '1 hour'";
+
+/// True of an account `a` under a connection `c` when the bridge still
+/// lists both: the account was seen in the last import, like its
+/// connection. One closed at its bank drops out. While its bank has a
+/// problem, an account is held to the last import that bank's accounts
+/// were seen in instead: a bank waiting to be signed in to again has not
+/// lost its accounts, whether or not the bridge goes on listing them, and
+/// one closed before that stays out.
+const MONEY_ACCOUNT_LISTED: &str = "c.seen_at >= (select max(seen_at) from money_connections) - interval '1 hour'
+    and a.seen_at >= (case when c.problem is null then (select max(seen_at) from money_accounts)
+                           else (select max(sibling.seen_at) from money_accounts sibling
+                                 where sibling.connection_id = a.connection_id) end) - interval '1 hour'";
+
+/// The accounts the bridge still lists, a bank at a time. One closed at
+/// its bank, or whose connection was deleted at the bridge, drops out;
+/// what was imported from it stays in its months.
 pub async fn money_accounts(pool: &PgPool) -> sqlx::Result<Vec<ledger::Account>> {
-    let rows = sqlx::query(
+    let rows = sqlx::query(&format!(
         "select a.id, a.name, c.name as connection, a.currency, a.balance_minor, a.available_minor, a.balance_at,
-                a.set_aside, a.problem
+                a.set_aside, a.invested, a.problem
          from money_accounts a join money_connections c on c.id = a.connection_id
-         where c.seen_at >= (select max(seen_at) from money_connections) - interval '1 hour'
-         order by a.set_aside, c.name, a.name, a.id",
-    )
+         where {MONEY_ACCOUNT_LISTED}
+         order by a.set_aside, c.name, a.name, a.id"
+    ))
     .fetch_all(pool)
     .await?;
     Ok(rows
@@ -2127,9 +2204,89 @@ pub async fn money_accounts(pool: &PgPool) -> sqlx::Result<Vec<ledger::Account>>
             available_minor: r.get("available_minor"),
             balance_at: r.get("balance_at"),
             set_aside: r.get("set_aside"),
+            invested: r.get("invested"),
             problem: r.get("problem"),
         })
         .collect())
+}
+
+/// What the accounts the bridge still lists hold.
+pub async fn money_holdings(pool: &PgPool) -> sqlx::Result<Vec<worth::Holding>> {
+    let rows = sqlx::query(&format!(
+        "select h.account_id, h.symbol, h.name, h.currency, h.shares_micro, h.value_minor, h.cost_minor
+         from money_holdings h join money_accounts a on a.id = h.account_id
+              join money_connections c on c.id = a.connection_id
+         where {MONEY_ACCOUNT_LISTED}
+         order by a.name, a.id, h.provider_id"
+    ))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| worth::Holding {
+            account_id: r.get("account_id"),
+            symbol: r.get("symbol"),
+            name: r.get("name"),
+            currency: r.get("currency"),
+            shares_micro: r.get("shares_micro"),
+            value_minor: r.get("value_minor"),
+            cost_minor: r.get("cost_minor"),
+        })
+        .collect())
+}
+
+/// Every balance kept, of every account ever imported: an account closed
+/// since still counts on the days it was there.
+pub async fn money_balances(pool: &PgPool) -> sqlx::Result<Vec<worth::Balance>> {
+    let rows = sqlx::query(
+        "select b.account_id, a.currency, b.day, b.balance_minor
+         from money_balances b join money_accounts a on a.id = b.account_id
+         order by b.day, b.account_id",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| worth::Balance {
+            account_id: r.get("account_id"),
+            currency: r.get("currency"),
+            day: r.get("day"),
+            balance_minor: r.get("balance_minor"),
+        })
+        .collect())
+}
+
+/// What the owner assumes about the way to financial independence.
+pub async fn money_plan(pool: &PgPool) -> sqlx::Result<fire::Plan> {
+    let row = sqlx::query("select withdrawal_bp, return_bp, birth_year, coast_age from money_plan").fetch_optional(pool).await?;
+    Ok(row.map_or_else(fire::Plan::default, |r| fire::Plan {
+        withdrawal_bp: r.get::<i32, _>("withdrawal_bp") as u32,
+        return_bp: r.get::<i32, _>("return_bp") as u32,
+        birth_year: r.get("birth_year"),
+        coast_age: r.get::<i32, _>("coast_age") as u32,
+    }))
+}
+
+pub async fn set_money_plan(pool: &PgPool, plan: &fire::Plan) -> sqlx::Result<()> {
+    sqlx::query(
+        "insert into money_plan (id, withdrawal_bp, return_bp, birth_year, coast_age) values (true, $1, $2, $3, $4)
+         on conflict (id) do update set
+            withdrawal_bp = excluded.withdrawal_bp, return_bp = excluded.return_bp,
+            birth_year = excluded.birth_year, coast_age = excluded.coast_age",
+    )
+    .bind(plan.withdrawal_bp as i32)
+    .bind(plan.return_bp as i32)
+    .bind(plan.birth_year)
+    .bind(plan.coast_age as i32)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The day of the oldest entry stored, which is as far back as a month can
+/// be held whole.
+pub async fn money_first_day(pool: &PgPool) -> sqlx::Result<Option<NaiveDate>> {
+    sqlx::query_scalar("select min(day) from money_entries").fetch_one(pool).await
 }
 
 /// A connection the bridge says is broken.
@@ -2142,11 +2299,11 @@ pub struct BrokenConnection {
 }
 
 pub async fn broken_money_connections(pool: &PgPool) -> sqlx::Result<Vec<BrokenConnection>> {
-    let rows = sqlx::query(
-        "select name, problem_code, problem, problem_since from money_connections
-         where problem is not null and seen_at >= (select max(seen_at) from money_connections) - interval '1 hour'
-         order by problem_since, name",
-    )
+    let rows = sqlx::query(&format!(
+        "select c.name, c.problem_code, c.problem, c.problem_since from money_connections c
+         where c.problem is not null and {MONEY_LISTED}
+         order by c.problem_since, c.name"
+    ))
     .fetch_all(pool)
     .await?;
     Ok(rows

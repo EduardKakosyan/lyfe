@@ -434,6 +434,23 @@ public struct LyfeAPI: Sendable {
             "PUT", "v1/money/accounts/\(id.uuidString.lowercased())", token: token, body: body, timeout: 15)
     }
 
+    /// What everything comes to, the line it has drawn, and what the
+    /// investments are in.
+    public func moneyWorth(token: String) async throws -> MoneyWorth {
+        try await call("GET", "v1/money/worth", token: token, body: nil, timeout: 15)
+    }
+
+    /// How far off financial independence is.
+    public func moneyFire(token: String) async throws -> MoneyFire {
+        try await call("GET", "v1/money/fire", token: token, body: nil, timeout: 15)
+    }
+
+    /// Says what to assume. The backend answers with everything worked
+    /// out again.
+    public func setMoneyPlan(token: String, plan: MoneyPlan) async throws -> MoneyFire {
+        try await call("PUT", "v1/money/plan", token: token, body: JSONEncoder.lyfe.encode(plan), timeout: 15)
+    }
+
     /// Which part of the path failed, with the system's error number so it
     /// can be looked up.
     static func explain(_ error: URLError) -> String {

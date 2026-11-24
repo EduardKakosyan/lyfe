@@ -8,6 +8,8 @@ Step 8 update (local build, not installed): Progress now includes pool distance,
 
 Money update (2026-11-23, built and tested on this Mac): money moved ahead of study once a provider was confirmed (ADR 0007). Accounts and posted transactions are imported from the banks through SimpleFIN Bridge by the backend itself, which replaces the trial script and its separate database. Money shows a month's spending across every account by category, with the entries behind it and the accounts; a card payment is paired with its other half and left out; an entry is sorted by the owner once for its payee; savings and investments are set aside. It was tried in the simulator against a local backend and a stand-in bridge: a month imported, entries sorted from the black bar, and the month redrawn. It is installed on the Spark, where the first real import brought back about six months of posted transactions in four requests, and on the phone. Its check on the real phone (sorting a month, and its figures set against the statements) is still to do. Bills, what is left until payday, what the investments hold and card rewards are not built.
 
+Worth and FIRE update (2026-11-24, built and tested on this Mac, not installed): Money has three sections, MONTH, WORTH and FIRE (ADR 0009). The import now also stores what each investment account holds, as the bridge lists it, and keeps every account's balance once a day. Worth shows net worth, the line it has drawn since it began being kept, what it is made of, the holdings with what they have grown by, and the accounts, which moved there from the month. FIRE shows what was kept of what came in over the months held whole, the FI number and the years to it, the coast number, the runway, and the plan it is worked out from, which the owner sets. It was tried in the simulator against a local backend and the stand-in bridge, which now has a broker: an import, Worth with its line, an account set aside from Worth, FIRE, and the plan changed and saved. Not installed on the Spark or the phone. Its checks there are still to do: what `money-check` says of the real investment accounts (how many holdings are read, and that they come to about the whole balance), net worth set against the banks' own figures, and the months FIRE counts set against the statements. The net worth line starts the day it is installed.
+
 An iPhone app in the Poster style that keeps three routines going: gym, breath training and food logging. It shows streaks with a recovery rule, pushes breath-hold progression, holds you to calorie and protein targets, and takes as little typing as possible. The backend runs on the Spark and is reached over Tailscale.
 
 Not in the first version: study sessions, a watch app.
@@ -28,6 +30,7 @@ Each step below works end to end, from capture to a screen you can look at, befo
 | 8 | Approve target changes, enter pool distance and tape measurements, and see the full Progress screen | 3, 4, 5 |
 | 9 | Use the same data from the Mac, and let an AI assistant read and act through MCP | 1 to 8 |
 | 10 | See a month's spending across every account by category, without typing any of it | 1, and the banks connected at SimpleFIN Bridge |
+| 11 | See what everything comes to and what the investments are in, and how far off financial independence is | 10 |
 
 ## The steps
 
@@ -50,6 +53,8 @@ Each step below works end to end, from capture to a screen you can look at, befo
 **9. Mac and MCP.** A Mac app sharing the Swift code, and an MCP server exposing the same operations the apps use, with the same permission checks. This delivers the "usable by me and by an AI" boundary from discovery.
 
 **10. Money.** Backend: a job that asks SimpleFIN Bridge for balances and posted transactions a few times a day and stores them under the bank's own ids; the rules for what an entry is (an expense, a refund, money in, money moved) as one tested module, with card payments paired and kept out of spending; the owner's word on a payee kept and applied to every entry from it. App: the Money screen with the month's figure, categories, entries and accounts, the sorting screen, and a strip on Home. Check: connect the banks, and a month's spending by category matches the statements, with no card payment counted.
+
+**11. Worth and FIRE.** Backend: the import stores what each investment account holds and keeps every account's balance once a day; net worth and the holdings as one tested module, and the way to financial independence as another (what is kept over whole months, the FI number, the years to it, the coast number, the runway), worked out from a plan the owner sets. App: Money in three sections, with the net worth line, the holdings and what they have grown by, what came in and was spent a month at a time, the line ahead, and the plan's entry. Check: the holdings and net worth match the banks' own figures, and the months counted match the statements.
 
 ## Rules that apply to every step
 

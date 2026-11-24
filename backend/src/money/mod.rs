@@ -1,6 +1,7 @@
 //! Client for SimpleFIN Bridge, which holds the owner's bank connections
-//! and hands lyfe a read-only view of them: accounts, balances and posted
-//! transactions. The bridge pushes nothing and refreshes about once a day,
+//! and hands lyfe a read-only view of them: accounts, balances, posted
+//! transactions and what an investment account holds. The bridge pushes
+//! nothing and refreshes about once a day,
 //! so lyfe asks a few times a day and never more (it allows about 24
 //! requests a day and switches off an access that goes far past that).
 //!
@@ -9,8 +10,10 @@
 //! stays in a file on the Spark and never appears in logs, errors or
 //! stored state.
 
+pub mod fire;
 pub mod ledger;
 pub mod sync;
+pub mod worth;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -143,9 +146,33 @@ pub struct BankAccount {
     /// True when the bank lists what the account holds: an investment
     /// account, which lyfe sets aside from the start.
     pub holds_investments: bool,
+    /// What it holds, as far as that could be read. `None` when the answer
+    /// had no list for the account at all, which says nothing about what
+    /// it holds.
+    pub holdings: Option<Vec<BankHolding>>,
+    /// Holdings that could not be read and were left out.
+    pub unreadable_holdings: usize,
     pub transactions: Vec<BankTransaction>,
     /// Transactions that could not be read and were left out.
     pub unreadable: usize,
+}
+
+/// One thing an investment account holds: a fund or a share.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BankHolding {
+    /// The bridge's id for it, unique within its account.
+    pub id: String,
+    /// The ticker, where the bank gives one.
+    pub symbol: String,
+    pub name: String,
+    /// The currency its value is in, which need not be the account's.
+    pub currency: String,
+    /// How many are held, in millionths; zero when the bank does not say.
+    pub shares_micro: i64,
+    /// What they are worth now, as the bank last priced them.
+    pub value_minor: i64,
+    /// What was paid for them, where the bank says.
+    pub cost_minor: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -355,6 +382,14 @@ fn parse_account(value: &Value) -> Option<(BankAccount, String)> {
     let balance_at = time(object.get("balance-date"))?;
     let name = ledger::shown(&text(object.get("name")).unwrap_or_default(), 60);
 
+    let listed = object.get("holdings").and_then(Value::as_array);
+    let (holdings, unreadable_holdings) = match listed {
+        Some(listed) => {
+            let (holdings, unreadable) = parse_holdings(listed, &currency);
+            (Some(holdings), unreadable)
+        }
+        None => (None, 0),
+    };
     let mut transactions = Vec::new();
     let mut unreadable = 0;
     for item in object.get("transactions").and_then(Value::as_array).into_iter().flatten() {
@@ -377,7 +412,10 @@ fn parse_account(value: &Value) -> Option<(BankAccount, String)> {
             balance_minor,
             available_minor: amount(object.get("available-balance")),
             balance_at,
-            holds_investments: object.get("holdings").and_then(Value::as_array).is_some_and(|held| !held.is_empty()),
+            // One it lists and lyfe cannot read still says what the account is.
+            holds_investments: listed.is_some_and(|held| !held.is_empty()),
+            holdings,
+            unreadable_holdings,
             transactions,
             unreadable,
         },
@@ -398,6 +436,58 @@ fn parse_transaction(value: &Value) -> Option<BankTransaction> {
         description: line("description"),
         memo: line("memo"),
     })
+}
+
+/// What an account holds. The bridge's list of holdings is not part of the
+/// published format, so it is read for the little lyfe needs and nothing
+/// is taken for granted: a holding with no value is counted and left out,
+/// as is one the bridge gives the same id twice. Where the bridge gives no
+/// ids, the same fund listed twice is two lots of it, and both are kept.
+fn parse_holdings(listed: &[Value], account_currency: &str) -> (Vec<BankHolding>, usize) {
+    let mut holdings: Vec<BankHolding> = Vec::new();
+    let mut unreadable = 0;
+    for item in listed {
+        let Some((mut holding, has_id)) = parse_holding(item, account_currency) else {
+            unreadable += 1;
+            continue;
+        };
+        let taken = |id: &str| holdings.iter().any(|known| known.id == id);
+        if taken(&holding.id) {
+            if has_id {
+                unreadable += 1;
+                continue;
+            }
+            let what = holding.id.clone();
+            holding.id = (2..).map(|lot| format!("{what} #{lot}")).find(|id| !taken(id)).expect("a number is always free");
+        }
+        holdings.push(holding);
+    }
+    (holdings, unreadable)
+}
+
+/// One holding, and whether the bridge gave an id for it.
+fn parse_holding(value: &Value, account_currency: &str) -> Option<(BankHolding, bool)> {
+    let object = value.as_object()?;
+    let line = |name: &str, most: usize| ledger::shown(&text(object.get(name)).unwrap_or_default(), most);
+    let symbol = line("symbol", 20);
+    let name = line("description", 80);
+    // Told apart by the bridge's id, or failing that by what it is.
+    let given = line("id", 200);
+    let id = [given.clone(), symbol.clone(), name.clone()].into_iter().find(|id| !id.is_empty())?;
+    let currency = text(object.get("currency"))
+        .filter(|code| code.len() == 3 && code.chars().all(|c| c.is_ascii_uppercase()))
+        .unwrap_or_else(|| account_currency.to_string());
+    let holding = BankHolding {
+        id,
+        symbol,
+        name,
+        currency,
+        shares_micro: text(object.get("shares")).and_then(|shares| ledger::scaled(&shares, 6)).filter(|shares| *shares > 0).unwrap_or(0),
+        value_minor: amount(object.get("market_value"))?,
+        // Nothing paid is how a bank that does not know writes it.
+        cost_minor: amount(object.get("cost_basis")).filter(|cost| *cost > 0),
+    };
+    Some((holding, !given.is_empty()))
 }
 
 /// A non-empty string, or a number written out.
@@ -485,6 +575,8 @@ mod tests {
                  ]},
                 {"id": "ACT-2", "name": "", "conn_id": "CON-2", "conn_name": "Second Bank", "currency": "CAD",
                  "balance": -310.4, "balance-date": 1795000000, "holdings": [{"id": "H1", "symbol": "XYZ"}]},
+                {"id": "ACT-4", "name": "Savings", "conn_id": "CON-1", "currency": "CAD", "balance": "10",
+                 "balance-date": 1795000000, "holdings": []},
                 {"id": "ACT-3", "name": "Points", "conn_id": "CON-1", "currency": "https://x.invalid/points",
                  "balance": "10", "balance-date": 1795000000},
                 {"name": "No id", "currency": "CAD", "balance": "1", "balance-date": 1795000000}
@@ -499,6 +591,7 @@ mod tests {
             ]
         );
         assert_eq!(set.unreadable_accounts, 2);
+        assert_eq!(set.accounts.len(), 3);
         let chequing = &set.accounts[0];
         assert_eq!((chequing.balance_minor, chequing.available_minor), (125007, Some(120000)));
         assert_eq!(chequing.balance_at.timestamp(), 1795000000);
@@ -518,6 +611,11 @@ mod tests {
         let card = &set.accounts[1];
         assert_eq!((card.name.as_str(), card.balance_minor, card.available_minor), ("Account", -31040, None));
         assert_eq!((chequing.holds_investments, card.holds_investments), (false, true));
+        // No list says nothing; an empty one says it holds nothing; and a
+        // holding that cannot be read still says what the account is.
+        assert_eq!((chequing.holdings.as_ref(), card.holdings.as_ref()), (None, Some(&vec![])));
+        assert_eq!((card.unreadable, card.unreadable_holdings), (0, 1));
+        assert_eq!((set.accounts[2].holds_investments, set.accounts[2].holdings.as_ref()), (false, Some(&vec![])));
         // The coded list wins over the plain lines, and is made safe to show.
         assert_eq!(set.troubles.len(), 3);
         assert_eq!(set.troubles[0].text, "Sign in again at First Bank");
@@ -525,6 +623,75 @@ mod tests {
         assert!(Trouble::needs_reconnecting(&set.troubles[0].code));
         assert_eq!(set.troubles[1].account_id.as_deref(), Some("ACT-2"));
         assert_eq!(set.troubles[2].text, "Something went wrong at the bank.");
+    }
+
+    #[test]
+    fn what_an_account_holds_is_read_for_what_it_is_worth() {
+        let set = parse_account_set(&json!({
+            "accounts": [{"id": "ACT-1", "name": "Brokerage", "conn_id": "CON-1", "currency": "CAD",
+                "balance": "22104.55", "balance-date": 1795000000, "transactions": [],
+                "holdings": [
+                    {"id": "HOL-1", "created": 1795000000, "currency": "CAD", "cost_basis": "10000.00",
+                     "description": "Whole World\tEquity Fund", "market_value": "12048.30", "purchase_price": "0.00",
+                     "shares": "350.1254", "symbol": "WRLD"},
+                    // In another currency than its account, and with nothing known of what was paid.
+                    {"id": "HOL-2", "currency": "USD", "cost_basis": "0.00", "description": "Big Tech Co",
+                     "market_value": 1500.5, "shares": 4, "symbol": "BIG"},
+                    // No id and no ticker: told apart by its name, in the account's currency.
+                    {"currency": "", "description": "Savings Bond", "market_value": "600"},
+                    // The same again with no id: another lot of it, and kept.
+                    {"description": "Savings Bond", "market_value": "150", "shares": "1"},
+                    // Listed twice, worth nothing readable, and not a holding at all.
+                    {"id": "HOL-1", "symbol": "WRLD", "market_value": "1.00"},
+                    {"id": "HOL-9", "symbol": "LOST", "shares": "3"},
+                    "nonsense"
+                ]}]
+        }))
+        .unwrap();
+        let account = &set.accounts[0];
+        assert!(account.holds_investments);
+        assert_eq!((account.unreadable, account.unreadable_holdings), (0, 3));
+        assert_eq!(
+            account.holdings.as_deref().unwrap(),
+            [
+                BankHolding {
+                    id: "HOL-1".into(),
+                    symbol: "WRLD".into(),
+                    name: "Whole World Equity Fund".into(),
+                    currency: "CAD".into(),
+                    shares_micro: 350_125_400,
+                    value_minor: 1_204_830,
+                    cost_minor: Some(1_000_000),
+                },
+                BankHolding {
+                    id: "HOL-2".into(),
+                    symbol: "BIG".into(),
+                    name: "Big Tech Co".into(),
+                    currency: "USD".into(),
+                    shares_micro: 4_000_000,
+                    value_minor: 150_050,
+                    cost_minor: None,
+                },
+                BankHolding {
+                    id: "Savings Bond".into(),
+                    symbol: String::new(),
+                    name: "Savings Bond".into(),
+                    currency: "CAD".into(),
+                    shares_micro: 0,
+                    value_minor: 60_000,
+                    cost_minor: None,
+                },
+                BankHolding {
+                    id: "Savings Bond #2".into(),
+                    symbol: String::new(),
+                    name: "Savings Bond".into(),
+                    currency: "CAD".into(),
+                    shares_micro: 1_000_000,
+                    value_minor: 15_000,
+                    cost_minor: None,
+                },
+            ]
+        );
     }
 
     #[test]

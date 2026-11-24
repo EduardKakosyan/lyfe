@@ -114,7 +114,8 @@ struct LyfeApp: App {
         }
 
         /// With LYFE_DEBUG_OPEN set to `food`, `meal`, `build`, `targets`,
-        /// `photo`, `scan`, `progress` or `money`, a signed-in development build opens that
+        /// `photo`, `scan`, `progress`, `money`, `worth`, `fire` or `plan`,
+        /// a signed-in development build opens that
         /// screen by itself once Home has arrived. With LYFE_DEBUG_FOOD_TAP
         /// set as well it first logs the meal the Food screen's bar offers,
         /// as one tap would; with LYFE_DEBUG_FOOD_PHOTO set to a line it
@@ -151,6 +152,15 @@ struct LyfeApp: App {
             case "build": model.openMealBuilder()
             case "targets": model.openTargets()
             case "progress": model.openProgress()
+            case "worth", "fire", "plan":
+                model.openMoney()
+                model.showMoney(screen == "worth" ? .worth : .fire)
+                if screen == "plan" {
+                    for _ in 0..<50 where model.fire == nil {
+                        try? await Task.sleep(for: .milliseconds(200))
+                    }
+                    model.openPlan()
+                }
             case "money":
                 model.openMoney()
                 // With LYFE_DEBUG_MONEY_SORT set to a category, the oldest

@@ -110,6 +110,25 @@ public final class AppModel {
     /// What went wrong fetching or changing it, in words for the owner.
     public private(set) var moneyProblem: String?
     public private(set) var isLoadingMoney = false
+    /// Which of Money's three sections is on screen.
+    public private(set) var moneySection: MoneySection = .month
+    /// What everything comes to, as the backend last answered. Like the
+    /// month, kept only while lyfe runs.
+    public private(set) var worth: MoneyWorth?
+    /// How far off financial independence is, likewise.
+    public private(set) var fire: MoneyFire?
+    private var isLoadingWorth = false
+    private var isLoadingFire = false
+    /// Set when one of them is asked for while it is already being
+    /// fetched: something has changed since that fetch left, so it is
+    /// fetched again once it is back.
+    private var worthAskedAgain = false
+    private var fireAskedAgain = false
+    /// Counts up each time what `fire` should hold is changed from here,
+    /// so an answer asked for before that is not shown over it.
+    private var fireChanges = 0
+    /// True while what FIRE assumes is open to change.
+    public private(set) var isEditingPlan = false
     /// The entry whose sorting screen is open.
     public private(set) var sortingEntry: UUID?
     /// True while the weight entry is on screen.
@@ -396,6 +415,10 @@ public final class AppModel {
         foodFlow = nil
         money = nil
         moneyProblem = nil
+        worth = nil
+        fire = nil
+        moneySection = .month
+        isEditingPlan = false
         sortingEntry = nil
         screen = .home
         isEnteringWeight = false
@@ -567,14 +590,18 @@ public final class AppModel {
     // MARK: Money
 
     /// Opens Money on the current month, showing the last answer until the
-    /// new one arrives.
+    /// new one arrives. It opens on the section it was left on.
     public func openMoney() {
         screen = .money
-        Task { await loadMoney(month: nil) }
+        Task {
+            await loadMoney(month: nil)
+            await reloadMoneySection()
+        }
     }
 
     public func closeMoney() {
         sortingEntry = nil
+        isEditingPlan = false
         screen = .home
         // Home's strip says how many are left to sort.
         Task { await reloadHome() }
@@ -628,12 +655,112 @@ public final class AppModel {
     }
 
     /// Sets an account aside, or brings it back. Returns what went wrong.
+    /// What is set aside changes what everything is made of and what
+    /// counts towards independence, so those are fetched again.
     @discardableResult
     public func setAside(account id: UUID, _ aside: Bool) async -> String? {
         guard let month = money?.month else { return "Open the month first." }
-        return await changeMoney("change the account") { api, token in
+        let problem = await changeMoney("change the account") { api, token in
             try await api.setMoneyAccount(token: token, id: id, setAside: aside, month: month)
         }
+        guard problem == nil else { return problem }
+        fire = nil
+        fireChanges += 1
+        if worth != nil { await loadWorth() }
+        return nil
+    }
+
+    /// Shows another of Money's sections, with the last answer until the
+    /// new one arrives.
+    public func showMoney(_ section: MoneySection) {
+        moneySection = section
+        moneyProblem = nil
+        Task { await reloadMoneySection() }
+    }
+
+    /// Fetches what the section on screen shows. The month has its own
+    /// way, since it is asked for by month.
+    public func reloadMoneySection() async {
+        switch moneySection {
+        case .month: break
+        case .worth: await loadWorth()
+        case .fire: await loadFire()
+        }
+    }
+
+    /// Fetches what everything comes to. One fetch at a time: asked for
+    /// again meanwhile, it is fetched once more when that one is back.
+    public func loadWorth() async {
+        guard phase == .signedIn else { return }
+        guard !isLoadingWorth else {
+            worthAskedAgain = true
+            return
+        }
+        isLoadingWorth = true
+        defer { isLoadingWorth = false }
+        repeat {
+            worthAskedAgain = false
+            let (answer, problem) = await askMoney("fetch what everything comes to") { api, token in
+                try await api.moneyWorth(token: token)
+            }
+            if let answer { worth = answer }
+            if moneySection == .worth { moneyProblem = problem }
+        } while worthAskedAgain && phase == .signedIn
+    }
+
+    /// Fetches how far off financial independence is, likewise. An answer
+    /// asked for before the plan or an account was changed is out of date
+    /// when it comes, and is asked for again instead of shown.
+    public func loadFire() async {
+        guard phase == .signedIn else { return }
+        guard !isLoadingFire else {
+            fireAskedAgain = true
+            return
+        }
+        isLoadingFire = true
+        defer { isLoadingFire = false }
+        repeat {
+            fireAskedAgain = false
+            let asked = fireChanges
+            let (answer, problem) = await askMoney("fetch the way to independence") { api, token in
+                try await api.moneyFire(token: token)
+            }
+            guard asked == fireChanges else {
+                fireAskedAgain = true
+                continue
+            }
+            if let answer { fire = answer }
+            if moneySection == .fire { moneyProblem = problem }
+        } while fireAskedAgain && phase == .signedIn
+    }
+
+    /// True while any of Money is being fetched.
+    public var isFetchingMoney: Bool {
+        isLoadingMoney || isLoadingWorth || isLoadingFire
+    }
+
+    /// Opens what FIRE assumes, to change it.
+    public func openPlan() {
+        guard fire != nil else { return }
+        isEditingPlan = true
+    }
+
+    public func closePlan() {
+        isEditingPlan = false
+    }
+
+    /// Says what to assume, and closes the entry once the backend has it.
+    /// Returns what went wrong, or nil.
+    @discardableResult
+    public func setPlan(_ plan: MoneyPlan) async -> String? {
+        let (answer, problem) = await askMoney("change what it assumes") { api, token in
+            try await api.setMoneyPlan(token: token, plan: plan)
+        }
+        guard let answer else { return problem }
+        fire = answer
+        fireChanges += 1
+        isEditingPlan = false
+        return nil
     }
 
     /// Asks the backend about money and shows the month it answers with.
@@ -641,27 +768,39 @@ public final class AppModel {
     private func changeMoney(
         _ what: String, _ change: (LyfeAPI, String) async throws -> MoneyMonth
     ) async -> String? {
-        guard phase == .signedIn, let api, let token else { return "Sign in first." }
+        let (month, problem) = await askMoney(what, change)
+        if let month { money = month }
+        return problem
+    }
+
+    /// Asks the backend something about money. `what` finishes
+    /// "Could not …". Answers with what it said, or with what went wrong.
+    private func askMoney<Answer>(
+        _ what: String, _ ask: (LyfeAPI, String) async throws -> Answer
+    ) async -> (answer: Answer?, problem: String?) {
+        guard phase == .signedIn, let api, let token else { return (nil, "Sign in first.") }
         do {
-            money = try await change(api, token)
+            let answer = try await ask(api, token)
+            // Signed out while it was on its way: nothing of it is kept.
+            guard phase == .signedIn else { return (nil, "Signed out.") }
             isOffline = false
             offlineReason = nil
-            return nil
+            return (answer, nil)
         } catch LyfeAPIError.unauthorized {
             forgetSession()
-            return "Signed out."
+            return (nil, "Signed out.")
         } catch LyfeAPIError.unreachable(let why) {
             isOffline = true
             offlineReason = why
-            return "Could not \(what): can't reach the server (\(why))."
+            return (nil, "Could not \(what): can't reach the server (\(why)).")
         } catch LyfeAPIError.unreadableResponse {
-            return "The server's answer could not be read. The app may be older than the server."
+            return (nil, "The server's answer could not be read. The app may be older than the server.")
         } catch LyfeAPIError.server(let status) where (400..<500).contains(status) {
-            return "The server would not \(what) (\(status))."
+            return (nil, "The server would not \(what) (\(status)).")
         } catch LyfeAPIError.server(let status) {
-            return "Could not \(what): the server answered with an error (\(status))."
+            return (nil, "Could not \(what): the server answered with an error (\(status)).")
         } catch {
-            return "Could not \(what)."
+            return (nil, "Could not \(what).")
         }
     }
 
