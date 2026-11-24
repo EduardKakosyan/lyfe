@@ -7,9 +7,10 @@ import Testing
 /// sends: two whole months of 3,000 in and 1,200 spent, and November
 /// running.
 enum FireFixture {
-    static func plan(withdrawal: Int = 350, growth: Int = 400, born: Int? = nil, coast: Int = 65) -> String {
+    static func plan(withdrawal: Int = 350, growth: Int = 400, born: Int? = nil, coast: Int = 65, fund: Int = 0) -> String {
         """
-        {"withdrawal_bp": \(withdrawal), "return_bp": \(growth), "birth_year": \(born.map(String.init) ?? "null"), "coast_age": \(coast)}
+        {"withdrawal_bp": \(withdrawal), "return_bp": \(growth), "birth_year": \(born.map(String.init) ?? "null"), "coast_age": \(coast),
+         "emergency_fund_minor": \(fund)}
         """
     }
 
@@ -25,7 +26,7 @@ enum FireFixture {
                         {"month": "2026-11", "spent_minor": 90000, "income_minor": 300000, "whole": false}],
              "counted": 2, "monthly_income_minor": 300000, "monthly_spent_minor": 120000, "monthly_kept_minor": 180000,
              "savings_rate_pct": 60.0, "yearly_spent_minor": 1440000, "yearly_kept_minor": 2160000,
-             "set_aside_minor": 2000000, "fi_number_minor": 41142857, "progress_pct": 4.9, "reached": false,
+             "set_aside_minor": 2000000, "emergency_fund_minor": 0, "fi_number_minor": 41142857, "progress_pct": 4.9, "reached": false,
              "years_to_fi": 13.5, "fi_year": 2040, "fi_age": \(born ? "50" : "null"), "age": \(age), "coast": \(coast),
              "on_hand_minor": 238000, "runway_months": 2.0,
              "ahead": [{"year": 2026, "age": \(age), "kept_minor": 2000000, "coast_minor": 2000000},
@@ -41,7 +42,7 @@ enum FireFixture {
         {"currency": "CAD", "months": [{"month": "2026-11", "spent_minor": 90000, "income_minor": 300000, "whole": false}],
          "counted": 0, "monthly_income_minor": null, "monthly_spent_minor": null, "monthly_kept_minor": null,
          "savings_rate_pct": null, "yearly_spent_minor": null, "yearly_kept_minor": null, "set_aside_minor": 2000000,
-         "fi_number_minor": null, "progress_pct": null, "reached": false, "years_to_fi": null, "fi_year": null,
+         "emergency_fund_minor": 0, "fi_number_minor": null, "progress_pct": null, "reached": false, "years_to_fi": null, "fi_year": null,
          "fi_age": null, "age": null, "coast": null, "on_hand_minor": 238000, "runway_months": null, "ahead": [],
          "plan": \(plan()), "problems": [],
          "source": {"state": "ok", "last_success_at": "2026-11-17T14:00:00Z", "last_attempt_at": "2026-11-17T14:00:00Z", "message": null}}
@@ -172,6 +173,11 @@ enum FireFixture {
         var coast = fire.coast!
         coast.reached = true
         #expect(FireText.coastLine(coast) == "COAST NUMBER 131,925 · PASSED: IT GROWS THERE BY 65 WITH NOTHING ADDED")
+        // What was held back for the emergency fund is said beside what is set aside.
+        var funded = FireFixture.decoded()
+        funded.emergencyFundMinor = 500_000
+        #expect(FireText.numberRows(funded).map(\.0)[2...3] == ["Set aside", "Emergency fund · held back"])
+        #expect(FireText.numberRows(funded)[3].1 == "5,000.00")
         // With nothing to work a number from, only what is set aside is said.
         #expect(FireText.numberRows(FireFixture.decoded(FireFixture.new)).map(\.0) == ["Set aside"])
         #expect(FireText.progress(FireFixture.decoded(FireFixture.new)) == 0)
@@ -314,7 +320,7 @@ enum FireFixture {
         #expect(model.isEditingPlan)
 
         let plan = MoneyPlan(withdrawalBp: 400, returnBp: 500, birthYear: 1990, coastAge: 60)
-        #expect(await model.setPlan(plan) == nil)
+        #expect(await model.setPlan(MoneyPlan(withdrawalBp: 400, returnBp: 500, birthYear: 1990, coastAge: 60, emergencyFundMinor: 500_000)) == nil)
         #expect(!model.isEditingPlan)
         #expect(model.fire?.plan == plan)
         #expect(model.fire?.age == 36)
@@ -323,6 +329,7 @@ enum FireFixture {
         #expect(body["return_bp"] as? Int == 500)
         #expect(body["birth_year"] as? Int == 1990)
         #expect(body["coast_age"] as? Int == 60)
+        #expect(body["emergency_fund_minor"] as? Int == 500_000)
 
         // No birth year is sent as none, which takes it back.
         model.openPlan()

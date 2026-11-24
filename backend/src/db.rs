@@ -2244,11 +2244,11 @@ pub async fn upsert_money_connection(
 }
 
 /// Stores an account's name and balance as the bank has them now, and
-/// returns lyfe's id for it. A new account that holds investments starts
-/// set aside; after that, whether it is set aside is the owner's to say
-/// and is left alone. Whether it is an investment account is the bank's
-/// to say, each time it lists what the account holds; an answer with no
-/// such list leaves that as it was.
+/// returns lyfe's id for it. An account starts set aside when it is first
+/// seen holding investments, new or not; after that, whether it is set
+/// aside is the owner's to say and is left alone. Whether it is an
+/// investment account is the bank's to say, each time it lists what the
+/// account holds; an answer with no such list leaves that as it was.
 pub async fn upsert_money_account(
     conn: &mut sqlx::PgConnection,
     account: &money::BankAccount,
@@ -2262,7 +2262,8 @@ pub async fn upsert_money_account(
          on conflict (connection_id, provider_id) do update set
             name = excluded.name, currency = excluded.currency, balance_minor = excluded.balance_minor,
             available_minor = excluded.available_minor, balance_at = excluded.balance_at,
-            problem = excluded.problem, invested = coalesce($10, money_accounts.invested), seen_at = now()
+            problem = excluded.problem, invested = coalesce($10, money_accounts.invested), seen_at = now(),
+            set_aside = money_accounts.set_aside or (coalesce($10, false) and not money_accounts.invested)
          returning id",
     )
     .bind(&account.connection_id)
@@ -2523,8 +2524,11 @@ pub async fn money_entry(conn: &mut sqlx::PgConnection, id: Uuid) -> sqlx::Resul
 /// Where the stored entries lie around the days from `from` to `to`.
 pub async fn money_history(pool: &PgPool, from: NaiveDate, to: NaiveDate) -> sqlx::Result<ledger::History> {
     let row = sqlx::query(
-        "select min(day) as first, max(day) filter (where day < $1) as before, min(day) filter (where day > $2) as after
-         from money_entries",
+        &format!(
+            "select {MONEY_HISTORY_FROM} as first, max(day) filter (where day < $1) as before,
+                    min(day) filter (where day > $2) as after
+             from money_entries"
+        ),
     )
     .bind(from)
     .bind(to)
@@ -2532,6 +2536,12 @@ pub async fn money_history(pool: &PgPool, from: NaiveDate, to: NaiveDate) -> sql
     .await?;
     Ok(ledger::History { first: row.get("first"), before: row.get("before"), after: row.get("after") })
 }
+
+/// The day every bank's entries reach back to: the latest of each bank's
+/// oldest entry. A bank with no entries yet says nothing about it.
+const MONEY_HISTORY_FROM: &str = "(select max(oldest) from (
+        select min(e.day) as oldest from money_entries e join money_accounts a on a.id = e.account_id
+        group by a.connection_id) banks)";
 
 /// True of a connection `c` the bridge still lists: one seen in the last
 /// import. One deleted at the bridge drops out.
@@ -2627,35 +2637,43 @@ pub async fn money_balances(pool: &PgPool) -> sqlx::Result<Vec<worth::Balance>> 
 
 /// What the owner assumes about the way to financial independence.
 pub async fn money_plan(pool: &PgPool) -> sqlx::Result<fire::Plan> {
-    let row = sqlx::query("select withdrawal_bp, return_bp, birth_year, coast_age from money_plan").fetch_optional(pool).await?;
+    let row = sqlx::query("select withdrawal_bp, return_bp, birth_year, coast_age, emergency_fund_minor from money_plan")
+        .fetch_optional(pool)
+        .await?;
     Ok(row.map_or_else(fire::Plan::default, |r| fire::Plan {
         withdrawal_bp: r.get::<i32, _>("withdrawal_bp") as u32,
         return_bp: r.get::<i32, _>("return_bp") as u32,
         birth_year: r.get("birth_year"),
         coast_age: r.get::<i32, _>("coast_age") as u32,
+        emergency_fund_minor: r.get("emergency_fund_minor"),
     }))
 }
 
 pub async fn set_money_plan(pool: &PgPool, plan: &fire::Plan) -> sqlx::Result<()> {
     sqlx::query(
-        "insert into money_plan (id, withdrawal_bp, return_bp, birth_year, coast_age) values (true, $1, $2, $3, $4)
+        "insert into money_plan (id, withdrawal_bp, return_bp, birth_year, coast_age, emergency_fund_minor)
+         values (true, $1, $2, $3, $4, $5)
          on conflict (id) do update set
             withdrawal_bp = excluded.withdrawal_bp, return_bp = excluded.return_bp,
-            birth_year = excluded.birth_year, coast_age = excluded.coast_age",
+            birth_year = excluded.birth_year, coast_age = excluded.coast_age,
+            emergency_fund_minor = excluded.emergency_fund_minor",
     )
     .bind(plan.withdrawal_bp as i32)
     .bind(plan.return_bp as i32)
     .bind(plan.birth_year)
     .bind(plan.coast_age as i32)
+    .bind(plan.emergency_fund_minor)
     .execute(pool)
     .await?;
     Ok(())
 }
 
-/// The day of the oldest entry stored, which is as far back as a month can
-/// be held whole.
+/// The day every bank's entries reach back to, which is as far back as a
+/// month can be held whole: the latest of each bank's oldest entry. A bank
+/// can give less history than another, and a month before its first entry
+/// would be missing what came in or went out there.
 pub async fn money_first_day(pool: &PgPool) -> sqlx::Result<Option<NaiveDate>> {
-    sqlx::query_scalar("select min(day) from money_entries").fetch_one(pool).await
+    sqlx::query_scalar(&format!("select {MONEY_HISTORY_FROM}")).fetch_one(pool).await
 }
 
 /// A connection the bridge says is broken.

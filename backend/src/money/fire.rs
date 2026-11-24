@@ -10,8 +10,9 @@
 //! the FI number is a year's spending divided by the withdrawal rate; the
 //! years to it are how long what is set aside takes to grow there with a
 //! year's keeping added each year; the coast number is what would grow
-//! there by itself by a given age. Growth is counted above inflation, so
-//! every figure is in today's money.
+//! there by itself by a given age. The emergency fund is held back from
+//! the savings set aside before any of that. Growth is counted above
+//! inflation, so every figure is in today's money.
 
 use std::collections::BTreeMap;
 
@@ -44,13 +45,17 @@ pub struct Plan {
     pub birth_year: Option<i32>,
     /// The age the coast number is worked out for.
     pub coast_age: u32,
+    /// What the owner keeps in savings for the unexpected, in the currency
+    /// totals are in. It is held back from what is set aside in the bank,
+    /// never from what is invested.
+    pub emergency_fund_minor: i64,
 }
 
 impl Default for Plan {
     /// Careful rather than hopeful (ADR 0009): a withdrawal rate that held
     /// over fifty years and more, and growth as planners assume it.
     fn default() -> Self {
-        Plan { withdrawal_bp: 350, return_bp: 400, birth_year: None, coast_age: 65 }
+        Plan { withdrawal_bp: 350, return_bp: 400, birth_year: None, coast_age: 65, emergency_fund_minor: 0 }
     }
 }
 
@@ -58,6 +63,7 @@ impl Plan {
     pub const WITHDRAWAL_BP: std::ops::RangeInclusive<u32> = 200..=600;
     pub const RETURN_BP: std::ops::RangeInclusive<u32> = 0..=1000;
     pub const COAST_AGE: std::ops::RangeInclusive<u32> = 40..=80;
+    pub const EMERGENCY_FUND_MINOR: std::ops::RangeInclusive<i64> = 0..=10_000_000;
 
     /// What is wrong with it, if anything, in words for whoever sent it.
     pub fn problem(&self, today: NaiveDate) -> Option<&'static str> {
@@ -72,6 +78,9 @@ impl Plan {
         }
         if self.birth_year.is_some_and(|year| !(1900..=today.year()).contains(&year)) {
             return Some("birth_year must be a year that has begun");
+        }
+        if !Self::EMERGENCY_FUND_MINOR.contains(&self.emergency_fund_minor) {
+            return Some("emergency_fund_minor must be between 0 and 10000000");
         }
         None
     }
@@ -136,8 +145,12 @@ pub struct FireView {
     pub savings_rate_pct: Option<f64>,
     pub yearly_spent_minor: Option<i64>,
     pub yearly_kept_minor: Option<i64>,
-    /// What counts towards independence: every account set aside.
+    /// What counts towards independence: every account set aside, less the
+    /// emergency fund.
     pub set_aside_minor: i64,
+    /// What was held back from it for the emergency fund: the fund, or
+    /// what the savings set aside come to if that is less.
+    pub emergency_fund_minor: i64,
     /// A year's spending divided by the withdrawal rate. Missing while
     /// there is no spending to work it from.
     pub fi_number_minor: Option<i64>,
@@ -167,13 +180,22 @@ pub struct FireInput<'a> {
     /// The day of the oldest entry stored: a month is whole only when the
     /// history reaches back to its first day.
     pub first: Option<NaiveDate>,
+    /// Every account set aside, added up.
     pub set_aside_minor: i64,
+    /// Of that, what is in the bank and not invested: the savings the
+    /// emergency fund is kept in.
+    pub set_aside_in_bank_minor: i64,
     pub on_hand_minor: i64,
     pub plan: Plan,
 }
 
 pub fn fire(input: FireInput<'_>) -> FireView {
-    let FireInput { today, currency, flows, first, set_aside_minor, on_hand_minor, plan } = input;
+    let FireInput { today, currency, flows, first, set_aside_minor, set_aside_in_bank_minor, on_hand_minor, plan } = input;
+    // The emergency fund is kept in the savings set aside and is not on its
+    // way to being invested, so it is held back from them; never from the
+    // investments, and never more than the savings hold.
+    let emergency_fund_minor = plan.emergency_fund_minor.clamp(0, set_aside_in_bank_minor.max(0));
+    let set_aside_minor = set_aside_minor - emergency_fund_minor;
     let current = Month::containing(today);
     let flow = |month: Month, whole: bool| {
         let Flow { spent_minor, income_minor } = flows.get(&month).copied().unwrap_or_default();
@@ -251,6 +273,7 @@ pub fn fire(input: FireInput<'_>) -> FireView {
         yearly_spent_minor,
         yearly_kept_minor,
         set_aside_minor,
+        emergency_fund_minor,
         fi_number_minor: fi_number.map(rounded),
         progress_pct: fi_number.map(|number| tenth(set_aside / number * 100.0)),
         reached,
@@ -348,6 +371,7 @@ mod tests {
             flows,
             first: Some(day(first)),
             set_aside_minor,
+            set_aside_in_bank_minor: 0,
             on_hand_minor: 1_200_000,
             plan,
         })
@@ -461,6 +485,7 @@ mod tests {
             flows: &gap,
             first: Some(day("2026-06-14")),
             set_aside_minor: 0,
+            set_aside_in_bank_minor: 0,
             on_hand_minor: 0,
             plan: Plan::default(),
         })
@@ -477,6 +502,7 @@ mod tests {
                 flows: &flows,
                 first,
                 set_aside_minor: 5_000_000,
+                set_aside_in_bank_minor: 0,
                 on_hand_minor: 100_000,
                 plan: Plan { birth_year: Some(1990), ..Plan::default() },
             });
@@ -511,7 +537,7 @@ mod tests {
     #[test]
     fn independence_reached_is_said_and_so_is_coasting() {
         let flows = steady("2026-05", 7, 200_000, 300_000);
-        let plan = Plan { birth_year: Some(1990), withdrawal_bp: 400, return_bp: 500, coast_age: 60 };
+        let plan = Plan { birth_year: Some(1990), withdrawal_bp: 400, return_bp: 500, coast_age: 60, ..Plan::default() };
         // 24,000 a year at 4% is 600,000.
         let there = worked_out(&flows, "2026-05-01", 60_000_000, plan);
         assert_eq!((there.fi_number_minor, there.reached, there.years_to_fi), (Some(60_000_000), true, Some(0.0)));
@@ -540,8 +566,41 @@ mod tests {
             Plan { coast_age: 81, ..Plan::default() },
             Plan { birth_year: Some(1899), ..Plan::default() },
             Plan { birth_year: Some(2027), ..Plan::default() },
+            Plan { emergency_fund_minor: -1, ..Plan::default() },
+            Plan { emergency_fund_minor: 10_000_001, ..Plan::default() },
         ] {
             assert!(wrong.problem(today).is_some(), "{wrong:?}");
         }
+        assert_eq!(Plan { emergency_fund_minor: 500_000, ..Plan::default() }.problem(today), None);
+    }
+
+    #[test]
+    fn the_emergency_fund_is_held_back_from_the_savings_set_aside() {
+        let flows = steady("2026-05", 7, 200_000, 300_000);
+        let plan = Plan { withdrawal_bp: 400, return_bp: 500, emergency_fund_minor: 500_000, ..Plan::default() };
+        let worked = |set_aside_minor: i64, set_aside_in_bank_minor: i64, plan: Plan| {
+            let view = fire(FireInput {
+                today: day("2026-11-17"),
+                currency: "CAD",
+                flows: &flows,
+                first: Some(day("2026-05-01")),
+                set_aside_minor,
+                set_aside_in_bank_minor,
+                on_hand_minor: 1_200_000,
+                plan,
+            });
+            (view.set_aside_minor, view.emergency_fund_minor, view.progress_pct, view.on_hand_minor)
+        };
+        // 100,000 invested and 11,000 in savings: 5,000 of the savings is
+        // the fund, and the rest is on its way to being invested. 24,000 a
+        // year at 4% is 600,000, and 106,000 of it is set aside. The fund is
+        // money on hand all the same.
+        assert_eq!(worked(11_100_000, 1_100_000, plan), (10_600_000, 500_000, Some(17.7), 1_200_000));
+        // Savings smaller than the fund are all of it; the investments are never held back.
+        assert_eq!(worked(10_300_000, 300_000, plan), (10_000_000, 300_000, Some(16.7), 1_200_000));
+        assert_eq!(worked(10_000_000, 0, plan), (10_000_000, 0, Some(16.7), 1_200_000));
+        // With no fund, everything set aside counts.
+        let no_fund = Plan { emergency_fund_minor: 0, ..plan };
+        assert_eq!(worked(11_100_000, 1_100_000, no_fund), (11_100_000, 0, Some(18.5), 1_200_000));
     }
 }
