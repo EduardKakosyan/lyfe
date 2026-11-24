@@ -118,6 +118,13 @@ public struct RootView: View {
         .environment(
             \.mealIllustration, IllustrationSource { [model] in await model.mealIllustration($0) }
         )
+        // The picker's tiles show a food's icon once the Spark has drawn it.
+        .environment(
+            \.foodIcons,
+            FoodIconSource(
+                kept: { [model] in model.keptFoodIcon(named: $0) },
+                ask: { [model] in await model.askForFoodIcon(named: $0) })
+        )
         // The Poster palette is fixed; it does not follow dark mode. The
         // lock is ink, so the clock and battery over it are drawn light.
         .preferredColorScheme(model.isLocked ? .dark : .light)

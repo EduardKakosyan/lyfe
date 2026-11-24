@@ -1,27 +1,15 @@
 import SwiftUI
 
+/// A food in the ingredient catalogue: its figures per 100 g, and the
+/// category it is browsed under.
 struct CommonIngredient: Identifiable, Decodable {
-    var symbol: String?
     var category: String?
-    var icon: String { symbol ?? Self.icons[category ?? ""] ?? "🍽️" }
     let name: String
     let kcal, protein, carbs, fat: Double
     var id: String { name }
 
-    init(_ icon: String, _ name: String, _ kcal: Double, _ protein: Double, _ carbs: Double, _ fat: Double) {
-        self.symbol = icon
-        self.category = switch icon {
-        case "🐖": "Pork"
-        case "🍗": "Poultry"
-        case "🥩": "Beef"
-        case "🐟": "Fish & seafood"
-        case "🥚", "🥛", "🧀": "Dairy & eggs"
-        case "🍚", "🍝", "🥣": "Grains & pasta"
-        case "🫘": "Beans & legumes"
-        case "🍌", "🍎", "🥑": "Fruit"
-        case "🧈", "🫒": "Fats & oils"
-        default: "Vegetables"
-        }
+    init(_ category: String, _ name: String, _ kcal: Double, _ protein: Double, _ carbs: Double, _ fat: Double) {
+        self.category = category
         self.name = name
         self.kcal = kcal
         self.protein = protein
@@ -29,10 +17,34 @@ struct CommonIngredient: Identifiable, Decodable {
         self.fat = fat
     }
 
-    static let icons = ["Dairy & eggs": "🥛", "Herbs & spices": "🌿", "Fats & oils": "🫒", "Poultry": "🍗",
-                        "Soups & sauces": "🥣", "Deli meats": "🥓", "Fruit": "🍎", "Pork": "🐖", "Vegetables": "🥬",
-                        "Nuts & seeds": "🥜", "Beef": "🥩", "Fish & seafood": "🐟", "Beans & legumes": "🫘",
-                        "Other meats": "🍖", "Breads & baking": "🍞", "Sweets": "🍫", "Grains & pasta": "🌾"]
+    /// The catalogue's categories, each with the food its drawing shows.
+    /// The Spark draws that as it draws any food's icon, by name, and a
+    /// food is shown with its category's drawing until its own has been
+    /// drawn.
+    static let categoryPictures = [
+        "Beans & legumes": "dried beans and green peas",
+        "Beef": "raw beef steak",
+        "Breads & baking": "bread",
+        "Dairy & eggs": "milk, cheese and eggs",
+        "Deli meats": "sliced salami and ham",
+        "Fats & oils": "cooking oil and butter",
+        "Fish & seafood": "fish and shrimp",
+        "Fruit": "mixed fruit",
+        "Grains & pasta": "dry pasta and grains",
+        "Herbs & spices": "fresh herbs and ground spices",
+        "Nuts & seeds": "mixed nuts",
+        "Other meats": "lamb chops",
+        "Pork": "raw pork chop",
+        "Poultry": "roast chicken",
+        "Soups & sauces": "soup",
+        "Sweets": "chocolate and sweets",
+        "Vegetables": "mixed vegetables",
+    ]
+
+    static let categories = categoryPictures.keys.sorted()
+
+    /// What this food's category is drawn as; nil for a food in none.
+    var categoryPicture: String? { category.flatMap { Self.categoryPictures[$0] } }
 
     static let library: [Self] = {
         guard let url = Bundle.module.url(forResource: "Ingredients", withExtension: "json"),
@@ -58,26 +70,26 @@ struct CommonIngredient: Identifiable, Decodable {
 
     // Typical values per 100 g of the edible portion, prepared as named.
     static let staples: [Self] = [
-        .init("🐖", "Pork tenderloin, roasted", 143, 26.2, 0, 3.5),
-        .init("🍗", "Chicken breast, roasted", 165, 31, 0, 3.6),
-        .init("🥩", "Ground beef, 90% lean, raw", 176, 20, 0, 10),
-        .init("🐟", "Atlantic salmon, cooked", 206, 22.1, 0, 12.4),
-        .init("🥚", "Egg, hard-boiled", 155, 12.6, 1.1, 10.6),
-        .init("🍚", "White rice, cooked", 130, 2.7, 28.2, 0.3),
-        .init("🍝", "Spaghetti, cooked", 158, 5.8, 30.9, 0.9),
-        .init("🥣", "Rolled oats, dry", 379, 13.2, 67.7, 6.5),
-        .init("🥔", "Potato, baked", 93, 2.5, 21.2, 0.1),
-        .init("🫘", "Black beans, cooked", 132, 8.9, 23.7, 0.5),
-        .init("🥦", "Broccoli, raw", 34, 2.8, 6.6, 0.4),
-        .init("🥕", "Carrot, raw", 41, 0.9, 9.6, 0.2),
-        .init("🍅", "Tomato, raw", 18, 0.9, 3.9, 0.2),
-        .init("🍌", "Banana, peeled", 89, 1.1, 22.8, 0.3),
-        .init("🍎", "Apple, with skin", 52, 0.3, 13.8, 0.2),
-        .init("🥑", "Avocado, flesh", 160, 2, 8.5, 14.7),
-        .init("🥛", "Whole milk", 61, 3.2, 4.8, 3.3),
-        .init("🧀", "Cheddar cheese", 403, 24.9, 1.3, 33.1),
-        .init("🧈", "Butter", 717, 0.9, 0.1, 81.1),
-        .init("🫒", "Olive oil", 884, 0, 0, 100),
+        .init("Pork", "Pork tenderloin, roasted", 143, 26.2, 0, 3.5),
+        .init("Poultry", "Chicken breast, roasted", 165, 31, 0, 3.6),
+        .init("Beef", "Ground beef, 90% lean, raw", 176, 20, 0, 10),
+        .init("Fish & seafood", "Atlantic salmon, cooked", 206, 22.1, 0, 12.4),
+        .init("Dairy & eggs", "Egg, hard-boiled", 155, 12.6, 1.1, 10.6),
+        .init("Grains & pasta", "White rice, cooked", 130, 2.7, 28.2, 0.3),
+        .init("Grains & pasta", "Spaghetti, cooked", 158, 5.8, 30.9, 0.9),
+        .init("Grains & pasta", "Rolled oats, dry", 379, 13.2, 67.7, 6.5),
+        .init("Vegetables", "Potato, baked", 93, 2.5, 21.2, 0.1),
+        .init("Beans & legumes", "Black beans, cooked", 132, 8.9, 23.7, 0.5),
+        .init("Vegetables", "Broccoli, raw", 34, 2.8, 6.6, 0.4),
+        .init("Vegetables", "Carrot, raw", 41, 0.9, 9.6, 0.2),
+        .init("Vegetables", "Tomato, raw", 18, 0.9, 3.9, 0.2),
+        .init("Fruit", "Banana, peeled", 89, 1.1, 22.8, 0.3),
+        .init("Fruit", "Apple, with skin", 52, 0.3, 13.8, 0.2),
+        .init("Fruit", "Avocado, flesh", 160, 2, 8.5, 14.7),
+        .init("Dairy & eggs", "Whole milk", 61, 3.2, 4.8, 3.3),
+        .init("Dairy & eggs", "Cheddar cheese", 403, 24.9, 1.3, 33.1),
+        .init("Fats & oils", "Butter", 717, 0.9, 0.1, 81.1),
+        .init("Fats & oils", "Olive oil", 884, 0, 0, 100),
     ]
 }
 
@@ -96,7 +108,7 @@ struct IngredientPicker: View {
                     .textFieldStyle(.roundedBorder).accessibilityLabel("Search foods")
                 Menu(category ?? "All foods") {
                     Button("All foods") { category = nil }
-                    ForEach(CommonIngredient.icons.keys.sorted(), id: \.self) { group in
+                    ForEach(CommonIngredient.categories, id: \.self) { group in
                         Button(group) { category = group }
                     }
                 }
@@ -110,10 +122,20 @@ struct IngredientPicker: View {
                             selection = item
                             grams = ""
                         } label: {
-                            VStack {
-                                Text(item.icon).font(.largeTitle).accessibilityHidden(true)
+                            // The icon is drawn on the app's paper, so the
+                            // tile it is on stays paper: the one picked is
+                            // marked by its name and an ink frame.
+                            VStack(spacing: 4) {
+                                FoodIconView(food: item).frame(width: 72, height: 72)
                                 Text(item.name).font(.caption.bold()).multilineTextAlignment(.center)
-                            }.padding(6).frame(width: 112).background(selection?.id == item.id ? Poster.yellow : .clear)
+                                    .padding(.horizontal, 3)
+                                    .background(selection?.id == item.id ? Poster.yellow : .clear)
+                            }
+                            .padding(6).frame(width: 112)
+                            .overlay {
+                                if selection?.id == item.id { Rectangle().strokeBorder(Poster.ink, lineWidth: 2.5) }
+                            }
+                            .contentShape(Rectangle())
                         }.buttonStyle(.plain)
                     }
                 }

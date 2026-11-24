@@ -251,6 +251,85 @@ enum BuiltFixture {
         #expect(slip("Flat white", "120", "") == "Type the protein it comes to in grams, 0 to 1000")
     }
 
+    @Test func aFoodTypedAsItsMacrosComesToWhatTheyDo() throws {
+        // Ten grams of fat, and nothing else typed: 90 kcal, named for it.
+        let fat = try FoodTyping.macros(name: "", protein: "", carbs: " ", fat: "10").get()
+        #expect(fat.name == "10 g fat")
+        #expect(fat.quantity == .whole(kcal: 90, proteinG: 0))
+        #expect(fat.carbsG == 0)
+        #expect(fat.fatG == 10)
+        #expect(!fat.estimated)
+        // All three, with a name of its own: 4, 4 and 9 kcal a gram.
+        let shake = try FoodTyping.macros(name: " Shake ", protein: "30", carbs: "12,5", fat: "2").get()
+        #expect(shake.name == "Shake")
+        #expect(shake.kcal == 188)
+        #expect(shake.proteinG == 30)
+        #expect(shake.carbsG == 12.5)
+        #expect(Macros.name(proteinG: 30, carbsG: 12.5, fatG: 2) == "30 g protein + 12.5 g carbs + 2 g fat")
+
+        func slip(_ protein: String, _ carbs: String, _ fat: String, name: String = "") -> String? {
+            if case .failure(let slip) = FoodTyping.macros(name: name, protein: protein, carbs: carbs, fat: fat) {
+                return slip.message
+            }
+            return nil
+        }
+        #expect(slip("", "", "") == "Type the grams of protein, carbs or fat")
+        #expect(slip("0", "", "0") == "Type the grams of protein, carbs or fat")
+        #expect(slip("", "ten", "") == "Type the carbs in grams, 0 to 1000, or leave it blank")
+        #expect(slip("", "", "1200") == "Type the fat in grams, 0 to 1000, or leave it blank")
+        #expect(slip("1000", "1000", "1000") == "That comes to more than 10000 kcal")
+        #expect(slip("", "", "10", name: String(repeating: "x", count: 61)) == "That name is too long")
+    }
+
+    @Test func aFoodTypedAsItsMacrosGoesIntoTheMealAndComesBackToTheForm() throws {
+        var fields = TypedFields(way: .macros)
+        #expect(fields.macrosKcal == 0)
+        fields.fat = "10"
+        #expect(fields.macrosKcal == 90)
+        #expect(FoodText.macrosComeTo(fields.macrosKcal) == "= 90 kcal · 4 a gram of protein or carbs, 9 of fat")
+        fields.protein = "x"
+        #expect(fields.macrosKcal == nil)
+        #expect(FoodText.macrosComeTo(nil) == "= ? kcal · 4 a gram of protein or carbs, 9 of fat")
+        fields.protein = ""
+        let food = try fields.read().get()
+
+        // In the meal it counts as measured, with its fat on the macros line.
+        var draft = MealDraft(slot: .snack, purpose: .log)
+        draft.parts = [MealPart(.food(BuiltFixture.banana)), MealPart(.food(food))]
+        #expect(draft.total() == .init(kcal: 197, proteinG: 1.3, kcalEstimated: 0, unknown: 0))
+        let row = FoodText.partRow(draft.parts[1])
+        #expect(row.title == "10 g fat")
+        #expect(row.label == "MACROS · 0 G PROTEIN")
+        #expect(row.value == "90")
+        #expect(row.mark == .solid)
+
+        // Sent and kept as any food typed whole, with its carbs and fat.
+        let sent = try JSONSerialization.jsonObject(with: JSONEncoder.lyfe.encode(food)) as? [String: Any]
+        #expect(sent?["kcal"] as? Double == 90)
+        #expect(sent?["protein_g"] as? Double == 0)
+        #expect(sent?["fat_g"] as? Double == 10)
+        #expect(sent?["carbs_g"] as? Double == 0)
+
+        // Tapped, it is macros again: none of a thing blank, and the name
+        // lyfe gave it left to follow the figures.
+        var again = TypedFields(try JSONDecoder().decode(Ingredient.self, from: JSONEncoder().encode(food)))
+        #expect(again.way == .macros)
+        #expect([again.name, again.protein, again.carbs, again.fat] == ["", "", "", "10"])
+        again.fat = "15"
+        again.protein = "20"
+        let changed = try again.read().get()
+        #expect(changed.name == "20 g protein + 15 g fat")
+        #expect(changed.kcal == 215)
+
+        // A name of its own stays, and so does a food typed as totals.
+        var named = food
+        named.name = "Olive oil"
+        #expect(TypedFields(named).name == "Olive oil")
+        #expect(TypedFields(named).way == .macros)
+        #expect(TypedFields(BuiltFixture.coffee).way == .whole)
+        #expect(!Macros.made(BuiltFixture.banana))
+    }
+
     @Test func theMealBeingBuiltIsKeptOnThePhone() {
         let store = DraftStore(directory: Fixture.temporaryDirectory())
         #expect(store.load() == nil)

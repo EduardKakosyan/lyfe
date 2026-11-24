@@ -528,6 +528,13 @@ public enum FoodText {
         return "Carbs \(figure(carbs)) · Fat \(figure(fat))"
     }
 
+    /// Under the macros typed for a food: what they come to, worked out
+    /// at the fixed kcal in a gram of each.
+    static func macrosComeTo(_ kcal: Double?) -> String {
+        let figure = kcal.map { Self.kcal(Int($0.rounded())) } ?? "?"
+        return "= \(figure) kcal · 4 a gram of protein or carbs, 9 of fat"
+    }
+
     /// Whole grams: "43".
     static func grams(_ value: Double) -> String {
         String(Int(value.rounded()))
@@ -1010,6 +1017,8 @@ public enum FoodText {
             "LABEL · \(plain(weight)) G · \(grams(food.proteinG)) G PROTEIN"
         case .whole where food.estimated:
             "PHOTO ESTIMATE · \(grams(food.proteinG)) G PROTEIN"
+        case .whole where Macros.made(food):
+            "MACROS · \(grams(food.proteinG)) G PROTEIN"
         case .whole:
             "TYPED WHOLE · \(grams(food.proteinG)) G PROTEIN"
         }

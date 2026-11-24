@@ -83,6 +83,16 @@ public struct MealBuilderView: View {
         _typing = State(initialValue: typing || (draft.purpose == .recipe && draft.parts.isEmpty))
     }
 
+    /// The builder as the galleries show it: with the ingredient picker
+    /// open, or the typing form open on what is already typed.
+    init(
+        draft: MealDraft, browsing: Bool, typed: TypedFields? = nil, onChange: @escaping ((inout MealDraft) -> Void) -> Void
+    ) {
+        self.init(draft: draft, typing: typed != nil, onChange: onChange, onSave: { nil }, onClose: {})
+        _browsing = State(initialValue: browsing)
+        if let typed { _fields = State(initialValue: typed) }
+    }
+
     private var logs: Bool { draft.purpose == .log }
     private var total: MealDraft.Total { draft.total(estimates: estimates) }
 
@@ -463,7 +473,7 @@ public struct MealBuilderView: View {
                 return false
             }
             onChange { $0.parts.append(MealPart(.food(food))) }
-            fields = TypedFields(whole: fields.whole)
+            fields = TypedFields(way: fields.way)
             note = nil
             return true
         case .failure(let slip):
@@ -516,7 +526,7 @@ public struct MealBuilderView: View {
 
     private func deselect() {
         selected = nil
-        fields = TypedFields(whole: fields.whole)
+        fields = TypedFields(way: fields.way)
         note = nil
     }
 
@@ -719,7 +729,7 @@ public struct LoggedMealView: View {
     private func add() {
         switch fields.read() {
         case .success(let food):
-            fields = TypedFields(whole: fields.whole)
+            fields = TypedFields(way: fields.way)
             note = nil
             Task { await onType(food) }
         case .failure(let slip):
@@ -731,20 +741,40 @@ public struct LoggedMealView: View {
 // MARK: Parts
 
 /// What is typed for one food: weighed, with the label's figures per
-/// 100 g, or whole, just what it comes to.
+/// 100 g; whole, just what it comes to; or as its macros alone, with the
+/// calories worked out from them.
 struct TypedFields: Equatable {
-    /// Just the totals: a menu item, a coffee from a café.
-    var whole = false
+    var way = Way.weighed
     var name = ""
     var grams = ""
-    /// Per 100 g when weighed; what it comes to when whole.
+    /// Per 100 g when weighed; what it comes to when whole. Not typed for
+    /// macros.
     var kcal = ""
+    /// Per 100 g when weighed; grams otherwise.
     var protein = ""
     var carbs = ""
     var fat = ""
 
-    init(whole: Bool = false) {
-        self.whole = whole
+    /// The three ways to type a food.
+    enum Way: Equatable, CaseIterable {
+        /// Weighed, with the figures per 100 g from its label.
+        case weighed
+        /// Just the totals: a menu item, a coffee from a café.
+        case whole
+        /// Only the grams of protein, carbs and fat it has.
+        case macros
+
+        var title: String {
+            switch self {
+            case .weighed: "Weighed"
+            case .whole: "Just the totals"
+            case .macros: "Macros"
+            }
+        }
+    }
+
+    init(way: Way = .weighed) {
+        self.way = way
     }
 
     /// A food, back in the form to be changed.
@@ -758,8 +788,18 @@ struct TypedFields: Equatable {
             grams = FoodText.plain(weight)
             kcal = FoodText.plain(kcalPer100g)
             protein = FoodText.plain(proteinPer100g)
+        case .whole(_, let proteinG) where Macros.made(food):
+            way = .macros
+            // None of one is left blank, as it was typed.
+            protein = proteinG > 0 ? FoodText.plain(proteinG) : ""
+            if food.carbsG == 0 { carbs = "" }
+            if food.fatG == 0 { fat = "" }
+            // A name lyfe gave it follows the figures when they change.
+            if name == Macros.name(proteinG: proteinG, carbsG: food.carbsG ?? 0, fatG: food.fatG ?? 0) {
+                name = ""
+            }
         case .whole(let kcal, let proteinG):
-            whole = true
+            way = .whole
             self.kcal = FoodText.plain(kcal)
             protein = FoodText.plain(proteinG)
         }
@@ -771,17 +811,35 @@ struct TypedFields: Equatable {
         }
     }
 
+    /// What the macros typed so far come to, in kcal; nil while any of
+    /// them does not read as a figure.
+    var macrosKcal: Double? {
+        var grams: [Double] = []
+        for text in [protein, carbs, fat] {
+            if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                grams.append(0)
+            } else if let value = FoodTyping.number(text) {
+                grams.append(value)
+            } else {
+                return nil
+            }
+        }
+        return Macros.kcal(proteinG: grams[0], carbsG: grams[1], fatG: grams[2])
+    }
+
     /// The food typed, or the first thing wrong with it.
     func read() -> Result<Ingredient, FoodSlip> {
-        let result =
-            whole
-            ? FoodTyping.whole(name: name, kcal: kcal, protein: protein)
-            : FoodTyping.ingredient(name: name, grams: grams, kcal: kcal, protein: protein)
+        let result: Result<Ingredient, FoodSlip>
+        switch way {
+        case .weighed: result = FoodTyping.ingredient(name: name, grams: grams, kcal: kcal, protein: protein)
+        case .whole: result = FoodTyping.whole(name: name, kcal: kcal, protein: protein)
+        case .macros: return FoodTyping.macros(name: name, protein: protein, carbs: carbs, fat: fat)
+        }
         return result.flatMap { ingredient in
             var food = ingredient
             let scale = food.grams.map { $0 / 100 } ?? 1
             for (text, key) in [(carbs, \Ingredient.carbsG), (fat, \Ingredient.fatG)] where !text.isEmpty {
-                guard let value = FoodTyping.number(text), value <= (whole ? 1000 : 100) else {
+                guard let value = FoodTyping.number(text), value <= (way == .whole ? 1000 : 100) else {
                     return .failure(FoodSlip("Check the carbs and fat, or leave them blank"))
                 }
                 food[keyPath: key] = value * scale
@@ -791,8 +849,8 @@ struct TypedFields: Equatable {
     }
 }
 
-/// The typing form, in yellow: what it is, then either what it weighed and
-/// the two figures from its label, or just what it comes to.
+/// The typing form, in yellow: what it is, then what it weighed and the
+/// figures from its label, or just what it comes to, or only its macros.
 struct TypedFieldsView: View {
     @Binding var fields: TypedFields
     var title: String
@@ -809,39 +867,48 @@ struct TypedFieldsView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
+            Text(title).posterLabel().lineLimit(1).minimumScaleFactor(0.7)
             HStack(spacing: 6) {
-                Text(title).posterLabel().lineLimit(1).minimumScaleFactor(0.7)
-                Spacer(minLength: 4)
-                way("Weighed", whole: false)
-                way("Just the totals", whole: true)
+                ForEach(TypedFields.Way.allCases, id: \.self) { way($0) }
+                Spacer(minLength: 0)
             }
             // The return key leads on to the figures, which brings their
             // row up from behind the keyboard.
             LabeledField(
-                label: "What it is", text: $fields.name, prompt: fields.whole ? "FLAT WHITE" : "OATS",
-                onSubmit: { focus = .first }
+                label: fields.way == .macros ? "What it is · or leave it blank" : "What it is",
+                text: $fields.name, prompt: namePrompt, onSubmit: { focus = .first }
             )
             .focused($focus, equals: .name)
             HStack(alignment: .bottom, spacing: 6) {
-                if fields.whole {
-                    LabeledField(label: "kcal", text: $fields.kcal, prompt: "120", numeric: true)
-                        .focused($focus, equals: .first)
-                    LabeledField(label: "Protein · g", text: $fields.protein, prompt: "6", numeric: true)
-                } else {
+                switch fields.way {
+                case .weighed:
                     LabeledField(label: "Weighed · g", text: $fields.grams, prompt: "80", numeric: true)
                         .focused($focus, equals: .first)
                     LabeledField(label: "kcal per 100 g", text: $fields.kcal, prompt: "379", numeric: true)
                     LabeledField(
                         label: "Protein per 100 g", text: $fields.protein, prompt: "13.2", numeric: true)
+                case .whole:
+                    LabeledField(label: "kcal", text: $fields.kcal, prompt: "120", numeric: true)
+                        .focused($focus, equals: .first)
+                    LabeledField(label: "Protein · g", text: $fields.protein, prompt: "6", numeric: true)
+                case .macros:
+                    LabeledField(label: "Protein · g", text: $fields.protein, prompt: "0", numeric: true)
+                        .focused($focus, equals: .first)
+                    LabeledField(label: "Carbs · g", text: $fields.carbs, prompt: "0", numeric: true)
+                    LabeledField(label: "Fat · g", text: $fields.fat, prompt: "0", numeric: true)
                 }
             }
-            HStack(spacing: 6) {
-                LabeledField(
-                    label: fields.whole ? "Carbs · g" : "Carbs per 100 g", text: $fields.carbs,
-                    prompt: "Optional", numeric: true)
-                LabeledField(
-                    label: fields.whole ? "Fat · g" : "Fat per 100 g", text: $fields.fat, prompt: "Optional",
-                    numeric: true)
+            if fields.way == .macros {
+                Text(FoodText.macrosComeTo(fields.macrosKcal)).posterLabel()
+            } else {
+                HStack(spacing: 6) {
+                    LabeledField(
+                        label: fields.way == .whole ? "Carbs · g" : "Carbs per 100 g", text: $fields.carbs,
+                        prompt: "Optional", numeric: true)
+                    LabeledField(
+                        label: fields.way == .whole ? "Fat · g" : "Fat per 100 g", text: $fields.fat,
+                        prompt: "Optional", numeric: true)
+                }
             }
             HStack(spacing: 6) {
                 FormButton(title: primary, filled: true, wide: true, action: onPrimary)
@@ -856,20 +923,28 @@ struct TypedFieldsView: View {
         .background(Poster.yellow)
     }
 
-    /// One of the two ways to type a food.
-    private func way(_ name: String, whole: Bool) -> some View {
-        let chosen = fields.whole == whole
+    private var namePrompt: String {
+        switch fields.way {
+        case .weighed: "OATS"
+        case .whole: "FLAT WHITE"
+        case .macros: "OLIVE OIL"
+        }
+    }
+
+    /// One of the ways to type a food.
+    private func way(_ way: TypedFields.Way) -> some View {
+        let chosen = fields.way == way
         return Button {
             guard !chosen else { return }
             // The figures mean something else the other way round.
-            fields.whole = whole
+            fields.way = way
             fields.grams = ""
             fields.kcal = ""
             fields.protein = ""
             fields.carbs = ""
             fields.fat = ""
         } label: {
-            Text(name)
+            Text(way.title)
                 .font(.system(size: 10, weight: .heavy))
                 .tracking(0.6)
                 .textCase(.uppercase)

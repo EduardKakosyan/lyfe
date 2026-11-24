@@ -1,6 +1,6 @@
-"""Draws meal photos as Poster illustrations with FLUX.2 klein 4B, for lyfe-server.
+"""Draws meal photos as Poster illustrations, and food icons, with FLUX.2 klein 4B, for lyfe-server.
 
-lyfe-server starts this when a photo is waiting and the Spark has memory
+lyfe-server starts this when a picture is waiting and the Spark has memory
 free (backend/src/illustrator.rs); nothing else should. It loads the model
 once, then reads one request per line on standard input and answers each
 with one line on standard output, until standard input closes, when it
@@ -9,6 +9,7 @@ exits and gives its memory back.
   first line out:  {"ready": true, "seconds": 93.2}
                    or {"ready": false, "error": "..."}, then it exits
   each line in:    {"id": "<uuid>", "prompt": "...", "jpeg": "<base64>"}
+                   or, for a food's icon, the same without "jpeg"
   each line out:   {"id": "<uuid>", "png": "<base64>", "seconds": 7.1}
                    or {"id": "<uuid>", "error": "..."}
 
@@ -16,6 +17,9 @@ The photo is redrawn from the prompt, which keeps the food in its own
 colours (ADR 0006). The background the model leaves is then set to exactly
 the app's paper colour, so the drawing sits on the screen without a box
 around it, and it is sent back shrunk, as a PNG of at most 64 colours.
+A request with no photo is the icon of a food in the ingredient catalogue
+(ADR 0008): drawn from the prompt alone, at a quarter of the size, which
+takes about a second, and finished the same way, smaller still.
 Nothing is downloaded at run time (the wrapper sets HF_HUB_OFFLINE), and
 nothing about the meal is written anywhere but the answer.
 
@@ -42,6 +46,12 @@ STEPS = 4
 GUIDANCE = 1.0
 # The same seed every time, so the same photo is drawn the same way.
 SEED = 7
+
+# A food's icon is shown about a centimetre across, so it is drawn at a
+# quarter of the pixels, sent back at 256, and comes to about 10 kB.
+ICON_SIZE = 512
+ICON_SENT_SIZE = 256
+ICON_COLOURS = 48
 
 # The app's paper, as in apps/LyfeKit/Sources/LyfeKit/Poster/Poster.swift.
 PAPER = (0xF3, 0xEF, 0xE6)
@@ -83,16 +93,25 @@ def on_paper(image):
     return Image.fromarray(out)
 
 
-def finished(image):
+def icon_seed(prompt):
+    """The seed an icon is drawn from: its own, so that foods do not all come
+    out in one pose, and the same each time, so that a food drawn again is
+    the same icon."""
+    import hashlib
+
+    return int(hashlib.sha256(prompt.encode()).hexdigest()[:8], 16)
+
+
+def finished(image, size=SENT_SIZE, colours=SENT_COLOURS):
     """The drawing as it is sent: on paper, shrunk, and in few colours, with
     the paper still exactly the paper."""
     from PIL import Image
 
-    image = on_paper(image).resize((SENT_SIZE, SENT_SIZE), Image.LANCZOS)
-    few = image.quantize(colors=SENT_COLOURS, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE)
+    image = on_paper(image).resize((size, size), Image.LANCZOS)
+    few = image.quantize(colors=colours, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE)
     # Cutting the colours down moves each a little; the one the paper
     # became is put back.
-    corners = [(0, 0), (SENT_SIZE - 1, 0), (0, SENT_SIZE - 1), (SENT_SIZE - 1, SENT_SIZE - 1)]
+    corners = [(0, 0), (size - 1, 0), (0, size - 1), (size - 1, size - 1)]
     palette = few.getpalette()
     for corner in corners:
         if image.getpixel(corner) == PAPER:
@@ -130,6 +149,13 @@ def self_test():
     assert sent.convert("RGB").getpixel((SENT_SIZE // 2, SENT_SIZE // 4)) == blue
     data = png_bytes(sent)
     assert data.startswith(b"\x89PNG\r\n\x1a\n")
+
+    # An icon is finished the same way, smaller, from a smaller drawing.
+    icon = finished(drawn.resize((ICON_SIZE, ICON_SIZE)), ICON_SENT_SIZE, ICON_COLOURS)
+    assert icon.size == (ICON_SENT_SIZE, ICON_SENT_SIZE) and icon.mode == "P"
+    assert icon.convert("RGB").getpixel((0, 0)) == PAPER
+    assert icon.convert("RGB").getpixel((ICON_SENT_SIZE // 2, ICON_SENT_SIZE // 4)) == blue
+    assert icon_seed("Potato, baked") == icon_seed("Potato, baked") != icon_seed("Potato, boiled")
     print("finishing a drawing works: on paper, shrunk, in few colours")
     return 0
 
@@ -175,19 +201,32 @@ def main():
         request = {}
         try:
             request = json.loads(line)
-            photo = Image.open(io.BytesIO(base64.b64decode(request["jpeg"])))
-            photo = ImageOps.fit(ImageOps.exif_transpose(photo).convert("RGB"), (SIZE, SIZE))
-            with torch.inference_mode():
-                drawn = pipe(
-                    prompt=request["prompt"],
-                    image=photo,
-                    height=SIZE,
-                    width=SIZE,
-                    guidance_scale=GUIDANCE,
-                    num_inference_steps=STEPS,
-                    generator=torch.Generator(device="cuda").manual_seed(SEED),
-                ).images[0]
-            png = png_bytes(finished(drawn))
+            if request.get("jpeg"):
+                photo = Image.open(io.BytesIO(base64.b64decode(request["jpeg"])))
+                photo = ImageOps.fit(ImageOps.exif_transpose(photo).convert("RGB"), (SIZE, SIZE))
+                with torch.inference_mode():
+                    drawn = pipe(
+                        prompt=request["prompt"],
+                        image=photo,
+                        height=SIZE,
+                        width=SIZE,
+                        guidance_scale=GUIDANCE,
+                        num_inference_steps=STEPS,
+                        generator=torch.Generator(device="cuda").manual_seed(SEED),
+                    ).images[0]
+                png = png_bytes(finished(drawn))
+            else:
+                # A food's icon: no photo, only what the prompt names.
+                with torch.inference_mode():
+                    drawn = pipe(
+                        prompt=request["prompt"],
+                        height=ICON_SIZE,
+                        width=ICON_SIZE,
+                        guidance_scale=GUIDANCE,
+                        num_inference_steps=STEPS,
+                        generator=torch.Generator(device="cuda").manual_seed(icon_seed(request["prompt"])),
+                    ).images[0]
+                png = png_bytes(finished(drawn, ICON_SENT_SIZE, ICON_COLOURS))
             say({"id": request["id"], "png": base64.b64encode(png).decode(), "seconds": round(time.monotonic() - began, 1)})
         except Exception as error:
             say({"id": request.get("id"), "error": f"{type(error).__name__}: {error}"[:300]})

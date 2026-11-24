@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::{DefaultBodyLimit, FromRequestParts, Path, State};
+use axum::extract::{DefaultBodyLimit, FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -24,6 +24,7 @@ use crate::garmin::sync::{Syncer, SOURCE as GARMIN};
 use crate::money::sync::Importer;
 use crate::routines::breath::{self, BreathRules};
 use crate::routines::food::{self, FoodDay, Slot};
+use crate::routines::illustration;
 use crate::routines::photo::{self, Oil};
 use crate::routines::product::{self, Product};
 use crate::routines::gym::{self, GymRules, GymSession, GymStreak, Week};
@@ -58,6 +59,9 @@ pub struct AppState {
     /// Wakes the illustrator when a photo can be drawn: it arrives, or the
     /// built meal it is a part of does.
     pub illustrator_wake: Arc<tokio::sync::Notify>,
+    /// Whether this server draws the icons of the foods in the ingredient
+    /// catalogue: it does while the illustrator is on.
+    pub food_icons: bool,
     /// Imports accounts and transactions from the bridge.
     pub money: Arc<Importer>,
     /// The currency money is totalled in, when set; otherwise the one most
@@ -89,6 +93,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/food/entries/{id}/estimate", put(correct_estimate))
         .route("/v1/food/entries/{id}/photo", get(food_photo))
         .route("/v1/food/entries/{id}/illustration", get(food_illustration))
+        .route("/v1/food/icons", get(food_icon))
         .route("/v1/food/products/{code}", get(find_product).put(set_product))
         .route("/v1/food/meals/{id}", put(save_meal).delete(remove_meal))
         .route("/v1/food/targets", put(set_food_targets))
@@ -410,6 +415,7 @@ async fn food_day(state: &AppState, now: DateTime<Utc>, today: NaiveDate) -> Res
     );
     day.drafts = food::draft_views(&db::draft_parts(&state.pool, state.timezone).await?, state.estimate_range_pct);
     day.products = db::recent_products(&state.pool, RECENT_PRODUCTS).await?;
+    day.icon_look = state.food_icons.then_some(illustration::ICON_LOOK);
     Ok(day)
 }
 
@@ -990,6 +996,35 @@ async fn food_photo(State(state): State<AppState>, _device: Device, Path(id): Pa
 async fn food_illustration(State(state): State<AppState>, _device: Device, Path(id): Path<Uuid>) -> Result<Response, ApiError> {
     let png = db::food_illustration(&state.pool, id).await?.ok_or(ApiError::NotFound)?;
     Ok(([(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, "private, no-cache")], png).into_response())
+}
+
+#[derive(Deserialize)]
+struct IconQuery {
+    /// The food's name, as the ingredient catalogue has it.
+    name: String,
+}
+
+/// The icon of a food in the ingredient catalogue: a small drawing of it,
+/// made on the Spark from its name. Asking is what gets it drawn: the
+/// first time, and until it is, the answer is 202 and the app shows the
+/// drawing it has for the food's category. The app may keep an icon for
+/// as long as the day's `icon_look` stays what it was. Not found when this
+/// server draws none, or the model could not draw this one.
+async fn food_icon(State(state): State<AppState>, _device: Device, Query(query): Query<IconQuery>) -> Result<Response, ApiError> {
+    let key = illustration::icon_key(&query.name).ok_or(ApiError::BadRequest("a food's name is 1 to 80 characters"))?;
+    if !state.food_icons {
+        return Err(ApiError::NotFound);
+    }
+    match db::ask_food_icon(&state.pool, &key, &query.name).await? {
+        db::IconAsked::Drawn(png) => {
+            Ok(([(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, "private, no-cache")], png).into_response())
+        }
+        db::IconAsked::Waiting => {
+            state.illustrator_wake.notify_one();
+            Ok((StatusCode::ACCEPTED, Json(json!({ "state": "waiting" }))).into_response())
+        }
+        db::IconAsked::GivenUp => Err(ApiError::NotFound),
+    }
 }
 
 /// The label lyfe has for a barcode: the one the owner typed, else the

@@ -18,13 +18,14 @@
     /// `photo`, `estimate`, `estimating`, `failed`, `scan`, `product`,
     /// `notfound` or `label`; with the photos drawn as illustrations,
     /// `drawn` (an estimate), `drawnday` (the day) or `drawnmeal` (a built
-    /// meal after logging).
+    /// meal after logging); `picker` (the ingredient catalogue, each food
+    /// by its icon) or `macros` (a food typed as its macros alone).
     struct CaptureGallery: View {
         var screen: String
 
         static let screens: Set<String> = [
             "mixed", "builder", "building", "logged", "photo", "estimate", "estimating", "failed", "scan", "product",
-            "notfound", "label", "drawn", "drawnday", "drawnmeal",
+            "notfound", "label", "drawn", "drawnday", "drawnmeal", "picker", "macros",
         ]
 
         static let bar = Product(
@@ -37,6 +38,10 @@
                     Builder(draft: Self.draft(), estimates: [Self.eggsID: Self.eggs(figures: .known)])
                 case "building":
                     Builder(draft: Self.draft(), estimates: [Self.eggsID: Self.eggs(figures: .estimating)])
+                case "picker":
+                    Builder(draft: MealDraft(slot: .lunch, purpose: .log), estimates: [:], browsing: true)
+                case "macros":
+                    Builder(draft: Self.snack(), estimates: [:], typed: Self.tenOfFat())
                 case "logged":
                     LoggedMealView(meal: Self.builtBreakfast(), onTakeBack: { _ in nil }, onClose: {})
                 case "photo":
@@ -84,6 +89,13 @@
                 }
             }
             .environment(\.mealIllustration, IllustrationSource { _ in Self.pictogram() })
+            // Every food by the same made-up icon, the staples at once and
+            // the rest as if the Spark had just drawn them.
+            .environment(
+                \.foodIcons,
+                FoodIconSource(
+                    kept: { name in CommonIngredient.staples.contains { $0.name == name } ? Self.pictogram() : nil },
+                    ask: { _ in Self.pictogram().map(FoodIconAnswer.drawn) ?? .none }))
             .preferredColorScheme(.light)
         }
 
@@ -99,11 +111,31 @@
         private struct Builder: View {
             @State var draft: MealDraft
             var estimates: [UUID: FoodDay.Entry]
+            var browsing = false
+            var typed: TypedFields?
 
             var body: some View {
-                MealBuilderView(
-                    draft: draft, estimates: estimates, onChange: { $0(&draft) }, onSave: { nil }, onClose: {})
+                if browsing || typed != nil {
+                    MealBuilderView(draft: draft, browsing: browsing, typed: typed, onChange: { $0(&draft) })
+                } else {
+                    MealBuilderView(
+                        draft: draft, estimates: estimates, onChange: { $0(&draft) }, onSave: { nil }, onClose: {})
+                }
             }
+        }
+
+        /// A snack with a banana in it, to add the fat to.
+        static func snack() -> MealDraft {
+            var draft = MealDraft(slot: .snack, purpose: .log)
+            draft.parts = [MealPart(.food(Ingredient(name: "Banana", grams: 120, kcalPer100g: 89, proteinPer100g: 1.1)))]
+            return draft
+        }
+
+        /// The typing form with ten grams of fat typed as macros.
+        static func tenOfFat() -> TypedFields {
+            var fields = TypedFields(way: .macros)
+            fields.fat = "10"
+            return fields
         }
 
         static let eggsID = UUID(uuidString: "00000000-0000-4000-9000-000000000034")!

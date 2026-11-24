@@ -27,7 +27,7 @@ A meal the owner eats repeatedly, defined once from its ingredients with the num
 _Avoid_: Recipe (for the saved meal itself), favourite, template
 
 **Part**:
-One thing in a meal that is built rather than tapped: a packet scanned by its barcode with the grams eaten, a food typed by hand, or a photo and one line. A meal is what its parts add up to, and each part is measured or estimated by itself.
+One thing in a meal that is built rather than tapped: a packet scanned by its barcode with the grams eaten, a food typed by hand or picked from the catalogue, or a photo and one line. A meal is what its parts add up to, and each part is measured or estimated by itself.
 _Avoid_: Item (that is a food a model saw in a photo), component, ingredient (that is what goes into a saved meal)
 
 **Food log**:
@@ -45,6 +45,18 @@ _Avoid_: Guess (in the app), approximation
 **Illustration**:
 A meal photo redrawn on the Spark as the meal it shows: the food in its own colours, black ink outlines, and its dish in a Poster colour, shown in the photo's place once it is ready. It only ever adds to a meal: the meal counts without it, and the photo stays if it never comes.
 _Avoid_: Filter, AI image, thumbnail, pictogram (that was the first look, which lost the meal)
+
+**Macros**:
+The grams of protein, carbs and fat in a food. A food can be typed as its macros alone, and what it comes to is then worked out at 4 kcal a gram of protein or carbs and 9 a gram of fat, the figures labels are worked out with. It is measured, not estimated.
+_Avoid_: Macro calories (as something typed), nutrients
+
+**Catalogue**:
+The foods lyfe comes with, each with its figures per 100 g: twenty staples and the generic foods of the USDA database, browsed by category and searched by name. A food picked from it is weighed, so it is measured.
+_Avoid_: Food database (that is the downloaded one barcodes are looked up in), library
+
+**Icon**:
+A small drawing of one food in the catalogue, drawn on the Spark from the food's name alone the first time it is looked at, and kept. Until a food's own icon has been drawn it is shown by its category's.
+_Avoid_: Emoji, stock image, thumbnail, illustration (that is a meal photo redrawn)
 
 **Label**:
 The calories and protein per 100 g printed on packaged food, found by its barcode in the downloaded food database or typed once by the owner. A meal logged from a label is measured.

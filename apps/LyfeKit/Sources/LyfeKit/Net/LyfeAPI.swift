@@ -278,6 +278,23 @@ public struct LyfeAPI: Sendable {
             "PUT", "v1/food/entries/\(id.uuidString.lowercased())/estimate", token: token, body: body, timeout: 15)
     }
 
+    /// The icon of a food in the ingredient catalogue (a PNG), by the
+    /// food's name. Asking is what gets it drawn: until the Spark has, the
+    /// answer is that it is waiting. None when the backend draws no icons,
+    /// or the model could not draw this one.
+    public func foodIcon(token: String, _ icon: FoodIcon) async throws -> FoodIconAnswer {
+        do {
+            // The look is not read by the backend: as with a meal's
+            // illustration, it makes an icon drawn again a new address.
+            let answer = try await answer(
+                "GET", "v1/food/icons", token: token, body: nil, timeout: 20,
+                query: [URLQueryItem(name: "name", value: icon.name), URLQueryItem(name: "v", value: String(icon.look))])
+            return answer.status == 200 ? .drawn(answer.body) : .waiting
+        } catch LyfeAPIError.server(status: 404) {
+            return .none
+        }
+    }
+
     /// The photo of a logged meal, as it was sent.
     public func foodPhoto(token: String, id: UUID) async throws -> Data {
         try await perform("GET", "v1/food/entries/\(id.uuidString.lowercased())/photo", token: token, body: nil, timeout: 20)
@@ -458,6 +475,14 @@ public struct LyfeAPI: Sendable {
         _ method: String, _ path: String, token: String?, body: Data?, timeout: TimeInterval,
         query: [URLQueryItem] = []
     ) async throws -> Data {
+        try await answer(method, path, token: token, body: body, timeout: timeout, query: query).body
+    }
+
+    /// What the backend answered, with which of the 2xx statuses it was.
+    private func answer(
+        _ method: String, _ path: String, token: String?, body: Data?, timeout: TimeInterval,
+        query: [URLQueryItem] = []
+    ) async throws -> (body: Data, status: Int) {
         let address = baseURL.appending(path: path)
         var request = URLRequest(url: query.isEmpty ? address : address.appending(queryItems: query))
         request.httpMethod = method
@@ -489,7 +514,7 @@ public struct LyfeAPI: Sendable {
         }
 
         if (200..<300).contains(response.statusCode) {
-            return data
+            return (data, response.statusCode)
         }
         struct Failure: Decodable {
             var error: String?

@@ -143,6 +143,7 @@ public final class AppModel {
         if receipt?.id == id { receipt = nil }
     }
     private let illustrations: IllustrationStore
+    private let foodIcons: FoodIconStore
     private var isSendingFood = false
     private let ownerCheck: any OwnerCheck
     private let makeCues: @MainActor () -> any BreathCues
@@ -161,6 +162,7 @@ public final class AppModel {
         captures: CaptureStore? = nil,
         drafts: DraftStore? = nil,
         illustrations: IllustrationStore? = nil,
+        foodIcons: FoodIconStore? = nil,
         transport: any HTTPTransport,
         deviceName: String,
         defaultServerAddress: String = "",
@@ -185,6 +187,9 @@ public final class AppModel {
             illustrations
             ?? IllustrationStore(
                 directory: FileManager.default.temporaryDirectory.appending(path: "lyfe-\(UUID().uuidString)"))
+        self.foodIcons =
+            foodIcons
+            ?? FoodIconStore(directory: FileManager.default.temporaryDirectory.appending(path: "lyfe-\(UUID().uuidString)"))
         self.ownerCheck = ownerCheck
         makeCues = cues
         self.transport = transport
@@ -240,6 +245,7 @@ public final class AppModel {
             captures: .standard(),
             drafts: .standard(),
             illustrations: .standard(),
+            foodIcons: .standard(),
             transport: TailnetTransport.live(),
             deviceName: deviceName,
             defaultServerAddress: defaultServerAddress,
@@ -1368,6 +1374,30 @@ public final class AppModel {
         guard let png = try? await api.foodIllustration(token: token, illustration) else { return nil }
         illustrations.keep(png, for: illustration)
         return png
+    }
+
+    /// A food's icon as this phone has it, asking nobody: in the look the
+    /// backend draws now, else in whichever look it was kept, which is
+    /// shown rather than nothing until the new one comes.
+    public func keptFoodIcon(named name: String) -> Data? {
+        if let look = home?.food?.iconLook, let kept = foodIcons.picture(FoodIcon(name: name, look: look)) {
+            return kept
+        }
+        return foodIcons.anyPicture(named: name)
+    }
+
+    /// Asks the backend for a food's icon, and keeps it here once it is
+    /// drawn. Asking is what has the Spark draw it, so while the answer is
+    /// `waiting` it is worth asking again. None while the backend draws no
+    /// icons or cannot be reached.
+    public func askForFoodIcon(named name: String) async -> FoodIconAnswer {
+        guard let look = home?.food?.iconLook else { return .none }
+        let icon = FoodIcon(name: name, look: look)
+        if let kept = foodIcons.picture(icon) { return .drawn(kept) }
+        guard phase == .signedIn, let api, let token else { return .none }
+        guard let answer = try? await api.foodIcon(token: token, icon) else { return .none }
+        if case .drawn(let png) = answer { foodIcons.keep(png, for: icon) }
+        return answer
     }
 
     /// Makes a change to food that needs the backend now, and shows the

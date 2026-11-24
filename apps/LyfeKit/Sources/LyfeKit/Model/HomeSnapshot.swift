@@ -422,6 +422,10 @@ public struct FoodDay: Codable, Equatable, Sendable {
     /// The saved meals, by slot, the one logged most recently first.
     public var meals: [SavedMeal]
     public var streak: DayStreak
+    /// The look the backend draws the icons of the catalogue's foods in
+    /// now; an icon kept from an earlier one is fetched again. Nil when the
+    /// backend draws none, and in answers cached before it drew any.
+    public var iconLook: Int?
 
     public struct Target: Codable, Equatable, Sendable {
         /// The day it took effect.

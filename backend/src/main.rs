@@ -103,6 +103,18 @@ enum Command {
         #[arg(long, default_value = "illustration.png")]
         out: std::path::PathBuf,
     },
+    /// Draw the icon of one food with the image model, from its name alone,
+    /// and write it out. Stores nothing; use it to see what an icon looks
+    /// like.
+    IconCheck {
+        #[command(flatten)]
+        illustration: IllustrationConfig,
+        /// The food's name, as the ingredient catalogue has it.
+        name: String,
+        /// Where to write the icon (a PNG).
+        #[arg(long, default_value = "icon.png")]
+        out: std::path::PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -126,8 +138,9 @@ async fn main() -> anyhow::Result<()> {
         Command::ImportFoodDb { database } => import_food_db(database).await,
         Command::PhotoCheck { photo, jpeg, note } => photo_check(photo, jpeg, note).await,
         Command::IllustrationCheck { illustration, jpeg, note, out } => {
-            illustration_check(illustration, jpeg, note, out).await
+            illustration_check(illustration, Some(jpeg), note, out).await
         }
+        Command::IconCheck { illustration, name, out } => illustration_check(illustration, None, name, out).await,
     }
 }
 
@@ -270,14 +283,16 @@ async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         Some(program) if std::path::Path::new(&program[0]).exists() => tracing::info!(
             program = %program[0],
             min_free_gb = illustrator.settings().min_free_gb,
-            "meal photos are illustrated on this machine"
+            "meal photos are illustrated, and food icons drawn, on this machine"
         ),
         Some(program) => tracing::warn!(
             program = %program[0],
-            "the illustrator is not installed (see lyfe-illustrator-setup); meals keep their photos until it is"
+            "the illustrator is not installed (see lyfe-illustrator-setup); meals keep their photos, and foods \
+             their category's icon, until it is"
         ),
-        None => tracing::warn!("LYFE_ILLUSTRATOR is off; meals keep their photos"),
+        None => tracing::warn!("LYFE_ILLUSTRATOR is off; meals keep their photos, and foods their category's icon"),
     }
+    let food_icons = illustrator.settings().program.is_some();
     if illustrator.settings().program.is_some() {
         let redrawn = db::redraw_older_looks(&pool).await?;
         if redrawn > 0 {
@@ -298,6 +313,7 @@ async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         estimate_range_pct: config.photo.photo_range_percent,
         estimator_wake,
         illustrator_wake,
+        food_icons,
         money: importer,
         money_currency: config.money.money_currency.clone(),
         now: Arc::new(Utc::now),
@@ -634,9 +650,11 @@ async fn photo_check(config: PhotoConfig, jpeg: Option<std::path::PathBuf>, note
     Ok(())
 }
 
+/// Draws one picture and writes it out: a meal photo with its line, or,
+/// with no photo, the icon of the food the line names.
 async fn illustration_check(
     config: IllustrationConfig,
-    jpeg: std::path::PathBuf,
+    jpeg: Option<std::path::PathBuf>,
     note: String,
     out: std::path::PathBuf,
 ) -> anyhow::Result<()> {
@@ -644,10 +662,19 @@ async fn illustration_check(
     if settings.program.is_none() {
         bail!("LYFE_ILLUSTRATOR is off");
     }
-    let jpeg = std::fs::read(&jpeg).context("could not read the photo")?;
-    if !photo::is_jpeg(&jpeg) {
-        bail!("the photo must be a JPEG");
-    }
+    let jpeg = match jpeg {
+        Some(path) => {
+            let jpeg = std::fs::read(&path).context("could not read the photo")?;
+            if !photo::is_jpeg(&jpeg) {
+                bail!("the photo must be a JPEG");
+            }
+            Some(jpeg)
+        }
+        None if lyfe_server::routines::illustration::icon_key(&note).is_none() => {
+            bail!("a food's name is 1 to 80 characters")
+        }
+        None => None,
+    };
     if let Some(free_gb) = lyfe_server::estimator::free_memory_gb(&settings.meminfo)
         && free_gb < f64::from(settings.min_free_gb)
     {
@@ -656,7 +683,11 @@ async fn illustration_check(
     // No database: nothing is stored.
     let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://unused")?;
     let illustrator = Illustrator::new(pool, settings, Arc::new(tokio::sync::Notify::new()));
-    let (png, loading, drawing) = illustrator.check(&note, jpeg).await.map_err(anyhow::Error::msg)?;
+    let drawn = match jpeg {
+        Some(jpeg) => illustrator.check(&note, jpeg).await,
+        None => illustrator.check_icon(&note).await,
+    };
+    let (png, loading, drawing) = drawn.map_err(anyhow::Error::msg)?;
     std::fs::write(&out, &png).with_context(|| format!("could not write {}", out.display()))?;
     println!(
         "Loaded in {:.1} s, drew in {:.1} s. Wrote {} ({} kB).",

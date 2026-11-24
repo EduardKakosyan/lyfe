@@ -2,7 +2,8 @@
 # A stand-in for the Spark's illustrator (deploy/spark/lyfe-illustrate.py),
 # for the tests and for running the backend on this Mac: nothing is loaded,
 # and every photo is answered with the same plate drawn in the five Poster
-# colours. It speaks the same lines of JSON.
+# colours. A request with no photo is a food's icon, and is answered with
+# the same plate, smaller. It speaks the same lines of JSON.
 #
 #   LYFE_ILLUSTRATOR=$PWD/backend/tests/illustrator_stand_in.py cargo run -- serve
 #
@@ -62,18 +63,19 @@ def main(arguments):
     say({"ready": True, "seconds": 0.0})
     drawn = open(arguments[arguments.index("--picture") + 1], "rb").read() if "--picture" in arguments else plate()
     picture = base64.b64encode(drawn).decode()
+    icon = picture if "--picture" in arguments else base64.b64encode(plate(96)).decode()
     for line in sys.stdin:
         request = json.loads(line)
         if log:
             with open(log, "a") as file:
-                file.write(json.dumps({"id": request["id"], "prompt": request["prompt"], "jpeg": request["jpeg"]}) + "\n")
-        sys.stderr.write("illustrator stand-in: drawing one photo\n")
+                file.write(json.dumps({"id": request["id"], "prompt": request["prompt"], "jpeg": request.get("jpeg")}) + "\n")
+        sys.stderr.write("illustrator stand-in: drawing one %s\n" % ("photo" if "jpeg" in request else "icon"))
         if "--exit-on-draw" in arguments:
             return 1
         if "--cannot-draw" in arguments:
             say({"id": request["id"], "error": "cannot identify image file (stand-in)"})
             continue
-        say({"id": request["id"], "png": picture, "seconds": 0.0})
+        say({"id": request["id"], "png": picture if "jpeg" in request else icon, "seconds": 0.0})
     return 0
 
 

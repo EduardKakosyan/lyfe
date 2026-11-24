@@ -90,6 +90,7 @@ async fn harness_at(pool: PgPool, now: &str, with_key: bool) -> Harness {
         estimate_range_pct: 35,
         estimator_wake: Arc::new(tokio::sync::Notify::new()),
         illustrator_wake: Arc::new(tokio::sync::Notify::new()),
+        food_icons: true,
         money: Arc::new(lyfe_server::money::sync::Importer::new(pool.clone(), None, chrono_tz::America::Puerto_Rico, 180, 14)),
         money_currency: None,
         now: Arc::new(move || now),
@@ -2872,7 +2873,18 @@ impl Drawer {
 impl Harness {
     /// The illustration of meal number `entry`: its status and the bytes.
     async fn illustration(&self, token: Option<&str>, entry: u32) -> (StatusCode, Option<String>, Vec<u8>) {
-        let mut request = Request::get(format!("/v1/food/entries/{}/illustration", food_id(entry)));
+        self.picture(token, &format!("/v1/food/entries/{}/illustration", food_id(entry))).await
+    }
+
+    /// The icon of the food called `name`, percent-encoded as the app sends
+    /// it: its status and the bytes.
+    async fn icon(&self, token: Option<&str>, name: &str) -> (StatusCode, Option<String>, Vec<u8>) {
+        self.picture(token, &format!("/v1/food/icons?name={name}")).await
+    }
+
+    /// A picture the API serves: its status, kind and bytes.
+    async fn picture(&self, token: Option<&str>, uri: &str) -> (StatusCode, Option<String>, Vec<u8>) {
+        let mut request = Request::get(uri);
         if let Some(token) = token {
             request = request.header("Authorization", format!("Bearer {token}"));
         }
@@ -3141,6 +3153,169 @@ async fn a_photo_drawn_in_an_older_look_is_drawn_again(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(look, lyfe_server::routines::illustration::LOOK);
+}
+
+// --- Food icons -----------------------------------------------------------
+
+/// Brings every icon's next try forward to now.
+async fn icons_due(pool: &PgPool) {
+    sqlx::query("update food_icons set due_at = now() where due_at is not null").execute(pool).await.unwrap();
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_foods_icon_is_drawn_from_its_name_the_first_time_it_is_asked_for(pool: PgPool) {
+    use lyfe_server::illustrator::Outcome;
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    let drawer = Drawer::start(&h, 72, &[]).await;
+
+    // The day says which look icons are in, so the phone knows what to keep.
+    let (_, home) = h.get("/v1/home", Some(&token)).await;
+    assert_eq!(home["food"]["icon_look"], lyfe_server::routines::illustration::ICON_LOOK);
+
+    // Nothing is drawn until the phone asks. Asking queues it, wakes the
+    // illustrator and says to come back.
+    assert_eq!(drawer.draw().await, Outcome::Idle);
+    assert_eq!(h.icon(None, "Potato,%20baked").await.0, StatusCode::UNAUTHORIZED);
+    let woken = || tokio::time::timeout(std::time::Duration::from_millis(50), h.state.illustrator_wake.notified());
+    assert!(woken().await.is_err());
+    let (status, kind, body) = h.icon(Some(&token), "Potato,%20baked").await;
+    assert_eq!((status, kind.as_deref()), (StatusCode::ACCEPTED, Some("application/json")));
+    assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), json!({ "state": "waiting" }));
+    assert!(woken().await.is_ok());
+    // Asked again, however it is spelled, it is still the one icon.
+    assert_eq!(h.icon(Some(&token), "%20potato,%20%20BAKED").await.0, StatusCode::ACCEPTED);
+    let queued: i64 = sqlx::query_scalar("select count(*) from food_icons").fetch_one(&h.state.pool).await.unwrap();
+    assert_eq!(queued, 1);
+
+    // Drawn from the name alone: there is no photo to send.
+    assert_eq!(drawer.draw().await, Outcome::Drew(1));
+    assert_eq!(drawer.draw().await, Outcome::Idle);
+    let asked = drawer.asked();
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0]["jpeg"], Value::Null);
+    let prompt = asked[0]["prompt"].as_str().unwrap();
+    assert_eq!(prompt, lyfe_server::routines::illustration::icon_prompt("Potato, baked"));
+    assert!(prompt.starts_with("Flat vector illustration of a serving of Potato, baked,"), "{prompt}");
+
+    // From then on it is there, and drawn once.
+    let (status, kind, png) = h.icon(Some(&token), "Potato,%20baked").await;
+    assert_eq!((status, kind.as_deref()), (StatusCode::OK, Some("image/png")));
+    assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert_eq!(drawer.draw().await, Outcome::Idle);
+    assert_eq!(drawer.asked().len(), 1);
+
+    // A name no food has is refused, and queues nothing.
+    assert_eq!(h.icon(Some(&token), "%20").await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(h.icon(Some(&token), &"x".repeat(81)).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(h.get("/v1/food/icons", Some(&token)).await.0, StatusCode::BAD_REQUEST);
+    let queued: i64 = sqlx::query_scalar("select count(*) from food_icons").fetch_one(&h.state.pool).await.unwrap();
+    assert_eq!(queued, 1);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn meal_photos_are_drawn_before_icons_and_the_icon_asked_for_latest_first(pool: PgPool) {
+    use lyfe_server::illustrator::Outcome;
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    let model = Model::start(&h, 72).await;
+    model.answers(STIR_FRY).await;
+
+    h.icon(Some(&token), "Carrot,%20raw").await;
+    h.icon(Some(&token), "Tomato,%20raw").await;
+    h.log_photo(&token, 21, "2026-11-17T16:00:00Z", "lunch", "pho").await;
+    model.estimate().await;
+    // Scrolled back to: the carrot is the one being looked at now.
+    sqlx::query("update food_icons set asked_at = asked_at - interval '1 minute'").execute(&h.state.pool).await.unwrap();
+    h.icon(Some(&token), "Carrot,%20raw").await;
+
+    // One load of the model draws all three.
+    let drawer = Drawer::start(&h, 72, &[]).await;
+    assert_eq!(drawer.draw().await, Outcome::Drew(3));
+    let asked = drawer.asked();
+    let order: Vec<&str> = asked.iter().map(|one| one["prompt"].as_str().unwrap().split(',').next().unwrap()).collect();
+    assert_eq!(order, ["Redraw this photo of pho as a bold flat graphic illustration with thick black ink outlines and flat colour fills", "Flat vector illustration of a serving of Carrot", "Flat vector illustration of a serving of Tomato"]);
+    assert!(asked[0]["jpeg"].is_string());
+    assert_eq!((&asked[1]["jpeg"], &asked[2]["jpeg"]), (&Value::Null, &Value::Null));
+    assert_eq!(h.illustration(Some(&token), 21).await.0, StatusCode::OK);
+    assert_eq!(h.icon(Some(&token), "Tomato,%20raw").await.0, StatusCode::OK);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn an_icon_waits_for_the_spark_and_one_that_will_not_draw_is_given_up_on(pool: PgPool) {
+    use lyfe_server::illustrator::Outcome;
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    h.icon(Some(&token), "Almonds").await;
+
+    // A busy Spark is not the icon's fault: it waits, and is drawn later.
+    let busy = Drawer::start(&h, 12, &[]).await;
+    for _ in 0..5 {
+        icons_due(&h.state.pool).await;
+        let Outcome::PutOff(why) = busy.draw().await else { panic!("not put off") };
+        assert_eq!(why, "The Spark is busy: 12 GB free, and the illustrator needs 24.");
+    }
+    assert_eq!(busy.draw().await, Outcome::Idle);
+    assert_eq!(h.icon(Some(&token), "Almonds").await.0, StatusCode::ACCEPTED);
+
+    // The model cannot draw it: three tries, then not again in this look.
+    let failing = Drawer::start(&h, 72, &["--cannot-draw"]).await;
+    for _ in 0..3 {
+        icons_due(&h.state.pool).await;
+        assert_eq!(failing.draw().await, Outcome::Drew(0));
+    }
+    assert_eq!(failing.asked().len(), 3);
+    icons_due(&h.state.pool).await;
+    assert_eq!(failing.draw().await, Outcome::Idle);
+    let (problem, tries): (Option<String>, i32) =
+        sqlx::query_as("select problem, tries from food_icons").fetch_one(&h.state.pool).await.unwrap();
+    assert_eq!(problem.as_deref(), Some("The illustrator could not draw it: cannot identify image file (stand-in)."));
+    assert_eq!(tries, 3);
+    // The phone is told there is none, and asking does not queue it again.
+    assert_eq!(h.icon(Some(&token), "Almonds").await.0, StatusCode::NOT_FOUND);
+    assert_eq!(Drawer::start(&h, 72, &[]).await.draw().await, Outcome::Idle);
+
+    // A program that dies on an icon is counted against that icon too.
+    h.icon(Some(&token), "Butter").await;
+    let dying = Drawer::start(&h, 72, &["--exit-on-draw"]).await;
+    assert_eq!(dying.draw().await, Outcome::Drew(0));
+    let tries: i32 = sqlx::query_scalar("select tries from food_icons where key = 'butter'").fetch_one(&h.state.pool).await.unwrap();
+    assert_eq!(tries, 1);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn an_icon_from_an_older_look_is_drawn_again_when_it_is_next_asked_for(pool: PgPool) {
+    use lyfe_server::illustrator::Outcome;
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    let drawer = Drawer::start(&h, 72, &[]).await;
+    h.icon(Some(&token), "Almonds").await;
+    h.icon(Some(&token), "Butter").await;
+    assert_eq!(drawer.draw().await, Outcome::Drew(2));
+
+    // As if both had been drawn in a look before this one.
+    sqlx::query("update food_icons set look = 0, png = '\\x89504e470d0a1a0a6f6c64'::bytea").execute(&h.state.pool).await.unwrap();
+    // Nothing is drawn again until it is wanted: the catalogue is large.
+    assert_eq!(drawer.draw().await, Outcome::Idle);
+    assert_eq!(h.icon(Some(&token), "Almonds").await.0, StatusCode::ACCEPTED);
+    assert_eq!(drawer.draw().await, Outcome::Drew(1));
+    let (status, _, png) = h.icon(Some(&token), "Almonds").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!png.ends_with(b"old"));
+    let looks: Vec<(String, i32)> = sqlx::query_as("select key, look from food_icons order by key").fetch_all(&h.state.pool).await.unwrap();
+    assert_eq!(looks, [("almonds".to_string(), lyfe_server::routines::illustration::ICON_LOOK), ("butter".to_string(), 0)]);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_server_that_draws_nothing_says_so_and_queues_nothing(pool: PgPool) {
+    let mut h = harness(pool).await;
+    h.state.food_icons = false;
+    let token = h.signed_in().await;
+    let (_, home) = h.get("/v1/home", Some(&token)).await;
+    assert_eq!(home["food"]["icon_look"], Value::Null);
+    assert_eq!(h.icon(Some(&token), "Almonds").await.0, StatusCode::NOT_FOUND);
+    let queued: i64 = sqlx::query_scalar("select count(*) from food_icons").fetch_one(&h.state.pool).await.unwrap();
+    assert_eq!(queued, 0);
 }
 
 // --- Money ---------------------------------------------------------------

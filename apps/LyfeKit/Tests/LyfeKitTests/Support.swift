@@ -303,6 +303,7 @@ struct World {
     let captures = CaptureStore(directory: Fixture.temporaryDirectory())
     let drafts = DraftStore(directory: Fixture.temporaryDirectory())
     let illustrations = IllustrationStore(directory: Fixture.temporaryDirectory())
+    let icons = FoodIconStore(directory: Fixture.temporaryDirectory())
     let clock = Date(timeIntervalSince1970: 1_795_000_000)
     /// The time the app sees; starts at `clock` and can be moved on.
     let time: TestClock
@@ -322,7 +323,8 @@ struct World {
         let time = time
         return AppModel(
             tokens: tokens, addresses: addresses, cache: cache, breath: breath, weighIns: weighIns, food: food,
-            captures: captures, drafts: drafts, illustrations: illustrations, transport: transport ?? backend,
+            captures: captures, drafts: drafts, illustrations: illustrations, foodIcons: icons,
+            transport: transport ?? backend,
             deviceName: "Test iPhone", ownerCheck: ownerCheck, now: { time.now })
     }
 }

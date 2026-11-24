@@ -138,9 +138,11 @@ case "${1:-run}" in
 
         name="lyfe-$(date -u +%Y%m%dT%H%M%SZ).dump.gpg"
         # The downloaded food database is left out: it is large, and
-        # lyfe-food-db fetches it again. Its table is still made on restore.
+        # lyfe-food-db fetches it again. So are the food icons, which are
+        # drawn again when asked for. Their tables are still made on restore.
         "$PG_DUMP" --format=custom --no-owner --dbname="$LYFE_DATABASE_URL" --file="$WORK/lyfe.dump" \
-            --exclude-table-data=barcode_products --exclude-table-data=barcode_products_next
+            --exclude-table-data=barcode_products --exclude-table-data=barcode_products_next \
+            --exclude-table-data=food_icons
         # pg_dump has already compressed it.
         gpg_quiet --symmetric --cipher-algo AES256 --compress-algo none --output "$WORK/$name" "$WORK/lyfe.dump"
         rm -f "$WORK/lyfe.dump"

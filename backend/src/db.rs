@@ -1212,6 +1212,123 @@ pub async fn food_illustration(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<V
     .await
 }
 
+// --- Food icons ----------------------------------------------------------
+
+/// A food's icon waiting to be drawn.
+#[derive(Debug, Clone)]
+pub struct PendingIcon {
+    pub id: Uuid,
+    /// The food's name, as the phone gave it.
+    pub name: String,
+    pub tries: i32,
+}
+
+/// Where a food's icon stands when the phone asks for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IconAsked {
+    /// Drawn, in the look of now.
+    Drawn(Vec<u8>),
+    /// Waiting to be drawn, since this asking or an earlier one.
+    Waiting,
+    /// The model could not draw it; it is not tried again in this look.
+    GivenUp,
+}
+
+/// The phone asks for a food's icon, which is what gets it drawn: one
+/// never asked for joins the queue, and so does one drawn, or given up on,
+/// in an older look. Asking again moves it to the front. `key` is
+/// `illustration::icon_key` of `name`.
+pub async fn ask_food_icon(pool: &PgPool, key: &str, name: &str) -> sqlx::Result<IconAsked> {
+    let row = sqlx::query(
+        "insert into food_icons (key, name) values ($1, $2)
+         on conflict (key) do update set
+            asked_at = now(),
+            tries = case when food_icons.due_at is null and coalesce(food_icons.look, 0) < $3 then 0
+                         else food_icons.tries end,
+            due_at = case when food_icons.due_at is null and coalesce(food_icons.look, 0) < $3 then now()
+                          else food_icons.due_at end
+         returning case when look = $3 then png end as png, due_at is not null as waiting",
+    )
+    .bind(key)
+    .bind(name.trim())
+    .bind(illustration::ICON_LOOK)
+    .fetch_one(pool)
+    .await?;
+    Ok(match (row.get::<Option<Vec<u8>>, _>("png"), row.get::<bool, _>("waiting")) {
+        (Some(png), false) => IconAsked::Drawn(png),
+        (_, true) => IconAsked::Waiting,
+        (None, false) => IconAsked::GivenUp,
+    })
+}
+
+/// The icon whose turn has come that was asked for latest: the one the
+/// owner is looking at now, ahead of ones scrolled past earlier.
+pub async fn next_pending_food_icon(pool: &PgPool) -> sqlx::Result<Option<PendingIcon>> {
+    let row = sqlx::query(
+        "select id, name, tries from food_icons where due_at <= now() order by asked_at desc, key limit 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| PendingIcon { id: r.get("id"), name: r.get("name"), tries: r.get("tries") }))
+}
+
+/// Keeps a food's icon, drawn in the look of now, in place of one drawn in
+/// an older look if it had one. Returns false when it was not waiting.
+pub async fn record_food_icon(pool: &PgPool, id: Uuid, png: &[u8]) -> sqlx::Result<bool> {
+    let result = sqlx::query(
+        "update food_icons set png = $2, look = $3, drawn_at = now(), due_at = null, problem = null, tries = 0
+         where id = $1 and due_at is not null",
+    )
+    .bind(id)
+    .bind(png)
+    .bind(illustration::ICON_LOOK)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// An icon the model could not draw. It is tried again after `retry_in`,
+/// and after `illustration::MAX_TRIES` failures not until the look moves
+/// on. Returns true when it has been given up on. One that was being drawn
+/// again keeps the drawing it had.
+pub async fn record_food_icon_problem(
+    pool: &PgPool,
+    id: Uuid,
+    problem: &str,
+    retry_in: chrono::Duration,
+) -> sqlx::Result<bool> {
+    let gave_up: Option<bool> = sqlx::query_scalar(
+        "update food_icons set
+            problem = $2,
+            tries = tries + 1,
+            look = case when tries + 1 >= $4 then $5 else look end,
+            due_at = case when tries + 1 >= $4 then null else now() + make_interval(secs => $3) end
+         where id = $1 and due_at is not null
+         returning due_at is null",
+    )
+    .bind(id)
+    .bind(problem)
+    .bind(retry_in.num_seconds() as f64)
+    .bind(illustration::MAX_TRIES)
+    .bind(illustration::ICON_LOOK)
+    .fetch_optional(pool)
+    .await?;
+    Ok(gave_up.unwrap_or(false))
+}
+
+/// Puts off every icon whose turn has come, when the Spark cannot draw any
+/// of them now. No icon is blamed for it.
+pub async fn put_off_food_icons(pool: &PgPool, problem: &str, retry_in: chrono::Duration) -> sqlx::Result<u64> {
+    let result = sqlx::query(
+        "update food_icons set problem = $1, due_at = now() + make_interval(secs => $2) where due_at <= now()",
+    )
+    .bind(problem)
+    .bind(retry_in.num_seconds() as f64)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 // --- Packaged food -------------------------------------------------------
 
 fn read_product(r: &sqlx::postgres::PgRow, origin: Origin) -> Product {
