@@ -288,12 +288,14 @@ async fn fire_now(state: &AppState) -> Result<FireResponse, ApiError> {
     }
     let entries = db::money_entries_between(&state.pool, from.first_day(), today).await?;
     let counted = |account: &&ledger::Account| account.currency == currency;
+    let set_aside = || accounts.iter().filter(counted).filter(|account| account.set_aside);
     let view = fire::fire(fire::FireInput {
         today,
         currency: &currency,
         flows: &ledger::flows(&entries, &currency),
         first: db::money_first_day(&state.pool).await?,
-        set_aside_minor: accounts.iter().filter(counted).filter(|account| account.set_aside).map(|account| account.balance_minor).sum(),
+        set_aside_minor: set_aside().map(|account| account.balance_minor).sum(),
+        set_aside_in_bank_minor: set_aside().filter(|account| !account.invested).map(|account| account.balance_minor).sum(),
         // What is in the bank less what is owed: nothing invested.
         on_hand_minor: accounts.iter().filter(counted).filter(|account| !account.invested).map(|account| account.balance_minor).sum(),
         plan: db::money_plan(&state.pool).await?,
@@ -315,6 +317,8 @@ pub(super) struct PlanRequest {
     /// Missing or null to take it back.
     birth_year: Option<i32>,
     coast_age: u32,
+    /// Missing leaves it as it was, for an app that does not know of it.
+    emergency_fund_minor: Option<i64>,
 }
 
 /// The owner says what to assume. Answers with everything worked out again.
@@ -323,11 +327,16 @@ pub(super) async fn set_plan(
     _device: Device,
     Json(request): Json<PlanRequest>,
 ) -> Result<Json<FireResponse>, ApiError> {
+    let emergency_fund_minor = match request.emergency_fund_minor {
+        Some(minor) => minor,
+        None => db::money_plan(&state.pool).await?.emergency_fund_minor,
+    };
     let plan = Plan {
         withdrawal_bp: request.withdrawal_bp,
         return_bp: request.return_bp,
         birth_year: request.birth_year,
         coast_age: request.coast_age,
+        emergency_fund_minor,
     };
     let today = (state.now)().with_timezone(&state.timezone).date_naive();
     if let Some(problem) = plan.problem(today) {
