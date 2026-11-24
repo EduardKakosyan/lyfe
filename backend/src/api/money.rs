@@ -1,12 +1,15 @@
 //! Money as the apps see it: a month of spending by category, the entries
 //! behind it, the accounts they came from, and the owner's say on what an
-//! entry or a payee is.
+//! entry or a payee is; what everything comes to and what the investments
+//! are in; and how far off financial independence is.
 
 use axum::extract::Query;
 
 use super::*;
+use crate::money::fire::{self, FireView, Plan};
 use crate::money::ledger::{self, Choice, Month, MonthView, Problem, SortedBy, Sorting};
 use crate::money::sync::SOURCE as SIMPLEFIN;
+use crate::money::worth::{self, WorthView};
 use crate::money::Trouble;
 
 #[derive(Serialize)]
@@ -91,6 +94,20 @@ async fn month_now(state: &AppState, month: Option<Month>) -> Result<MoneyRespon
         history,
     });
 
+    let Trust { problems, pressing, source } = trust(state).await?;
+    Ok(MoneyResponse { view, problems, pressing, source })
+}
+
+/// How far the figures can be trusted: where they come from, and what is
+/// wrong with that.
+struct Trust {
+    problems: Vec<Problem>,
+    /// How many of them, from the front, stop the figures from being right.
+    pressing: usize,
+    source: SourceStatus,
+}
+
+async fn trust(state: &AppState) -> Result<Trust, ApiError> {
     let source = source_status(state).await?;
     // Ordered by how much they call for: what stops the figures first.
     let mut problems = Vec::new();
@@ -105,7 +122,7 @@ async fn month_now(state: &AppState, month: Option<Month>) -> Result<MoneyRespon
     }
     let pressing = problems.len();
     problems.extend(db::money_notes(&state.pool).await?.into_iter().map(|text| Problem { text, reconnect: false }));
-    Ok(MoneyResponse { view, problems, pressing, source })
+    Ok(Trust { problems, pressing, source })
 }
 
 /// What Home shows of money, or nothing while no bank has ever been
@@ -215,4 +232,107 @@ pub(super) async fn set_account(
     db::resort_money(&mut tx).await?;
     tx.commit().await?;
     Ok(Json(month_now(&state, month).await?))
+}
+
+// --- Worth ---------------------------------------------------------------
+
+#[derive(Serialize)]
+pub(super) struct WorthResponse {
+    #[serde(flatten)]
+    view: WorthView,
+    problems: Vec<Problem>,
+    source: SourceStatus,
+}
+
+/// What everything comes to, the line it has drawn since lyfe began
+/// keeping it, and what the investments are in.
+pub(super) async fn worth(State(state): State<AppState>, _device: Device) -> Result<Json<WorthResponse>, ApiError> {
+    let now = (state.now)();
+    let accounts = db::money_accounts(&state.pool).await?;
+    let holdings = db::money_holdings(&state.pool).await?;
+    let balances = db::money_balances(&state.pool).await?;
+    let currency = home_currency(&state, &accounts);
+    let view = worth::worth(worth::WorthInput {
+        today: now.with_timezone(&state.timezone).date_naive(),
+        now,
+        currency: &currency,
+        accounts: &accounts,
+        holdings: &holdings,
+        balances: &balances,
+    });
+    let Trust { problems, source, .. } = trust(&state).await?;
+    Ok(Json(WorthResponse { view, problems, source }))
+}
+
+// --- The way to financial independence -----------------------------------
+
+#[derive(Serialize)]
+pub(super) struct FireResponse {
+    #[serde(flatten)]
+    view: FireView,
+    /// What stops the figures from being right: a failed import, a bank
+    /// to sign in to again. A month a bank was missing from reads low.
+    problems: Vec<Problem>,
+    source: SourceStatus,
+}
+
+async fn fire_now(state: &AppState) -> Result<FireResponse, ApiError> {
+    let now = (state.now)();
+    let today = now.with_timezone(&state.timezone).date_naive();
+    let accounts = db::money_accounts(&state.pool).await?;
+    let currency = home_currency(state, &accounts);
+    // The months the averages can be from, and the one running.
+    let mut from = Month::containing(today);
+    for _ in 0..fire::MONTHS_COUNTED {
+        from = from.previous();
+    }
+    let entries = db::money_entries_between(&state.pool, from.first_day(), today).await?;
+    let counted = |account: &&ledger::Account| account.currency == currency;
+    let view = fire::fire(fire::FireInput {
+        today,
+        currency: &currency,
+        flows: &ledger::flows(&entries, &currency),
+        first: db::money_first_day(&state.pool).await?,
+        set_aside_minor: accounts.iter().filter(counted).filter(|account| account.set_aside).map(|account| account.balance_minor).sum(),
+        // What is in the bank less what is owed: nothing invested.
+        on_hand_minor: accounts.iter().filter(counted).filter(|account| !account.invested).map(|account| account.balance_minor).sum(),
+        plan: db::money_plan(&state.pool).await?,
+    });
+    let Trust { mut problems, pressing, source } = trust(state).await?;
+    problems.truncate(pressing);
+    Ok(FireResponse { view, problems, source })
+}
+
+pub(super) async fn fire(State(state): State<AppState>, _device: Device) -> Result<Json<FireResponse>, ApiError> {
+    Ok(Json(fire_now(&state).await?))
+}
+
+#[derive(Deserialize)]
+pub(super) struct PlanRequest {
+    /// Hundredths of a percent: 350 is 3.5%.
+    withdrawal_bp: u32,
+    return_bp: u32,
+    /// Missing or null to take it back.
+    birth_year: Option<i32>,
+    coast_age: u32,
+}
+
+/// The owner says what to assume. Answers with everything worked out again.
+pub(super) async fn set_plan(
+    State(state): State<AppState>,
+    _device: Device,
+    Json(request): Json<PlanRequest>,
+) -> Result<Json<FireResponse>, ApiError> {
+    let plan = Plan {
+        withdrawal_bp: request.withdrawal_bp,
+        return_bp: request.return_bp,
+        birth_year: request.birth_year,
+        coast_age: request.coast_age,
+    };
+    let today = (state.now)().with_timezone(&state.timezone).date_naive();
+    if let Some(problem) = plan.problem(today) {
+        return Err(ApiError::BadRequest(problem));
+    }
+    db::set_money_plan(&state.pool, &plan).await?;
+    Ok(Json(fire_now(&state).await?))
 }

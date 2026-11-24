@@ -90,6 +90,52 @@ public struct LyfeAPI: Sendable {
         return try await call("POST", "v1/breath/sessions", token: token, body: body, timeout: 20)
     }
 
+    /// Hands the backend a finished study session. It answers with Home as
+    /// it now stands. Sending the same session again changes nothing.
+    public func recordStudySession(token: String, run: StudyRun) async throws -> HomeSnapshot {
+        let body = try JSONEncoder.lyfe.encode(StudySessionUpload(run))
+        return try await call("POST", "v1/study/sessions", token: token, body: body, timeout: 20)
+    }
+
+    /// Sets a goal, or changes the title, figure or date of one already
+    /// set. It answers with Home as it now stands.
+    public func setGoal(token: String, id: UUID, request: GoalRequest) async throws -> HomeSnapshot {
+        let body = try JSONEncoder.lyfe.encode(request)
+        return try await call("PUT", "v1/goals/\(id.uuidString.lowercased())", token: token, body: body, timeout: 15)
+    }
+
+    /// Makes a goal active, parks it, or ends it as reached or dropped.
+    public func setGoalStatus(token: String, id: UUID, status: GoalStatus, note: String?) async throws -> HomeSnapshot {
+        struct Body: Encodable {
+            var status: GoalStatus
+            var note: String?
+        }
+        let body = try JSONEncoder.lyfe.encode(Body(status: status, note: note))
+        return try await call(
+            "POST", "v1/goals/\(id.uuidString.lowercased())/status", token: token, body: body, timeout: 15)
+    }
+
+    /// Keeps a practice test's score for an exam goal.
+    public func recordPractice(token: String, goal: UUID, entry: PracticeEntry) async throws -> HomeSnapshot {
+        let body = try JSONEncoder.lyfe.encode(entry)
+        return try await call(
+            "POST", "v1/goals/\(goal.uuidString.lowercased())/scores", token: token, body: body, timeout: 15)
+    }
+
+    /// Keeps how an exam went.
+    public func recordExamResult(
+        token: String, goal: UUID, passed: Bool, on: CalendarDay, score: Int?
+    ) async throws -> HomeSnapshot {
+        struct Body: Encodable {
+            var outcome: String
+            var on: CalendarDay
+            var score: Int?
+        }
+        let body = try JSONEncoder.lyfe.encode(Body(outcome: passed ? "passed" : "failed", on: on, score: score))
+        return try await call(
+            "POST", "v1/goals/\(goal.uuidString.lowercased())/result", token: token, body: body, timeout: 15)
+    }
+
     /// Hands the backend a weight the owner typed. It answers with Home as
     /// it now stands. Sending the same weigh-in again changes nothing.
     /// Kept short: it may be running behind the lock screen, where the
@@ -278,6 +324,23 @@ public struct LyfeAPI: Sendable {
             "PUT", "v1/food/entries/\(id.uuidString.lowercased())/estimate", token: token, body: body, timeout: 15)
     }
 
+    /// The icon of a food in the ingredient catalogue (a PNG), by the
+    /// food's name. Asking is what gets it drawn: until the Spark has, the
+    /// answer is that it is waiting. None when the backend draws no icons,
+    /// or the model could not draw this one.
+    public func foodIcon(token: String, _ icon: FoodIcon) async throws -> FoodIconAnswer {
+        do {
+            // The look is not read by the backend: as with a meal's
+            // illustration, it makes an icon drawn again a new address.
+            let answer = try await answer(
+                "GET", "v1/food/icons", token: token, body: nil, timeout: 20,
+                query: [URLQueryItem(name: "name", value: icon.name), URLQueryItem(name: "v", value: String(icon.look))])
+            return answer.status == 200 ? .drawn(answer.body) : .waiting
+        } catch LyfeAPIError.server(status: 404) {
+            return .none
+        }
+    }
+
     /// The photo of a logged meal, as it was sent.
     public func foodPhoto(token: String, id: UUID) async throws -> Data {
         try await perform("GET", "v1/food/entries/\(id.uuidString.lowercased())/photo", token: token, body: nil, timeout: 20)
@@ -417,6 +480,23 @@ public struct LyfeAPI: Sendable {
             "PUT", "v1/money/accounts/\(id.uuidString.lowercased())", token: token, body: body, timeout: 15)
     }
 
+    /// What everything comes to, the line it has drawn, and what the
+    /// investments are in.
+    public func moneyWorth(token: String) async throws -> MoneyWorth {
+        try await call("GET", "v1/money/worth", token: token, body: nil, timeout: 15)
+    }
+
+    /// How far off financial independence is.
+    public func moneyFire(token: String) async throws -> MoneyFire {
+        try await call("GET", "v1/money/fire", token: token, body: nil, timeout: 15)
+    }
+
+    /// Says what to assume. The backend answers with everything worked
+    /// out again.
+    public func setMoneyPlan(token: String, plan: MoneyPlan) async throws -> MoneyFire {
+        try await call("PUT", "v1/money/plan", token: token, body: JSONEncoder.lyfe.encode(plan), timeout: 15)
+    }
+
     /// Which part of the path failed, with the system's error number so it
     /// can be looked up.
     static func explain(_ error: URLError) -> String {
@@ -458,6 +538,14 @@ public struct LyfeAPI: Sendable {
         _ method: String, _ path: String, token: String?, body: Data?, timeout: TimeInterval,
         query: [URLQueryItem] = []
     ) async throws -> Data {
+        try await answer(method, path, token: token, body: body, timeout: timeout, query: query).body
+    }
+
+    /// What the backend answered, with which of the 2xx statuses it was.
+    private func answer(
+        _ method: String, _ path: String, token: String?, body: Data?, timeout: TimeInterval,
+        query: [URLQueryItem] = []
+    ) async throws -> (body: Data, status: Int) {
         let address = baseURL.appending(path: path)
         var request = URLRequest(url: query.isEmpty ? address : address.appending(queryItems: query))
         request.httpMethod = method
@@ -489,7 +577,7 @@ public struct LyfeAPI: Sendable {
         }
 
         if (200..<300).contains(response.statusCode) {
-            return data
+            return (data, response.statusCode)
         }
         struct Failure: Decodable {
             var error: String?

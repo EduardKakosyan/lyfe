@@ -1,12 +1,17 @@
 import SwiftUI
 
-/// Money: what a month's spending comes to across every account, by
-/// category, with the entries behind it and the accounts they came from.
-/// Money moved between the owner's own accounts is never spending. The
+/// Money, in three sections under one head. The month: what its spending
+/// comes to across every account, by category, with the entries behind it;
+/// money moved between the owner's own accounts is never spending, and the
 /// black bar goes through what is still to sort, once for each payee.
+/// Worth: what everything comes to, and what the investments are in. FIRE:
+/// how far off financial independence is.
 public struct MoneyScreen: View {
     let money: MoneyMonth?
-    /// What went wrong fetching the month, if anything.
+    var worth: MoneyWorth?
+    var fire: MoneyFire?
+    var section: MoneySection = .month
+    /// What went wrong fetching what is on screen, if anything.
     var problem: String?
     var loading = false
     let onBack: () -> Void
@@ -18,6 +23,12 @@ public struct MoneyScreen: View {
     let onSortNext: () -> Void
     /// Sets an account aside or brings it back; answers with what went wrong.
     let onSetAside: (UUID, Bool) async -> String?
+    /// Shows another section.
+    var onSection: (MoneySection) -> Void = { _ in }
+    /// Fetches the section on screen again, when it is not the month.
+    var onReload: () async -> Void = {}
+    /// Opens what FIRE assumes.
+    var onPlan: () -> Void = {}
 
     /// The category whose entries are shown; all of them when nil.
     @State private var showing: String?
@@ -26,20 +37,27 @@ public struct MoneyScreen: View {
 
     public var body: some View {
         Group {
-            if let money {
-                if let showing {
-                    VStack(alignment: .leading, spacing: 0) {
-                        TopLine(left: "← Categories", right: MoneyText.long(money.month)) { self.showing = nil }
-                        Text(showing).posterHeading().padding(.horizontal, Poster.margin)
-                        if let category = money.categories.first(where: { $0.name == showing }) {
-                            Text("\(MoneyText.amount(category.spentMinor)) \(money.currency)").font(.largeTitle.bold()).padding(.horizontal, Poster.margin)
-                        }
-                        PosterRule()
-                        ScrollView { entries(money) }
-                    }.frame(maxWidth: .infinity, alignment: .leading)
-                } else { month(money) }
-            } else {
-                waiting
+            switch section {
+            case .month:
+                if let money {
+                    if let showing {
+                        VStack(alignment: .leading, spacing: 0) {
+                            TopLine(left: "← Categories", right: MoneyText.long(money.month)) { self.showing = nil }
+                            Text(showing).posterHeading().padding(.horizontal, Poster.margin)
+                            if let category = money.categories.first(where: { $0.name == showing }) {
+                                Text("\(MoneyText.amount(category.spentMinor)) \(money.currency)").font(.largeTitle.bold()).padding(.horizontal, Poster.margin)
+                            }
+                            PosterRule()
+                            ScrollView { entries(money) }
+                        }.frame(maxWidth: .infinity, alignment: .leading)
+                    } else { month(money) }
+                } else {
+                    waiting
+                }
+            case .worth:
+                worthPage
+            case .fire:
+                firePage
             }
         }
         .foregroundStyle(Poster.ink)
@@ -52,27 +70,16 @@ public struct MoneyScreen: View {
                 showing = nil
                 Task { await onMonth(month) }
             })
+            MoneySections(section: section, onSection: onSection)
             ScrollView {
                 VStack(spacing: 0) {
-                    TimelineView(.periodic(from: .now, by: 60)) { timeline in
-                        let source = MoneyText.sourceLine(money.source, now: timeline.date)
-                        HStack(spacing: 6) {
-                            PosterSquare(state: source.mark, size: 10)
-                            Text(source.left).posterLabel()
-                            Spacer()
-                            Text(loading ? "CHECKING" : source.right).posterLabel()
-                        }
-                        .padding(.horizontal, Poster.margin)
-                        .padding(.vertical, 7)
-                    }
-                    PosterRule(thickness: 1.5)
-                    ForEach(notices(money), id: \.self) { notice in
+                    sourceLine(money.source)
+                    ForEach(notices(money.problems, source: money.source), id: \.self) { notice in
                         NoticeRow(text: notice)
                         PosterRule(thickness: 1.5)
                     }
                     categories(money)
                     entries(money)
-                    accounts(money)
                 }
             }
             .refreshable { await onMonth(money.month) }
@@ -84,6 +91,34 @@ public struct MoneyScreen: View {
                 .buttonStyle(.plain)
                 .accessibilityHint("Goes through the entries still to sort")
             }
+        }
+    }
+
+    // MARK: Worth
+
+    private var worthPage: some View {
+        VStack(spacing: 0) {
+            MoneyHead(
+                top: worth.flatMap { worth in worth.recordedSince.map { "KEPT SINCE \(WorthText.dayLabel($0, in: worth))" } } ?? "",
+                heading: "Worth", beside: worth.map(WorthText.changeLine) ?? "",
+                figure: worth.map { MoneyText.whole($0.worthMinor) } ?? "–",
+                caption: worth.map(WorthText.caption) ?? "EVERYTHING ADDED UP", onBack: onBack)
+            MoneySections(section: section, onSection: onSection)
+            ScrollView {
+                VStack(spacing: 0) {
+                    if let worth {
+                        sourceLine(worth.source)
+                        ForEach(notices(worth.problems, source: worth.source), id: \.self) { notice in
+                            NoticeRow(text: notice)
+                            PosterRule(thickness: 1.5)
+                        }
+                        WorthSection(worth: worth, onAccount: { asking = $0 })
+                    } else {
+                        fetching("what everything comes to")
+                    }
+                }
+            }
+            .refreshable { await onReload() }
         }
         .confirmationDialog(
             asking.map(MoneyText.asideQuestion) ?? "", isPresented: askingShown, titleVisibility: .visible
@@ -100,15 +135,79 @@ public struct MoneyScreen: View {
         Binding(get: { asking != nil }, set: { if !$0 { asking = nil } })
     }
 
-    private func notices(_ money: MoneyMonth) -> [String] {
+    // MARK: FIRE
+
+    private var firePage: some View {
+        let hero = fire.map(FireText.hero) ?? ("–", "OF WHAT CAME IN, KEPT")
+        return VStack(spacing: 0) {
+            MoneyHead(
+                top: fire.map(FireText.basis) ?? "", heading: "FIRE", beside: fire.map(FireText.headline) ?? "",
+                figure: hero.0, caption: hero.1, captionRight: fire.map(FireText.when) ?? "", onBack: onBack)
+            MoneySections(section: section, onSection: onSection)
+            ScrollView {
+                VStack(spacing: 0) {
+                    if let fire {
+                        sourceLine(fire.source)
+                        ForEach(notices(fire.problems, source: fire.source), id: \.self) { notice in
+                            NoticeRow(text: notice)
+                            PosterRule(thickness: 1.5)
+                        }
+                        FireSection(fire: fire, onPlan: onPlan)
+                    } else {
+                        fetching("the way to independence")
+                    }
+                }
+            }
+            .refreshable { await onReload() }
+        }
+    }
+
+    // MARK: Shared
+
+    /// Where the figures come from and how fresh they are.
+    private func sourceLine(_ status: SourceStatus) -> some View {
+        VStack(spacing: 0) {
+            TimelineView(.periodic(from: .now, by: 60)) { timeline in
+                let source = MoneyText.sourceLine(status, now: timeline.date)
+                HStack(spacing: 6) {
+                    PosterSquare(state: source.mark, size: 10)
+                    Text(source.left).posterLabel()
+                    Spacer()
+                    Text(loading ? "CHECKING" : source.right).posterLabel()
+                }
+                .padding(.horizontal, Poster.margin)
+                .padding(.vertical, 7)
+            }
+            PosterRule(thickness: 1.5)
+        }
+    }
+
+    private func notices(_ problems: [MoneyMonth.Problem], source: SourceStatus) -> [String] {
         var notices: [String] = []
         if let note { notices.append(note) }
         if let problem { notices.append(problem) }
-        notices += money.problems.map(MoneyText.notice)
-        if money.source.state == .notConfigured {
+        notices += problems.map(MoneyText.notice)
+        if source.state == .notConfigured {
             notices.append("No bank is connected. The server has no SimpleFIN access file.")
         }
         return notices
+    }
+
+    /// A section with nothing fetched yet: money is not kept on the phone.
+    private func fetching(_ what: String) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text(loading ? "Fetching \(what)" : (problem ?? "Fetching \(what)")).posterLabel()
+            Button {
+                Task { await onReload() }
+            } label: {
+                Text("Try again").posterLabel().padding(.vertical, 12).contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .opacity(problem != nil && !loading ? 1 : 0)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, Poster.margin)
+        .padding(.vertical, 18)
     }
 
     @ViewBuilder private func categories(_ money: MoneyMonth) -> some View {
@@ -153,34 +252,6 @@ public struct MoneyScreen: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, Poster.margin)
                 .padding(.vertical, 14)
-            PosterRule(thickness: 1.5)
-        }
-    }
-
-    @ViewBuilder private func accounts(_ money: MoneyMonth) -> some View {
-        if !money.accounts.isEmpty {
-            PosterRule(thickness: 1.5)
-            StripRow(left: "Accounts", right: "Everyday \(MoneyText.amount(money.everydayMinor)) \(money.currency)")
-            PosterRule(thickness: 1.5)
-            TimelineView(.periodic(from: .now, by: 300)) { timeline in
-                VStack(spacing: 0) {
-                    ForEach(money.accounts) { account in
-                        Button {
-                            asking = account
-                        } label: {
-                            AccountRow(account: account, currency: money.currency, now: timeline.date)
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityHint(account.setAside ? "Brings it back into spending" : "Sets it aside")
-                        PosterRule(thickness: 1.5)
-                    }
-                }
-            }
-            if money.accounts.contains(where: \.setAside) {
-                StripRow(left: "Set aside", right: "\(MoneyText.amount(money.setAsideMinor)) \(money.currency)")
-            } else {
-                StripRow(left: "Tap savings or investments to set them aside", right: "")
-            }
             PosterRule(thickness: 1.5)
         }
     }

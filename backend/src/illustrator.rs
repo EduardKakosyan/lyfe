@@ -1,15 +1,18 @@
-//! Draws meal photos as Poster illustrations with FLUX.2 klein 4B on the
-//! Spark, in the background.
+//! Draws meal photos as Poster illustrations, and the icons of the foods
+//! in the ingredient catalogue, with FLUX.2 klein 4B on the Spark, in the
+//! background.
 //!
 //! The model runs in a program of its own (`deploy/spark/lyfe-illustrate.py`),
-//! which lyfe starts only when a photo is waiting and the shared machine has
-//! the memory free. The program loads the model once, which takes a minute
-//! or two, draws every photo waiting, and is let go a few minutes after the
-//! last, so meals logged together are drawn together and its memory is given
-//! back when it exits. Talking to it is one line of JSON each way per photo
-//! (`crate::routines::illustration`). A meal is never held up by any of
-//! this: it is logged and counted without its illustration, and the app
-//! shows the photo until one comes.
+//! which lyfe starts only when a picture is waiting and the shared machine
+//! has the memory free. The program loads the model once, which takes a
+//! minute or two, draws every picture waiting, and is let go a few minutes
+//! after the last, so meals logged together are drawn together and its
+//! memory is given back when it exits. Talking to it is one line of JSON
+//! each way per picture (`crate::routines::illustration`). A meal is never
+//! held up by any of this: it is logged and counted without its
+//! illustration, and the app shows the photo until one comes. Meal photos
+//! go first; a food's icon, which is drawn from its name alone, waits for
+//! them.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -22,7 +25,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Notify;
 
-use crate::db::{self, PendingIllustration};
+use crate::db::{self, PendingIcon, PendingIllustration};
 use crate::estimator::free_memory_gb;
 use crate::routines::illustration;
 
@@ -64,11 +67,45 @@ impl Default for IllustratorSettings {
 pub enum Outcome {
     /// Nothing was waiting.
     Idle,
-    /// The program ran and drew this many photos; any it could not draw
-    /// are tried again later.
+    /// The program ran and drew this many pictures, meal photos and food
+    /// icons together; any it could not draw are tried again later.
     Drew(usize),
-    /// Nothing could be drawn now; every photo waiting is tried again later.
+    /// Nothing could be drawn now; every picture waiting is tried again
+    /// later.
     PutOff(String),
+}
+
+/// One picture waiting to be drawn.
+#[derive(Debug, Clone)]
+enum Waiting {
+    /// A meal's photo, to redraw.
+    Meal(PendingIllustration),
+    /// A food's icon, to draw from its name.
+    Icon(PendingIcon),
+}
+
+impl Waiting {
+    fn id(&self) -> uuid::Uuid {
+        match self {
+            Waiting::Meal(meal) => meal.id,
+            Waiting::Icon(icon) => icon.id,
+        }
+    }
+
+    fn prompt(&self) -> String {
+        match self {
+            Waiting::Meal(meal) => illustration::prompt(&meal.note),
+            Waiting::Icon(icon) => illustration::icon_prompt(&icon.name),
+        }
+    }
+
+    /// The photo to redraw; none for an icon.
+    fn jpeg(&self) -> Option<&[u8]> {
+        match self {
+            Waiting::Meal(meal) => Some(&meal.jpeg),
+            Waiting::Icon(_) => None,
+        }
+    }
 }
 
 /// How long to wait before trying again, by what went wrong.
@@ -116,10 +153,18 @@ impl Illustrator {
         }
     }
 
-    /// Starts the program if a photo's turn has come, draws until nothing
+    /// The picture to draw next: a meal's photo before any food's icon.
+    async fn next_waiting(&self) -> sqlx::Result<Option<Waiting>> {
+        if let Some(meal) = db::next_pending_illustration(&self.pool).await? {
+            return Ok(Some(Waiting::Meal(meal)));
+        }
+        Ok(db::next_pending_food_icon(&self.pool).await?.map(Waiting::Icon))
+    }
+
+    /// Starts the program if a picture's turn has come, draws until nothing
     /// has been waiting for the keep-alive time, then lets it go.
     pub async fn run_once(&self) -> sqlx::Result<Outcome> {
-        let Some(first) = db::next_pending_illustration(&self.pool).await? else {
+        let Some(first) = self.next_waiting().await? else {
             return Ok(Outcome::Idle);
         };
         let Some(program) = &self.settings.program else {
@@ -148,28 +193,37 @@ impl Illustrator {
         let mut drew = 0;
         let mut next = Some(first);
         loop {
-            let meal = match next.take() {
-                Some(meal) => meal,
+            let waiting = match next.take() {
+                Some(waiting) => waiting,
                 None => match self.wait_for_next().await? {
-                    Some(meal) => meal,
+                    Some(waiting) => waiting,
                     None => break,
                 },
             };
-            match running.draw(&meal, self.settings.draw_timeout).await {
+            match running.draw(waiting.id(), &waiting.prompt(), waiting.jpeg(), self.settings.draw_timeout).await {
                 Ok(png) => {
-                    db::record_illustration(&self.pool, meal.id, &png).await?;
+                    // What was eaten, or looked up, is not logged; it is
+                    // the owner's.
+                    match &waiting {
+                        Waiting::Meal(meal) => {
+                            db::record_illustration(&self.pool, meal.id, &png).await?;
+                            tracing::info!(id = %meal.id, bytes = png.len(), "meal illustrated");
+                        }
+                        Waiting::Icon(icon) => {
+                            db::record_food_icon(&self.pool, icon.id, &png).await?;
+                            tracing::info!(id = %icon.id, bytes = png.len(), "food icon drawn");
+                        }
+                    }
                     drew += 1;
-                    // What was eaten is not logged; it is the owner's.
-                    tracing::info!(id = %meal.id, bytes = png.len(), "meal illustrated");
                 }
                 Err(Undrawn::Picture(words)) => {
-                    self.picture_failed(&meal, &words).await?;
+                    self.picture_failed(&waiting, &words).await?;
                 }
                 Err(Undrawn::Program(words)) => {
                     // The program is gone or stuck on this picture. It is
                     // counted against the picture, so one that kills the
                     // model is not tried for ever.
-                    self.picture_failed(&meal, &words).await?;
+                    self.picture_failed(&waiting, &words).await?;
                     running.kill().await;
                     return Ok(Outcome::Drew(drew));
                 }
@@ -180,12 +234,12 @@ impl Illustrator {
         Ok(Outcome::Drew(drew))
     }
 
-    /// The next photo whose turn comes before the keep-alive time is up.
-    async fn wait_for_next(&self) -> sqlx::Result<Option<PendingIllustration>> {
+    /// The next picture whose turn comes before the keep-alive time is up.
+    async fn wait_for_next(&self) -> sqlx::Result<Option<Waiting>> {
         let until = Instant::now() + self.settings.keep_alive;
         loop {
-            if let Some(meal) = db::next_pending_illustration(&self.pool).await? {
-                return Ok(Some(meal));
+            if let Some(waiting) = self.next_waiting().await? {
+                return Ok(Some(waiting));
             }
             let left = until.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -198,26 +252,50 @@ impl Illustrator {
         }
     }
 
-    async fn picture_failed(&self, meal: &PendingIllustration, words: &str) -> sqlx::Result<()> {
-        let gave_up = db::record_illustration_problem(&self.pool, meal.id, words, RETRY_PICTURE).await?;
-        if gave_up {
-            tracing::warn!(id = %meal.id, problem = %words, "meal not illustrated; its photo is shown instead");
-        } else {
-            tracing::warn!(id = %meal.id, problem = %words, "meal not illustrated this time");
+    async fn picture_failed(&self, waiting: &Waiting, words: &str) -> sqlx::Result<()> {
+        match waiting {
+            Waiting::Meal(meal) => {
+                let gave_up = db::record_illustration_problem(&self.pool, meal.id, words, RETRY_PICTURE).await?;
+                if gave_up {
+                    tracing::warn!(id = %meal.id, problem = %words, "meal not illustrated; its photo is shown instead");
+                } else {
+                    tracing::warn!(id = %meal.id, problem = %words, "meal not illustrated this time");
+                }
+            }
+            Waiting::Icon(icon) => {
+                let gave_up = db::record_food_icon_problem(&self.pool, icon.id, words, RETRY_PICTURE).await?;
+                if gave_up {
+                    tracing::warn!(id = %icon.id, problem = %words, "food icon not drawn; its category's is shown instead");
+                } else {
+                    tracing::warn!(id = %icon.id, problem = %words, "food icon not drawn this time");
+                }
+            }
         }
         Ok(())
     }
 
     async fn put_off(&self, words: String, retry: chrono::Duration) -> sqlx::Result<Outcome> {
-        let waiting = db::put_off_illustrations(&self.pool, &words, retry).await?;
-        tracing::warn!(waiting, problem = %words, retry_minutes = retry.num_minutes(), "meals not illustrated for now");
+        let meals = db::put_off_illustrations(&self.pool, &words, retry).await?;
+        let icons = db::put_off_food_icons(&self.pool, &words, retry).await?;
+        tracing::warn!(meals, icons, problem = %words, retry_minutes = retry.num_minutes(), "nothing drawn for now");
         Ok(Outcome::PutOff(words))
     }
 
-    /// Draws one photo without storing anything: for checking the model
-    /// from the command line. Gives the PNG and how long loading and drawing
-    /// took, or what went wrong in words.
+    /// Draws one meal photo without storing anything: for checking the
+    /// model from the command line. Gives the PNG and how long loading and
+    /// drawing took, or what went wrong in words.
     pub async fn check(&self, note: &str, jpeg: Vec<u8>) -> Result<(Vec<u8>, Duration, Duration), String> {
+        let meal = PendingIllustration { id: uuid::Uuid::nil(), note: note.to_string(), jpeg, tries: 0 };
+        self.check_one(Waiting::Meal(meal)).await
+    }
+
+    /// Draws one food's icon without storing anything, as `check` does a
+    /// photo.
+    pub async fn check_icon(&self, name: &str) -> Result<(Vec<u8>, Duration, Duration), String> {
+        self.check_one(Waiting::Icon(PendingIcon { id: uuid::Uuid::nil(), name: name.to_string(), tries: 0 })).await
+    }
+
+    async fn check_one(&self, waiting: Waiting) -> Result<(Vec<u8>, Duration, Duration), String> {
         let program = self.settings.program.as_ref().ok_or("illustrations are off")?;
         let started = Instant::now();
         let mut running = Running::start(program, self.settings.load_timeout).await.map_err(|unstarted| match unstarted {
@@ -225,8 +303,7 @@ impl Illustrator {
             Unstarted::Failed(words) => words,
         })?;
         let loaded = started.elapsed();
-        let meal = PendingIllustration { id: uuid::Uuid::nil(), note: note.to_string(), jpeg, tries: 0 };
-        let drawn = running.draw(&meal, self.settings.draw_timeout).await;
+        let drawn = running.draw(waiting.id(), &waiting.prompt(), waiting.jpeg(), self.settings.draw_timeout).await;
         let drawing = started.elapsed() - loaded;
         running.stop().await;
         match drawn {
@@ -297,12 +374,13 @@ impl Running {
         Ok(running)
     }
 
-    async fn draw(&mut self, meal: &PendingIllustration, timeout: Duration) -> Result<Vec<u8>, Undrawn> {
-        let prompt = illustration::prompt(&meal.note);
+    /// Draws one picture: `jpeg` redrawn as the prompt says, or, with no
+    /// photo, a food's icon from the prompt alone.
+    async fn draw(&mut self, id: uuid::Uuid, prompt: &str, jpeg: Option<&[u8]>, timeout: Duration) -> Result<Vec<u8>, Undrawn> {
         let request = illustration::Request {
-            id: meal.id,
-            prompt: &prompt,
-            jpeg: base64::engine::general_purpose::STANDARD.encode(&meal.jpeg),
+            id,
+            prompt,
+            jpeg: jpeg.map(|jpeg| base64::engine::general_purpose::STANDARD.encode(jpeg)),
         };
         let mut line = serde_json::to_vec(&request).expect("a request is JSON");
         line.push(b'\n');
@@ -315,7 +393,7 @@ impl Running {
             return Err(Undrawn::Program("The illustrator stopped.".into()));
         }
         match tokio::time::timeout(timeout, self.output.next_line()).await {
-            Ok(Ok(Some(answer))) => illustration::read_answer(&answer, meal.id)
+            Ok(Ok(Some(answer))) => illustration::read_answer(&answer, id)
                 .map(|drawn| drawn.png)
                 .map_err(|words| Undrawn::Picture(capitalised(&words))),
             Ok(_) => Err(Undrawn::Program("The illustrator stopped while drawing.".into())),

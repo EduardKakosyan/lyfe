@@ -43,7 +43,7 @@ struct ProgressDetails: View {
             Button(progress.tapeDue ? "Tape measurement due · Enter" : "Enter tape measurement") { editor = "tape" }
             PosterRule()
             Text("Calorie target review").posterHeading()
-            Text(progress.goal.map { "Weekly weight goal: \($0.formatted())%" } ?? "Set your weekly weight trend to enable suggestions.")
+            Text(progress.goal.map { "Weekly weight rate: \($0.formatted())%" } ?? "Set your weekly weight trend to enable suggestions.")
             Button("Set weekly trend") { editor = "goal" }
             Button(progress.confirmed ? "Food log confirmed today" : "Confirm I logged all food today") {
                 submit(ProgressEntry(kind: "confirm", day: home.today))

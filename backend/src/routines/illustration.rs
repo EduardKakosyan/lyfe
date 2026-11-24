@@ -9,6 +9,10 @@
 //! background to the app's paper, so the result sits on the screen without
 //! a box around it. An illustration only ever adds to a meal: the meal is
 //! logged and counted without it, and the photo is shown until it comes.
+//!
+//! The same model draws the icons of the foods in the ingredient catalogue,
+//! from a food's name alone, with no photo (ADR 0008): the food by itself,
+//! in its own colours, with the same ink outlines, on the same paper.
 
 use serde::{Deserialize, Serialize};
 
@@ -41,6 +45,38 @@ pub fn prompt(note: &str) -> String {
     )
 }
 
+/// The look food icons are drawn in, counted up whenever `icon_prompt` or
+/// the program's finishing changes what an icon looks like. An icon drawn
+/// in an earlier look is drawn again the next time the phone asks for it.
+pub const ICON_LOOK: i32 = 1;
+/// The longest food name an icon is drawn for. The catalogue's are at most
+/// 60 characters.
+pub const MAX_ICON_NAME_LENGTH: usize = 80;
+
+/// The prompt a food's icon is drawn from, with no photo: its name as the
+/// catalogue has it, which says how it is prepared ("Potato, baked"). The
+/// wording is the one that did best in six rounds on the Spark. "A serving
+/// of" is what keeps "Chicken, broiler, wing" from being drawn as a hen;
+/// saying what to leave out does not work, since whatever the prompt names
+/// is drawn.
+pub fn icon_prompt(name: &str) -> String {
+    let food = describe(name);
+    format!(
+        "Flat vector illustration of a serving of {food}, as a simple food icon. Thick black ink outline, bold flat natural \
+         colours, no shading, no gradients, no white border. Isolated and centred on a plain off-white \
+         background, filling most of the picture. No text."
+    )
+}
+
+/// What a food's icon is kept by: its name on one line and in lower case,
+/// so the same food asked for twice is drawn once. None for a name no icon
+/// is drawn for: an empty one, or one too long to be a food's.
+pub fn icon_key(name: &str) -> Option<String> {
+    let line: String = name.split_whitespace().collect::<Vec<_>>().join(" ").chars().filter(|c| !c.is_control()).collect();
+    let key = line.trim().to_lowercase();
+    (!key.is_empty() && key.chars().count() <= MAX_ICON_NAME_LENGTH).then_some(key)
+}
+
 /// The meal as the prompt names it: the owner's line, on one line and
 /// without its closing stop, or just a meal when there is no line.
 fn describe(note: &str) -> String {
@@ -60,8 +96,10 @@ fn describe(note: &str) -> String {
 pub struct Request<'a> {
     pub id: uuid::Uuid,
     pub prompt: &'a str,
-    /// The photo as the phone sent it, base64.
-    pub jpeg: String,
+    /// The photo to redraw, as the phone sent it, base64. Left out for a
+    /// food's icon, which is drawn from the prompt alone, and smaller.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jpeg: Option<String>,
 }
 
 /// The first line the program writes, once the model is loaded or it has
@@ -155,6 +193,29 @@ mod tests {
         assert!(prompt("").starts_with("Redraw this photo of a meal as a bold flat"));
         assert!(prompt(" ... ").starts_with("Redraw this photo of a meal as a bold flat"));
         assert!(!prompt("eggs\u{7}").contains('\u{7}'));
+    }
+
+    #[test]
+    fn an_icon_is_asked_for_by_the_foods_name_alone() {
+        let prompt = icon_prompt(" Potato,\n baked. ");
+        assert!(prompt.starts_with("Flat vector illustration of a serving of Potato, baked, as a simple food icon."), "{prompt}");
+        assert!(prompt.contains("Thick black ink outline, bold flat natural colours"));
+        assert!(prompt.ends_with("on a plain off-white background, filling most of the picture. No text."));
+        // With no photo, the request has none.
+        let id = uuid::Uuid::from_u128(7);
+        let line = serde_json::to_string(&Request { id, prompt: "p", jpeg: None }).unwrap();
+        assert_eq!(line, format!(r#"{{"id":"{id}","prompt":"p"}}"#));
+        let line = serde_json::to_string(&Request { id, prompt: "p", jpeg: Some("QQ==".into()) }).unwrap();
+        assert_eq!(line, format!(r#"{{"id":"{id}","prompt":"p","jpeg":"QQ=="}}"#));
+    }
+
+    #[test]
+    fn an_icon_is_kept_by_the_foods_name_however_it_is_spelled() {
+        assert_eq!(icon_key("  Potato,\n  BAKED "), Some("potato, baked".into()));
+        assert_eq!(icon_key("Crème fraîche\u{7}"), Some("crème fraîche".into()));
+        assert_eq!(icon_key(" \n "), None);
+        assert_eq!(icon_key(&"x".repeat(MAX_ICON_NAME_LENGTH)), Some("x".repeat(MAX_ICON_NAME_LENGTH)));
+        assert_eq!(icon_key(&"x".repeat(MAX_ICON_NAME_LENGTH + 1)), None);
     }
 
     #[test]

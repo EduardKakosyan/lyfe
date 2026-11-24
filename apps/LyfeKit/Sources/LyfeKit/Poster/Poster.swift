@@ -18,6 +18,10 @@ public enum Poster {
     public static let yellow = Color(red: 0xff / 255, green: 0xd2 / 255, blue: 0x1f / 255)
     /// The darker stripe on the food band while its streak is in recovery.
     public static let yellowShade = Color(red: 0xeb / 255, green: 0xb8 / 255, blue: 0x00 / 255)
+    /// Study.
+    public static let green = Color(red: 0x18 / 255, green: 0xb3 / 255, blue: 0x68 / 255)
+    /// The darker stripe on the study band while its streak is in recovery.
+    public static let greenShade = Color(red: 0x0f / 255, green: 0x94 / 255, blue: 0x54 / 255)
 
     /// Thickness of the rules between sections.
     public static let rule: CGFloat = 3

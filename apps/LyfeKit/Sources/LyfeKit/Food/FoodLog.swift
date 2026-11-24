@@ -415,6 +415,38 @@ public enum FoodTyping {
         return .success(Ingredient(name: name, kcal: kcal, proteinG: protein))
     }
 
+    /// A food typed as its macros alone: the grams of protein, carbs and
+    /// fat, any of them left blank for none, and a name only if it is to
+    /// have one. What it comes to in kcal is worked out (`Macros`), so
+    /// 10 g of fat is logged by typing 10. Or the first thing wrong.
+    public static func macros(name: String, protein: String, carbs: String, fat: String)
+        -> Result<Ingredient, FoodSlip>
+    {
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard name.count <= MealDraft.maxNameLength else { return .failure(FoodSlip("That name is too long")) }
+        var grams: [Double] = []
+        for (text, what) in [(protein, "protein"), (carbs, "carbs"), (fat, "fat")] {
+            if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                grams.append(0)
+            } else if let value = number(text), value <= 1000 {
+                grams.append(value)
+            } else {
+                return .failure(FoodSlip("Type the \(what) in grams, 0 to 1000, or leave it blank"))
+            }
+        }
+        guard grams.contains(where: { $0 > 0 }) else {
+            return .failure(FoodSlip("Type the grams of protein, carbs or fat"))
+        }
+        let kcal = Macros.kcal(proteinG: grams[0], carbsG: grams[1], fatG: grams[2])
+        guard kcal <= 10_000 else { return .failure(FoodSlip("That comes to more than 10000 kcal")) }
+        var food = Ingredient(
+            name: name.isEmpty ? Macros.name(proteinG: grams[0], carbsG: grams[1], fatG: grams[2]) : name,
+            kcal: kcal, proteinG: grams[0])
+        food.carbsG = grams[1]
+        food.fatG = grams[2]
+        return .success(food)
+    }
+
     /// The two fields of the targets entry, or the first thing wrong.
     public static func targets(kcal: String, protein: String) -> Result<FoodTargets, FoodSlip> {
         guard let kcal = number(kcal), kcal == kcal.rounded(), (800...10_000).contains(kcal) else {
@@ -424,6 +456,37 @@ public enum FoodTyping {
             return .failure(FoodSlip("Type the protein for a day in grams, 20 to 500"))
         }
         return .success(FoodTargets(kcal: Int(kcal), proteinG: Int(protein)))
+    }
+}
+
+/// What a gram of protein, carbs and fat each comes to in kcal: the fixed
+/// figures food labels are worked out with. They let a food be typed as
+/// its macros alone, with no calories to look up.
+public enum Macros {
+    public static let kcalPerGramOfProtein = 4.0
+    public static let kcalPerGramOfCarbs = 4.0
+    public static let kcalPerGramOfFat = 9.0
+
+    public static func kcal(proteinG: Double, carbsG: Double, fatG: Double) -> Double {
+        proteinG * kcalPerGramOfProtein + carbsG * kcalPerGramOfCarbs + fatG * kcalPerGramOfFat
+    }
+
+    /// What a food typed as macros is called when it is given no name:
+    /// "10 g fat", "30 g protein + 10 g fat".
+    public static func name(proteinG: Double, carbsG: Double, fatG: Double) -> String {
+        [(proteinG, "protein"), (carbsG, "carbs"), (fatG, "fat")]
+            .filter { $0.0 > 0 }
+            .map { "\(FoodText.plain($0.0)) g \($0.1)" }
+            .joined(separator: " + ")
+    }
+
+    /// True for a food typed as its macros alone: one that says its carbs
+    /// and fat, and comes to exactly what its macros do.
+    public static func made(_ food: Ingredient) -> Bool {
+        guard case .whole(let kcal, let proteinG) = food.quantity, !food.estimated,
+            let carbsG = food.carbsG, let fatG = food.fatG
+        else { return false }
+        return abs(kcal - Self.kcal(proteinG: proteinG, carbsG: carbsG, fatG: fatG)) < 0.005
     }
 }
 

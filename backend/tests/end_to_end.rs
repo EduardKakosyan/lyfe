@@ -81,6 +81,7 @@ async fn harness_at(pool: PgPool, now: &str, with_key: bool) -> Harness {
             min_duration_s: 15.0 * 60.0,
         }),
         breath_rules: Arc::new(lyfe_server::routines::breath::BreathRules::default()),
+        study_rules: Arc::new(lyfe_server::routines::study::StudyRules::default()),
         // Kilograms here; pounds, the default, have their own test.
         weight: lyfe_server::routines::weight::WeightSettings {
             unit: lyfe_server::routines::weight::Unit::Kg,
@@ -90,6 +91,7 @@ async fn harness_at(pool: PgPool, now: &str, with_key: bool) -> Harness {
         estimate_range_pct: 35,
         estimator_wake: Arc::new(tokio::sync::Notify::new()),
         illustrator_wake: Arc::new(tokio::sync::Notify::new()),
+        food_icons: true,
         money: Arc::new(lyfe_server::money::sync::Importer::new(pool.clone(), None, chrono_tz::America::Puerto_Rico, 180, 14)),
         money_currency: None,
         now: Arc::new(move || now),
@@ -727,6 +729,7 @@ fn notifier(h: &Harness, apple: &MockServer) -> Notifier {
         default_environment: Environment::Development,
         timezone: h.state.timezone,
         gym_rules: h.state.gym_rules.clone(),
+        study_rules: h.state.study_rules.clone(),
         from_hour: 7,
         until_hour: 18,
         weight: h.state.weight,
@@ -1346,6 +1349,459 @@ async fn when_both_routines_need_today_each_gets_its_own_prompt(pool: PgPool) {
     assert_eq!(sent(notifier.tick(at("2026-11-21T12:05:00Z")).await.unwrap()), "Breath: 2 more by Sunday");
     assert_eq!(notifier.tick(at("2026-11-21T12:10:00Z")).await.unwrap(), Outcome::AlreadySent);
     assert_eq!(apple.received_requests().await.unwrap().len(), 2);
+}
+
+// --- Study sessions ------------------------------------------------------
+
+/// A study session as the phone sends it: `minutes` on the timer from
+/// `started_at`, with no pause.
+fn study_session(n: u32, started_at: &str, minutes: i64, subject: &str, kind: &str) -> Value {
+    let ended_at = at(started_at) + chrono::Duration::minutes(minutes);
+    json!({
+        "id": format!("00000000-0000-4000-a000-{n:012}"),
+        "started_at": started_at,
+        "ended_at": ended_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "active_s": minutes * 60,
+        "subject": subject,
+        "kind": kind,
+    })
+}
+
+impl Harness {
+    async fn record_study(&self, token: &str, session: Value) -> Value {
+        let (status, body) = self.post("/v1/study/sessions", Some(token), Some(session)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body
+    }
+
+    /// Four 50-minute evenings (Monday to Thursday) in each week starting
+    /// on the given Mondays.
+    async fn study_weeks(&self, token: &str, mondays: &[&str]) {
+        for (week, monday) in mondays.iter().enumerate() {
+            for day in 0..4 {
+                let date: chrono::NaiveDate = monday.parse().unwrap();
+                let started_at = format!("{}T23:00:00Z", date + chrono::Duration::days(day));
+                let n = 1000 + (week * 10) as u32 + day as u32;
+                self.record_study(token, study_session(n, &started_at, 50, "System design", "questions")).await;
+            }
+        }
+    }
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_study_session_counts_once_its_timer_passes_the_minimum(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+
+    let (_, before) = h.get("/v1/home", Some(&token)).await;
+    let study = &before["study"];
+    assert_eq!((&study["target"], &study["done"], &study["remaining"]), (&json!(4), &json!(0), &json!(4)));
+    assert_eq!(study["streak"]["state"], "not_started");
+    assert_eq!(study["subjects"], json!([]));
+    assert_eq!(
+        study["rules"],
+        json!({"min_minutes": 45, "target_minutes": 90, "builds_per_week": 2, "stop_after_minutes": 180})
+    );
+
+    // Thirty minutes this morning does not count; ninety-two this evening
+    // (Monday 19:00 in San Juan is Monday 23:00 UTC) on the day before.
+    let short = h
+        .record_study(&token, study_session(1, "2026-11-17T12:00:00Z", 30, "System design", "reading"))
+        .await;
+    assert_eq!((&short["study"]["done"], &short["study"]["done_today"]), (&json!(0), &json!(false)));
+    assert_eq!(short["study"]["sessions"][0]["not_counted"], "short");
+
+    let mut questions = study_session(2, "2026-11-16T23:00:00Z", 92, "  system   DESIGN ", "questions");
+    questions["answered"] = json!(12);
+    questions["right_first"] = json!(8);
+    let after = h.record_study(&token, questions.clone()).await;
+    let study = &after["study"];
+    assert_eq!((&study["done"], &study["remaining"], &study["done_today"]), (&json!(1), &json!(3), &json!(false)));
+    assert_eq!(study["minutes"], 122);
+    let first = &study["sessions"][0];
+    assert_eq!((&first["date"], &first["minutes"], &first["counts"]), (&json!("2026-11-16"), &json!(92), &json!(true)));
+    assert_eq!((&first["answered"], &first["right_first"]), (&json!(12), &json!(8)));
+    // The name typed differently is the same subject, kept as first typed.
+    assert_eq!(study["subjects"].as_array().unwrap().len(), 1);
+    assert_eq!(study["subjects"][0]["name"], "System design");
+    assert_eq!((&study["subjects"][0]["minutes"], &study["subjects"][0]["sessions"]), (&json!(122), &json!(2)));
+
+    // Sent again, even changed, it is the same session.
+    let mut altered = questions;
+    altered["active_s"] = json!(10);
+    altered["subject"] = json!("Something else");
+    let again = h.record_study(&token, altered).await;
+    assert_eq!(again["study"], after["study"]);
+    let subjects: i64 = sqlx::query_scalar("select count(*) from study_subjects")
+        .fetch_one(&h.state.pool)
+        .await
+        .unwrap();
+    assert_eq!(subjects, 1);
+    // The gym and breath training are untouched by it.
+    assert_eq!((&after["gym"]["done"], &after["breath"]["done"]), (&json!(0), &json!(0)));
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_build_session_counts_with_its_explain_back_and_two_a_week(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+
+    let unexplained = h
+        .record_study(&token, study_session(1, "2026-11-16T12:00:00Z", 120, "lyfe", "build"))
+        .await;
+    assert_eq!(unexplained["study"]["sessions"][0]["not_counted"], "not_explained");
+    assert_eq!(unexplained["study"]["done"], 0);
+
+    for (n, day) in [(2, "2026-11-16T22:00:00Z"), (3, "2026-11-17T12:00:00Z"), (4, "2026-11-17T13:00:00Z")] {
+        let mut build = study_session(n, day, 60, "lyfe", "build");
+        build["explain_back"] = json!("  The study timer, worked out from the clock so a locked phone cannot stop it.  ");
+        h.record_study(&token, build).await;
+    }
+    let (_, home) = h.get("/v1/home", Some(&token)).await;
+    let study = &home["study"];
+    // Monday's second and Tuesday's first count; Tuesday's second is a third.
+    assert_eq!((&study["builds"], &study["done"]), (&json!(2), &json!(2)));
+    let marks: Vec<&Value> = study["sessions"].as_array().unwrap().iter().map(|s| &s["not_counted"]).collect();
+    assert_eq!(marks, [&json!("not_explained"), &Value::Null, &Value::Null, &json!("builds_used")]);
+    let kept: String = sqlx::query_scalar("select explain_back from study_sessions where kind = 'build' and explain_back is not null limit 1")
+        .fetch_one(&h.state.pool)
+        .await
+        .unwrap();
+    assert!(kept.starts_with("The study timer"), "{kept}");
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_study_session_that_makes_no_sense_is_refused(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    let good = study_session(1, "2026-11-17T12:00:00Z", 60, "System design", "questions");
+
+    let (status, _) = h.post("/v1/study/sessions", None, Some(good.clone())).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let with = |field: &str, value: Value| {
+        let mut bad = good.clone();
+        bad[field] = value;
+        bad
+    };
+    let bads = [
+        with("ended_at", json!("2026-11-17T11:00:00Z")),
+        with("active_s", json!(3661 + 60)),
+        with("subject", json!("   ")),
+        with("subject", json!("x".repeat(61))),
+        with("kind", json!("nap")),
+        with("answered", json!(1001)),
+        with("right_first", json!(3)),
+        with("ended_at", json!("2026-11-18T13:00:00Z")),
+        with("started_at", json!("2026-11-19T12:00:00Z")),
+        with("explain_back", json!("x".repeat(4001))),
+    ];
+    for bad in bads {
+        let (status, body) = h.post("/v1/study/sessions", Some(&token), Some(bad.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad} {body}");
+    }
+    let mut more_right = good.clone();
+    more_right["answered"] = json!(5);
+    more_right["right_first"] = json!(6);
+    let (status, _) = h.post("/v1/study/sessions", Some(&token), Some(more_right)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (_, home) = h.get("/v1/home", Some(&token)).await;
+    assert_eq!(home["study"]["sessions"], json!([]));
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn study_weeks_build_a_streak_and_prompt_when_every_day_is_needed(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    register_device(&h, &token).await;
+    // Weeks 45 and 46 kept, Monday and Tuesday of week 47 done.
+    h.study_weeks(&token, &["2026-11-02", "2026-11-09"]).await;
+    for (n, day) in [(1, "2026-11-16T23:00:00Z"), (2, "2026-11-17T23:00:00Z")] {
+        h.record_study(&token, study_session(n, day, 50, "System design", "questions")).await;
+    }
+    let (_, home) = h.get("/v1/home", Some(&token)).await;
+    assert_eq!((&home["study"]["streak"]["weeks"], &home["study"]["streak"]["state"]), (&json!(2), &json!("on_track")));
+    let apple = MockServer::start().await;
+    apple_answers(&apple, "dev", 200, None).await;
+    let notifier = notifier(&h, &apple);
+
+    // Friday 08:00 in San Juan: three days left for two sessions.
+    assert_eq!(notifier.tick(at("2026-11-20T12:00:00Z")).await.unwrap(), Outcome::NothingDue);
+    // Saturday 08:00: today and Sunday are both needed.
+    assert_eq!(
+        notifier.tick(at("2026-11-21T12:00:00Z")).await.unwrap(),
+        Outcome::Sent {
+            title: "Study: 2 more by Sunday".into(),
+            body: "Study today to keep your 2-week streak. It takes every day left this week.".into(),
+            devices: 1,
+        }
+    );
+    assert_eq!(notifier.tick(at("2026-11-21T12:05:00Z")).await.unwrap(), Outcome::AlreadySent);
+    let requests = apple.received_requests().await.unwrap();
+    assert_eq!(requests[0].headers.get("apns-collapse-id").unwrap(), "study_train_today");
+}
+
+// --- Goals ---------------------------------------------------------------
+
+fn goal_id(n: u32) -> String {
+    format!("00000000-0000-4000-c000-{n:012}")
+}
+
+impl Harness {
+    async fn set_goal(&self, token: &str, n: u32, body: Value) -> Value {
+        let (status, answer) = self.put(&format!("/v1/goals/{}", goal_id(n)), Some(token), body).await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        answer
+    }
+
+    async fn goal_status(&self, token: &str, n: u32, status: &str) -> (StatusCode, Value) {
+        self.post(&format!("/v1/goals/{}/status", goal_id(n)), Some(token), Some(json!({ "status": status }))).await
+    }
+}
+
+fn goal_in<'a>(home: &'a Value, n: u32) -> &'a Value {
+    home["goals"]["goals"].as_array().unwrap().iter().find(|g| g["id"] == goal_id(n)).unwrap()
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_study_goal_moves_as_sessions_on_its_subject_are_timed(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    let (_, before) = h.get("/v1/home", Some(&token)).await;
+    assert_eq!(before["goals"], json!({"limit": 3, "goals": []}));
+
+    // Eighty hours on one subject by 4 January.
+    let home = h
+        .set_goal(&token, 1, json!({"reading": "study_minutes", "subject": "cloud certification", "target_value": 4800, "due_on": "2027-01-04"}))
+        .await;
+    let goal = goal_in(&home, 1);
+    assert_eq!((&goal["title"], &goal["shape"], &goal["status"]), (&json!("Study · cloud certification"), &json!("total"), &json!("active")));
+    assert_eq!((&goal["start_on"], &goal["start_value"], &goal["moved_by"]), (&json!("2026-11-17"), &json!(0.0), &json!("study")));
+    assert_eq!(goal["standing"]["current"], 0.0);
+    assert_eq!(goal["days_left"], 48);
+
+    // A session on it moves it; one on another subject does not.
+    h.record_study(&token, study_session(1, "2026-11-17T12:00:00Z", 92, "Cloud Certification", "questions")).await;
+    let after = h.record_study(&token, study_session(2, "2026-11-17T14:00:00Z", 50, "System design", "reading")).await;
+    let standing = &goal_in(&after, 1)["standing"];
+    assert_eq!(standing["current"], 92.0);
+    assert_eq!(standing["reached"], false);
+    // The subject named in the goal is the one sessions found by name.
+    assert_eq!(after["study"]["subjects"].as_array().unwrap().len(), 2);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_hold_goal_starts_at_the_best_hold_and_a_weight_goal_needs_a_weight(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    h.record_breath(&token, breath_session(1, "2026-11-16T14:30:00Z", 240, GOOD_HOLDS)).await;
+    let home = h
+        .set_goal(&token, 1, json!({"title": "Three-minute hold", "reading": "breath_hold", "target_value": 180, "due_on": "2027-06-01"}))
+        .await;
+    let goal = goal_in(&home, 1);
+    assert_eq!((&goal["start_value"], &goal["standing"]["current"]), (&json!(132.0), &json!(132.0)));
+    assert_eq!((&goal["shape"], &goal["moved_by"]), (&json!("reach"), &json!("breath")));
+    assert_eq!(goal["standing"]["ahead_by"], 0.0);
+
+    let (status, body) = h
+        .put(&format!("/v1/goals/{}", goal_id(2)), Some(&token), json!({"reading": "weight", "target_value": 78000, "due_on": "2027-06-01"}))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["detail"], "lyfe has no reading of that yet");
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn three_goals_are_active_and_changes_are_kept(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    for n in 1..=4 {
+        h.set_goal(&token, n, json!({"reading": "study_minutes", "target_value": 600 * n, "due_on": "2027-03-01"})).await;
+    }
+    let (_, home) = h.get("/v1/home", Some(&token)).await;
+    let statuses: Vec<&Value> = (1..=4).map(|n| &goal_in(&home, n)["status"]).collect();
+    assert_eq!(statuses, [&json!("active"), &json!("active"), &json!("active"), &json!("parked")]);
+
+    // A fourth cannot be made active until one is parked.
+    let (status, body) = h.goal_status(&token, 4, "active").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(h.goal_status(&token, 1, "parked").await.0, StatusCode::OK);
+    let (status, home) = h.goal_status(&token, 4, "active").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(goal_in(&home, 4)["status"], "active");
+
+    // Moving the figure and the date keeps what they were; sending the same
+    // again changes nothing.
+    let moved = json!({"target_value": 900, "due_on": "2027-04-01"});
+    h.set_goal(&token, 2, moved.clone()).await;
+    let home = h.set_goal(&token, 2, moved).await;
+    let changes = &goal_in(&home, 2)["changes"];
+    assert_eq!(
+        changes,
+        &json!([
+            {"on": "2026-11-17", "what": "target", "was": "1200", "now": "900"},
+            {"on": "2026-11-17", "what": "due", "was": "2027-03-01", "now": "2027-04-01"}
+        ])
+    );
+    assert_eq!(goal_in(&home, 2)["start_on"], "2026-11-17");
+
+    // Dropped, with a line why: kept, ended today, and last in the list.
+    let (status, home) = h
+        .post(&format!("/v1/goals/{}/status", goal_id(3)), Some(&token), Some(json!({"status": "dropped", "note": "  Not this year. "})))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let dropped = goal_in(&home, 3);
+    assert_eq!((&dropped["status"], &dropped["ended_on"], &dropped["note"]), (&json!("dropped"), &json!("2026-11-17"), &json!("Not this year.")));
+    assert_eq!(home["goals"]["goals"].as_array().unwrap().last().unwrap()["id"], goal_id(3));
+    // A goal can be taken up again.
+    let (_, home) = h.goal_status(&token, 3, "parked").await;
+    assert_eq!((&goal_in(&home, 3)["status"], &goal_in(&home, 3)["ended_on"]), (&json!("parked"), &Value::Null));
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_goal_that_makes_no_sense_is_refused(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    let uri = format!("/v1/goals/{}", goal_id(1));
+    let (status, _) = h.put(&uri, None, json!({"reading": "study_minutes", "target_value": 600, "due_on": "2027-01-04"})).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    for bad in [
+        json!({"reading": "study_minutes", "target_value": 600, "due_on": "2026-11-17"}),
+        json!({"reading": "study_minutes", "target_value": 600, "due_on": "2037-01-04"}),
+        json!({"reading": "study_minutes", "target_value": 10, "due_on": "2027-01-04"}),
+        json!({"reading": "net_worth", "target_value": 600, "due_on": "2027-01-04"}),
+        json!({"reading": "breath_hold", "subject": "Breath", "target_value": 180, "due_on": "2027-01-04"}),
+        json!({"reading": "breath_hold", "target_value": 5000, "due_on": "2027-01-04"}),
+        json!({"title": "   ", "reading": "study_minutes", "target_value": 600, "due_on": "2027-01-04"}),
+        json!({"target_value": 600, "due_on": "2027-01-04"}),
+    ] {
+        let (status, body) = h.put(&uri, Some(&token), bad.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad} {body}");
+    }
+    h.set_goal(&token, 1, json!({"reading": "study_minutes", "target_value": 600, "due_on": "2027-01-04"})).await;
+    let (status, _) = h.put(&uri, Some(&token), json!({"reading": "breath_hold", "target_value": 180, "due_on": "2027-01-04"})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = h.goal_status(&token, 9, "parked").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = h.goal_status(&token, 1, "won").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+fn an_exam() -> Value {
+    json!({
+        "name": "Solutions  architect",
+        "scale_max": 1000,
+        "pass_mark": 720,
+        "ready_margin": 30,
+        "ready_runs": 3,
+        "valid_months": 36,
+        "domains": [
+            {"name": "Secure", "weight_pct": 30},
+            {"name": "Resilient", "weight_pct": 26},
+            {"name": "High-performing", "weight_pct": 24},
+            {"name": "Cost-optimized", "weight_pct": 20}
+        ]
+    })
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn an_exam_is_got_ready_for_with_practice_scores_and_ended_by_its_result(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    let home = h
+        .set_goal(&token, 1, json!({"reading": "exam", "subject": "Cloud certification", "due_on": "2027-01-04", "exam": an_exam()}))
+        .await;
+    let goal = goal_in(&home, 1);
+    assert_eq!((&goal["title"], &goal["shape"], &goal["moved_by"]), (&json!("Solutions architect"), &json!("result"), &json!("study")));
+    assert_eq!((&goal["target_value"], &goal["standing"]), (&json!(720.0), &Value::Null));
+    let exam = &goal["exam"];
+    assert_eq!((&exam["ready_at"], &exam["in_a_row"], &exam["ready"]), (&json!(750), &json!(0), &json!(false)));
+    assert_eq!(exam["domains"].as_array().unwrap().len(), 4);
+
+    // Study on its subject counts toward it.
+    h.record_study(&token, study_session(1, "2026-11-17T12:00:00Z", 92, "cloud certification", "questions")).await;
+
+    let score = |n: u32, day: &str, score: u32, domains: Value| {
+        json!({"id": format!("00000000-0000-4000-d000-{n:012}"), "taken_on": day, "score": score, "domains": domains})
+    };
+    let uri = format!("/v1/goals/{}/scores", goal_id(1));
+    for (n, day, points) in [(1, "2026-11-10", 640), (2, "2026-11-13", 760), (3, "2026-11-15", 755)] {
+        let (status, body) = h.post(&uri, Some(&token), Some(score(n, day, points, json!([])))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let last = score(4, "2026-11-17", 790, json!([{"name": "secure", "pct": 78}, {"name": "Resilient", "pct": 64}]));
+    let (_, home) = h.post(&uri, Some(&token), Some(last.clone())).await;
+    // Sent again, it is kept once.
+    let (_, again) = h.post(&uri, Some(&token), Some(last)).await;
+    assert_eq!(goal_in(&again, 1), goal_in(&home, 1));
+    let exam = &goal_in(&home, 1)["exam"];
+    assert_eq!((&exam["in_a_row"], &exam["ready"]), (&json!(3), &json!(true)));
+    assert_eq!(exam["practice"].as_array().unwrap().len(), 4);
+    assert_eq!(exam["domains"][0]["latest_pct"], 78);
+    assert_eq!(exam["weakest"], "Resilient");
+    assert_eq!(exam["minutes"], 92);
+
+    for bad in [
+        score(5, "2026-11-18", 700, json!([])),
+        score(6, "2026-11-16", 1001, json!([])),
+        score(7, "2026-11-16", 700, json!([{"name": "Networking", "pct": 50}])),
+        score(8, "2026-11-16", 700, json!([{"name": "Secure", "pct": 101}])),
+    ] {
+        let (status, body) = h.post(&uri, Some(&token), Some(bad.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad} {body}");
+    }
+
+    // Not passed the first time: still active, and its date moved by the owner.
+    let result = format!("/v1/goals/{}/result", goal_id(1));
+    let (status, home) = h.post(&result, Some(&token), Some(json!({"outcome": "failed", "on": "2026-11-16", "score": 701}))).await;
+    assert_eq!(status, StatusCode::OK, "{home}");
+    assert_eq!(goal_in(&home, 1)["status"], "active");
+    assert_eq!(goal_in(&home, 1)["exam"]["result"], json!({"outcome": "failed", "on": "2026-11-16", "score": 701}));
+    // Passed: reached, and valid for three years from the day.
+    let (_, home) = h.post(&result, Some(&token), Some(json!({"outcome": "passed", "on": "2026-11-17", "score": 801}))).await;
+    let goal = goal_in(&home, 1);
+    assert_eq!((&goal["status"], &goal["ended_on"]), (&json!("reached"), &json!("2026-11-17")));
+    assert_eq!(goal["exam"]["expires_on"], "2029-11-17");
+    assert_eq!(goal["changes"].as_array().unwrap().last().unwrap()["now"], "reached");
+
+    // A figure goal has no practice or result.
+    h.set_goal(&token, 2, json!({"reading": "study_minutes", "target_value": 600, "due_on": "2027-01-04"})).await;
+    let (status, _) = h.post(&format!("/v1/goals/{}/scores", goal_id(2)), Some(&token), Some(score(9, "2026-11-16", 700, json!([])))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn an_exam_that_does_not_hang_together_is_refused(pool: PgPool) {
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    let uri = format!("/v1/goals/{}", goal_id(1));
+    let with = |field: &str, value: Value| {
+        let mut exam = an_exam();
+        exam[field] = value;
+        json!({"reading": "exam", "due_on": "2027-01-04", "exam": exam})
+    };
+    for bad in [
+        with("pass_mark", json!(990)),
+        with("name", json!("  ")),
+        with("ready_runs", json!(0)),
+        with("domains", json!([{"name": "Secure", "weight_pct": 30}, {"name": "secure", "weight_pct": 20}])),
+        json!({"reading": "exam", "due_on": "2027-01-04"}),
+        json!({"reading": "study_minutes", "target_value": 600, "due_on": "2027-01-04", "exam": an_exam()}),
+    ] {
+        let (status, body) = h.put(&uri, Some(&token), bad.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad} {body}");
+    }
+    // Its pass mark and parts can be changed once set, keeping practice.
+    h.set_goal(&token, 1, json!({"reading": "exam", "due_on": "2027-01-04", "exam": an_exam()})).await;
+    let mut changed = an_exam();
+    changed["pass_mark"] = json!(700);
+    changed["domains"] = json!([{"name": "Everything", "weight_pct": 100}]);
+    let home = h.set_goal(&token, 1, json!({"due_on": "2027-02-01", "exam": changed})).await;
+    let goal = goal_in(&home, 1);
+    assert_eq!((&goal["target_value"], &goal["exam"]["pass_mark"]), (&json!(700.0), &json!(700)));
+    assert_eq!(goal["exam"]["domains"][0]["name"], "Everything");
+    let whats: Vec<&Value> = goal["changes"].as_array().unwrap().iter().map(|c| &c["what"]).collect();
+    assert_eq!(whats, [&json!("target"), &json!("due")]);
 }
 
 // --- Weigh-ins -----------------------------------------------------------
@@ -2872,7 +3328,18 @@ impl Drawer {
 impl Harness {
     /// The illustration of meal number `entry`: its status and the bytes.
     async fn illustration(&self, token: Option<&str>, entry: u32) -> (StatusCode, Option<String>, Vec<u8>) {
-        let mut request = Request::get(format!("/v1/food/entries/{}/illustration", food_id(entry)));
+        self.picture(token, &format!("/v1/food/entries/{}/illustration", food_id(entry))).await
+    }
+
+    /// The icon of the food called `name`, percent-encoded as the app sends
+    /// it: its status and the bytes.
+    async fn icon(&self, token: Option<&str>, name: &str) -> (StatusCode, Option<String>, Vec<u8>) {
+        self.picture(token, &format!("/v1/food/icons?name={name}")).await
+    }
+
+    /// A picture the API serves: its status, kind and bytes.
+    async fn picture(&self, token: Option<&str>, uri: &str) -> (StatusCode, Option<String>, Vec<u8>) {
+        let mut request = Request::get(uri);
         if let Some(token) = token {
             request = request.header("Authorization", format!("Bearer {token}"));
         }
@@ -3141,6 +3608,235 @@ async fn a_photo_drawn_in_an_older_look_is_drawn_again(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(look, lyfe_server::routines::illustration::LOOK);
+}
+
+// --- Migrations ------------------------------------------------------------
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_database_that_ran_the_reworded_migration_is_still_brought_up_to_date(pool: PgPool) {
+    // As the Spark's database is: migration 13 run in its earlier wording.
+    let earlier = sqlx::query("update _sqlx_migrations set checksum = '\\x0013'::bytea where version = 13")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(earlier.rows_affected(), 1);
+    assert!(lyfe_server::db::MIGRATOR.run(&pool).await.is_err(), "sqlx alone refuses it");
+    lyfe_server::db::migrate(&pool).await.unwrap();
+    lyfe_server::db::MIGRATOR.run(&pool).await.unwrap();
+    // What it made is gone either way, which is why the wording is not held to.
+    let left: i64 = sqlx::query_scalar("select count(*) from information_schema.tables where table_name like 'plaid%'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
+
+    // Any other migration changed after it ran is still refused.
+    sqlx::query("update _sqlx_migrations set checksum = '\\x0012'::bytea where version = 12").execute(&pool).await.unwrap();
+    assert!(lyfe_server::db::migrate(&pool).await.is_err());
+}
+
+// --- Food icons -----------------------------------------------------------
+
+/// Brings every icon's next try forward to now.
+async fn icons_due(pool: &PgPool) {
+    sqlx::query("update food_icons set due_at = now() where due_at is not null").execute(pool).await.unwrap();
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_foods_icon_is_drawn_from_its_name_the_first_time_it_is_asked_for(pool: PgPool) {
+    use lyfe_server::illustrator::Outcome;
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    let drawer = Drawer::start(&h, 72, &[]).await;
+
+    // The day says which look icons are in, so the phone knows what to keep.
+    let (_, home) = h.get("/v1/home", Some(&token)).await;
+    assert_eq!(home["food"]["icon_look"], lyfe_server::routines::illustration::ICON_LOOK);
+
+    // Nothing is drawn until the phone asks. Asking queues it, wakes the
+    // illustrator and says to come back.
+    assert_eq!(drawer.draw().await, Outcome::Idle);
+    assert_eq!(h.icon(None, "Potato,%20baked").await.0, StatusCode::UNAUTHORIZED);
+    let woken = || tokio::time::timeout(std::time::Duration::from_millis(50), h.state.illustrator_wake.notified());
+    assert!(woken().await.is_err());
+    let (status, kind, body) = h.icon(Some(&token), "Potato,%20baked").await;
+    assert_eq!((status, kind.as_deref()), (StatusCode::ACCEPTED, Some("application/json")));
+    assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), json!({ "state": "waiting" }));
+    assert!(woken().await.is_ok());
+    // Asked again, however it is spelled, it is still the one icon.
+    assert_eq!(h.icon(Some(&token), "%20potato,%20%20BAKED").await.0, StatusCode::ACCEPTED);
+    let queued: i64 = sqlx::query_scalar("select count(*) from food_icons").fetch_one(&h.state.pool).await.unwrap();
+    assert_eq!(queued, 1);
+
+    // Drawn from the name alone: there is no photo to send.
+    assert_eq!(drawer.draw().await, Outcome::Drew(1));
+    assert_eq!(drawer.draw().await, Outcome::Idle);
+    let asked = drawer.asked();
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0]["jpeg"], Value::Null);
+    let prompt = asked[0]["prompt"].as_str().unwrap();
+    assert_eq!(prompt, lyfe_server::routines::illustration::icon_prompt("Potato, baked"));
+    assert!(prompt.starts_with("Flat vector illustration of a serving of Potato, baked,"), "{prompt}");
+
+    // From then on it is there, and drawn once.
+    let (status, kind, png) = h.icon(Some(&token), "Potato,%20baked").await;
+    assert_eq!((status, kind.as_deref()), (StatusCode::OK, Some("image/png")));
+    assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert_eq!(drawer.draw().await, Outcome::Idle);
+    assert_eq!(drawer.asked().len(), 1);
+
+    // A name no food has is refused, and queues nothing.
+    assert_eq!(h.icon(Some(&token), "%20").await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(h.icon(Some(&token), &"x".repeat(81)).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(h.get("/v1/food/icons", Some(&token)).await.0, StatusCode::BAD_REQUEST);
+    let queued: i64 = sqlx::query_scalar("select count(*) from food_icons").fetch_one(&h.state.pool).await.unwrap();
+    assert_eq!(queued, 1);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn meal_photos_are_drawn_before_icons_and_the_icon_asked_for_latest_first(pool: PgPool) {
+    use lyfe_server::illustrator::Outcome;
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    let model = Model::start(&h, 72).await;
+    model.answers(STIR_FRY).await;
+
+    h.icon(Some(&token), "Carrot,%20raw").await;
+    h.icon(Some(&token), "Tomato,%20raw").await;
+    h.log_photo(&token, 21, "2026-11-17T16:00:00Z", "lunch", "pho").await;
+    model.estimate().await;
+    // Scrolled back to: the carrot is the one being looked at now.
+    sqlx::query("update food_icons set asked_at = asked_at - interval '1 minute'").execute(&h.state.pool).await.unwrap();
+    h.icon(Some(&token), "Carrot,%20raw").await;
+
+    // One load of the model draws all three.
+    let drawer = Drawer::start(&h, 72, &[]).await;
+    assert_eq!(drawer.draw().await, Outcome::Drew(3));
+    let asked = drawer.asked();
+    let order: Vec<&str> = asked.iter().map(|one| one["prompt"].as_str().unwrap().split(',').next().unwrap()).collect();
+    assert_eq!(order, ["Redraw this photo of pho as a bold flat graphic illustration with thick black ink outlines and flat colour fills", "Flat vector illustration of a serving of Carrot", "Flat vector illustration of a serving of Tomato"]);
+    assert!(asked[0]["jpeg"].is_string());
+    assert_eq!((&asked[1]["jpeg"], &asked[2]["jpeg"]), (&Value::Null, &Value::Null));
+    assert_eq!(h.illustration(Some(&token), 21).await.0, StatusCode::OK);
+    assert_eq!(h.icon(Some(&token), "Tomato,%20raw").await.0, StatusCode::OK);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn an_icon_waits_for_the_spark_and_one_that_will_not_draw_is_given_up_on(pool: PgPool) {
+    use lyfe_server::illustrator::Outcome;
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    h.icon(Some(&token), "Almonds").await;
+
+    // A busy Spark is not the icon's fault: it waits, and is drawn later.
+    let busy = Drawer::start(&h, 12, &[]).await;
+    for _ in 0..5 {
+        icons_due(&h.state.pool).await;
+        let Outcome::PutOff(why) = busy.draw().await else { panic!("not put off") };
+        assert_eq!(why, "The Spark is busy: 12 GB free, and the illustrator needs 24.");
+    }
+    assert_eq!(busy.draw().await, Outcome::Idle);
+    assert_eq!(h.icon(Some(&token), "Almonds").await.0, StatusCode::ACCEPTED);
+
+    // The model cannot draw it: three tries, then not again in this look.
+    let failing = Drawer::start(&h, 72, &["--cannot-draw"]).await;
+    for _ in 0..3 {
+        icons_due(&h.state.pool).await;
+        assert_eq!(failing.draw().await, Outcome::Drew(0));
+    }
+    assert_eq!(failing.asked().len(), 3);
+    icons_due(&h.state.pool).await;
+    assert_eq!(failing.draw().await, Outcome::Idle);
+    let (problem, tries): (Option<String>, i32) =
+        sqlx::query_as("select problem, tries from food_icons").fetch_one(&h.state.pool).await.unwrap();
+    assert_eq!(problem.as_deref(), Some("The illustrator could not draw it: cannot identify image file (stand-in)."));
+    assert_eq!(tries, 3);
+    // The phone is told there is none, and asking does not queue it again.
+    assert_eq!(h.icon(Some(&token), "Almonds").await.0, StatusCode::NOT_FOUND);
+    assert_eq!(Drawer::start(&h, 72, &[]).await.draw().await, Outcome::Idle);
+
+    // A program that dies on an icon is counted against that icon too.
+    h.icon(Some(&token), "Butter").await;
+    let dying = Drawer::start(&h, 72, &["--exit-on-draw"]).await;
+    assert_eq!(dying.draw().await, Outcome::Drew(0));
+    let tries: i32 = sqlx::query_scalar("select tries from food_icons where key = 'butter'").fetch_one(&h.state.pool).await.unwrap();
+    assert_eq!(tries, 1);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn an_icon_from_an_older_look_is_drawn_again_when_it_is_next_asked_for(pool: PgPool) {
+    use lyfe_server::illustrator::Outcome;
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    let drawer = Drawer::start(&h, 72, &[]).await;
+    h.icon(Some(&token), "Almonds").await;
+    h.icon(Some(&token), "Butter").await;
+    assert_eq!(drawer.draw().await, Outcome::Drew(2));
+
+    // As if both had been drawn in a look before this one.
+    sqlx::query("update food_icons set look = 0, png = '\\x89504e470d0a1a0a6f6c64'::bytea").execute(&h.state.pool).await.unwrap();
+    // Nothing is drawn again until it is wanted: the catalogue is large.
+    assert_eq!(drawer.draw().await, Outcome::Idle);
+    assert_eq!(h.icon(Some(&token), "Almonds").await.0, StatusCode::ACCEPTED);
+    assert_eq!(drawer.draw().await, Outcome::Drew(1));
+    let (status, _, png) = h.icon(Some(&token), "Almonds").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!png.ends_with(b"old"));
+    let looks: Vec<(String, i32)> = sqlx::query_as("select key, look from food_icons order by key").fetch_all(&h.state.pool).await.unwrap();
+    assert_eq!(looks, [("almonds".to_string(), lyfe_server::routines::illustration::ICON_LOOK), ("butter".to_string(), 0)]);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn icons_queued_ahead_are_drawn_in_order_after_any_the_phone_asks_for(pool: PgPool) {
+    use lyfe_server::db::{self, IconCounts};
+    use lyfe_server::illustrator::Outcome;
+    let h = harness(pool).await;
+    let token = h.signed_in().await;
+    let pool = &h.state.pool;
+
+    // The catalogue, queued before anyone has looked at it.
+    for (place, name) in ["roast chicken", "Potato, baked", "Almonds"].into_iter().enumerate() {
+        let key = lyfe_server::routines::illustration::icon_key(name).unwrap();
+        assert!(db::queue_food_icon(pool, &key, name, place as i64 + 1).await.unwrap());
+    }
+    assert_eq!(db::food_icon_counts(pool).await.unwrap(), IconCounts { drawn: 0, waiting: 3, given_up: 0 });
+    // Queued twice, it is still queued once, and keeps its place.
+    assert!(!db::queue_food_icon(pool, "almonds", "Almonds", 1).await.unwrap());
+    // The phone asks for one that is nowhere in the list, and one that is.
+    assert_eq!(h.icon(Some(&token), "Butter").await.0, StatusCode::ACCEPTED);
+    assert_eq!(h.icon(Some(&token), "Almonds").await.0, StatusCode::ACCEPTED);
+
+    let drawer = Drawer::start(&h, 72, &[]).await;
+    assert_eq!(drawer.draw().await, Outcome::Drew(4));
+    let asked = drawer.asked();
+    let order: Vec<&str> = asked
+        .iter()
+        .map(|one| one["prompt"].as_str().unwrap().trim_start_matches("Flat vector illustration of a serving of ").split(", as a simple").next().unwrap())
+        .collect();
+    assert_eq!(order, ["Almonds", "Butter", "roast chicken", "Potato, baked"]);
+    assert_eq!(db::food_icon_counts(pool).await.unwrap(), IconCounts { drawn: 4, waiting: 0, given_up: 0 });
+
+    // Already drawn: the phone has it at its first asking, and queuing the
+    // list again draws nothing twice.
+    assert_eq!(h.icon(Some(&token), "Potato,%20baked").await.0, StatusCode::OK);
+    assert!(!db::queue_food_icon(pool, "potato, baked", "Potato, baked", 2).await.unwrap());
+    assert_eq!(drawer.draw().await, Outcome::Idle);
+    // Until the look moves on, when it is queued again.
+    sqlx::query("update food_icons set look = 0 where key = 'butter'").execute(pool).await.unwrap();
+    assert!(db::queue_food_icon(pool, "butter", "Butter", 9).await.unwrap());
+    assert_eq!(db::food_icon_counts(pool).await.unwrap(), IconCounts { drawn: 3, waiting: 1, given_up: 0 });
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn a_server_that_draws_nothing_says_so_and_queues_nothing(pool: PgPool) {
+    let mut h = harness(pool).await;
+    h.state.food_icons = false;
+    let token = h.signed_in().await;
+    let (_, home) = h.get("/v1/home", Some(&token)).await;
+    assert_eq!(home["food"]["icon_look"], Value::Null);
+    assert_eq!(h.icon(Some(&token), "Almonds").await.0, StatusCode::NOT_FOUND);
+    let queued: i64 = sqlx::query_scalar("select count(*) from food_icons").fetch_one(&h.state.pool).await.unwrap();
+    assert_eq!(queued, 0);
 }
 
 // --- Money ---------------------------------------------------------------
@@ -3625,7 +4321,328 @@ async fn without_a_bank_the_server_still_answers(pool: PgPool) {
     let money = h.money(&token).await;
     assert_eq!((&money["source"]["state"], &money["entries"], &money["accounts"]), (&json!("not_configured"), &json!([]), &json!([])));
     assert_eq!((&money["spent_minor"], &money["problems"]), (&json!(0), &json!([])));
+    let worth = h.worth(&token).await;
+    assert_eq!((&worth["source"]["state"], &worth["accounts"], &worth["holdings"]), (&json!("not_configured"), &json!([]), &json!([])));
+    assert_eq!((&worth["worth_minor"], &worth["currency"]), (&json!(0), &json!("USD")));
+    assert_eq!(h.fire(&token).await["counted"], 0);
     assert!(h.state.money.import_once((h.state.now)()).await.is_none());
+}
+
+// --- Worth and the way to financial independence --------------------------
+
+fn holding(id: &str, symbol: &str, name: &str, shares: &str, value: &str, cost: &str) -> Value {
+    json!({"id": id, "created": noon("2026-11-17"), "currency": "CAD", "cost_basis": cost, "description": name,
+           "market_value": value, "purchase_price": "0.00", "shares": shares, "symbol": symbol})
+}
+
+fn with_holdings(mut account: Value, holdings: Value) -> Value {
+    account["holdings"] = holdings;
+    account
+}
+
+impl Harness {
+    async fn worth(&self, token: &str) -> Value {
+        let (status, body) = self.get("/v1/money/worth", Some(token)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body
+    }
+
+    async fn fire(&self, token: &str) -> Value {
+        let (status, body) = self.get("/v1/money/fire", Some(token)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body
+    }
+}
+
+fn account_named<'a>(view: &'a Value, name: &str) -> &'a Value {
+    view["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|account| account["name"] == name)
+        .unwrap_or_else(|| panic!("no account called {name} in {}", view["accounts"]))
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn what_the_investments_are_in_is_imported_and_added_up(pool: PgPool) {
+    let (h, bridge) = banked(pool).await;
+    let token = h.signed_in().await;
+    let (chequing, card) = chequing_and_card();
+    let everyday = || vec![bank_account("ACT-1", "Chequing", "2500.00", chequing.clone()), bank_account("ACT-2", "Card", "-120.00", card.clone())];
+    let world = holding("H1", "WRLD", "Whole World Equity Fund", "300.5", "15000.00", "12000.00");
+    let mut accounts = everyday();
+    accounts.extend([
+        // A savings account lists nothing: it is money in the bank.
+        with_holdings(bank_account("ACT-3", "Savings", "9000.00", vec![]), json!([])),
+        with_holdings(
+            bank_account("ACT-4", "Brokerage", "20000.00", vec![]),
+            json!([
+                world,
+                // The bank does not say what was paid for this one.
+                holding("H2", "BOND", "Bond Fund", "100", "4000.00", "0.00"),
+                // Worth nothing lyfe can read: counted and left out.
+                {"id": "H3", "symbol": "LOST", "shares": "3"},
+            ]),
+        ),
+        with_holdings(
+            bank_account("ACT-5", "Retirement", "6000.00", vec![]),
+            json!([holding("H1", "WRLD", "Whole World Equity Fund", "120", "6000.00", "5500.00")]),
+        ),
+    ]);
+    bridge_answers(&bridge, bridge_answer(accounts, json!([]))).await;
+    let report = h.import().await;
+    // Asked four times for the history; what is held is stored once.
+    assert_eq!((report.requests, report.accounts, report.holdings, report.unreadable), (4, 5, 3, 1));
+
+    let (status, _) = h.get("/v1/money/worth", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let worth = h.worth(&token).await;
+    assert_eq!(worth["currency"], "CAD");
+    // In the bank, invested, and owed on the card.
+    assert_eq!((&worth["banked_minor"], &worth["invested_minor"], &worth["owed_minor"]), (&json!(1150000), &json!(2600000), &json!(12000)));
+    assert_eq!(worth["worth_minor"], 1150000 + 2600000 - 12000);
+    // The accounts that list holdings were set aside from the start; the
+    // savings account waits for the owner to say so.
+    assert_eq!((&worth["everyday_minor"], &worth["set_aside_minor"]), (&json!(1138000), &json!(2600000)));
+    for (name, invested, set_aside) in [("Chequing", false, false), ("Savings", false, false), ("Brokerage", true, true), ("Retirement", true, true)] {
+        let account = account_named(&worth, name);
+        assert_eq!((&account["invested"], &account["set_aside"]), (&json!(invested), &json!(set_aside)), "{name}");
+    }
+    // The same fund in two accounts is one holding, largest first.
+    assert_eq!(
+        worth["holdings"],
+        json!([
+            {"symbol": "WRLD", "name": "Whole World Equity Fund", "currency": "CAD", "shares_micro": 420500000,
+             "value_minor": 2100000, "cost_minor": 1750000, "accounts": ["Brokerage", "Retirement"]},
+            {"symbol": "BOND", "name": "Bond Fund", "currency": "CAD", "shares_micro": 100000000,
+             "value_minor": 400000, "cost_minor": null, "accounts": ["Brokerage"]},
+        ])
+    );
+    // A thousand in the brokerage is in no holding; growth is said of the fund a cost is known for.
+    assert_eq!((&worth["held_minor"], &worth["loose_minor"]), (&json!(2500000), &json!(100000)));
+    assert_eq!(worth["paid"], json!({"paid_minor": 1750000, "worth_minor": 2100000, "holdings": 1}));
+    assert_eq!((&worth["problems"], &worth["source"]["state"]), (&json!([]), &json!("ok")));
+    // The month says which accounts are invested too.
+    assert_eq!(account_named(&h.money(&token).await, "Brokerage")["invested"], true);
+
+    // The bonds are sold and the fund moves. The retirement account comes
+    // without its list this time, which says nothing about what it holds.
+    let mut accounts = everyday();
+    accounts.extend([
+        with_holdings(bank_account("ACT-3", "Savings", "9000.00", vec![]), json!([])),
+        with_holdings(
+            bank_account("ACT-4", "Brokerage", "20500.00", vec![]),
+            json!([holding("H1", "WRLD", "Whole World Equity Fund", "400", "20500.00", "16000.00")]),
+        ),
+        bank_account("ACT-5", "Retirement", "6100.00", vec![]),
+    ]);
+    bridge_answers(&bridge, bridge_answer(accounts, json!([]))).await;
+    let report = h.import().await;
+    assert_eq!((report.requests, report.holdings, report.unreadable), (1, 1, 0));
+    let worth = h.worth(&token).await;
+    assert_eq!(
+        worth["holdings"],
+        json!([{"symbol": "WRLD", "name": "Whole World Equity Fund", "currency": "CAD", "shares_micro": 520000000,
+                "value_minor": 2650000, "cost_minor": 2150000, "accounts": ["Brokerage", "Retirement"]}])
+    );
+    assert_eq!((&worth["invested_minor"], &worth["loose_minor"]), (&json!(2660000), &json!(10000)));
+    assert_eq!(account_named(&worth, "Retirement")["invested"], true);
+
+    // Everything in the brokerage sold: it holds nothing and is money in
+    // the bank again, and stays set aside until the owner says otherwise.
+    // The savings account was closed, and the bank no longer lists it.
+    let mut accounts = everyday();
+    accounts.extend([
+        with_holdings(bank_account("ACT-4", "Brokerage", "20500.00", vec![]), json!([])),
+        bank_account("ACT-5", "Retirement", "6100.00", vec![]),
+    ]);
+    bridge_answers(&bridge, bridge_answer(accounts, json!([]))).await;
+    // (An account is seen by the database's clock: the closed one is put an import back.)
+    sqlx::query("update money_accounts set seen_at = now() - interval '6 hours' where name = 'Savings'")
+        .execute(&h.state.pool)
+        .await
+        .unwrap();
+    h.import().await;
+    let worth = h.worth(&token).await;
+    let brokerage = account_named(&worth, "Brokerage");
+    assert_eq!((&brokerage["invested"], &brokerage["set_aside"]), (&json!(false), &json!(true)));
+    // The closed account is in nothing any more: not the bank, not the list.
+    assert_eq!((&worth["banked_minor"], &worth["invested_minor"]), (&json!(250000 + 2050000), &json!(610000)));
+    assert_eq!(worth["accounts"].as_array().unwrap().iter().map(|a| a["name"].as_str().unwrap()).collect::<Vec<_>>(), ["Card", "Chequing", "Brokerage", "Retirement"]);
+    assert_eq!(h.money(&token).await["accounts"].as_array().unwrap().len(), 4);
+    assert_eq!(worth["holdings"].as_array().unwrap().len(), 1);
+    assert_eq!(worth["holdings"][0]["accounts"], json!(["Retirement"]));
+
+    // A bank waiting to be signed in to again keeps its accounts, with
+    // what was last seen of them, even when the bridge stops listing them
+    // meanwhile. The one closed before that stays out.
+    let broken = bridge_answer(vec![], json!([{"code": "con.auth", "msg": "Sign in again", "conn_id": "CON-1"}]));
+    bridge_answers(&bridge, broken).await;
+    sqlx::query("update money_accounts set seen_at = seen_at - interval '6 hours'").execute(&h.state.pool).await.unwrap();
+    h.import().await;
+    let worth = h.worth(&token).await;
+    assert_eq!(worth["accounts"].as_array().unwrap().iter().map(|a| a["name"].as_str().unwrap()).collect::<Vec<_>>(), ["Card", "Chequing", "Brokerage", "Retirement"]);
+    assert_eq!((&worth["banked_minor"], &worth["invested_minor"]), (&json!(250000 + 2050000), &json!(610000)));
+    assert_eq!(worth["problems"][0]["reconnect"], true);
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn net_worth_is_kept_once_a_day_and_drawn_from_what_was_kept(pool: PgPool) {
+    let (h, bridge) = banked(pool).await;
+    let token = h.signed_in().await;
+    let answer = |chequing: &str, card: &str| {
+        bridge_answer(vec![bank_account("ACT-1", "Chequing", chequing, vec![]), bank_account("ACT-2", "Card", card, vec![])], json!([]))
+    };
+    // Nothing imported yet: nothing to draw.
+    let worth = h.worth(&token).await;
+    assert_eq!((&worth["worth_minor"], &worth["series"], &worth["recorded_since"], &worth["change"]), (&json!(0), &json!([]), &json!(null), &json!(null)));
+
+    bridge_answers(&bridge, answer("1000.00", "-100.00")).await;
+    h.import_at(at("2026-11-14T15:00:00Z")).await.unwrap();
+    // Twice in a day: the last balance seen that day stands.
+    bridge_answers(&bridge, answer("1100.00", "-100.00")).await;
+    h.import_at(at("2026-11-15T13:00:00Z")).await.unwrap();
+    bridge_answers(&bridge, answer("1200.00", "-100.00")).await;
+    h.import_at(at("2026-11-15T19:00:00Z")).await.unwrap();
+    // Nothing imported on the 16th. On the 17th a brokerage is connected.
+    let mut later = answer("1500.00", "-50.00");
+    later["accounts"].as_array_mut().unwrap().push(with_holdings(
+        bank_account("ACT-3", "Brokerage", "5000.00", vec![]),
+        json!([holding("H1", "WRLD", "Whole World Equity Fund", "100", "5000.00", "4000.00")]),
+    ));
+    bridge_answers(&bridge, later).await;
+    h.import().await;
+
+    let worth = h.worth(&token).await;
+    assert_eq!(
+        worth["series"],
+        json!([
+            {"day": "2026-11-14", "worth_minor": 90000},
+            {"day": "2026-11-15", "worth_minor": 110000},
+            {"day": "2026-11-16", "worth_minor": 110000},
+            {"day": "2026-11-17", "worth_minor": 645000},
+        ])
+    );
+    assert_eq!(worth["worth_minor"], 645000);
+    assert_eq!(worth["recorded_since"], "2026-11-14");
+    // Not a month kept yet, so the change is since the first day: 500 more
+    // in chequing and 50 less owed. The brokerage connected today is where
+    // the line steps up, and no part of the change.
+    assert_eq!(worth["change"], json!({"since": "2026-11-14", "minor": 55000}));
+}
+
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn the_way_to_independence_is_worked_out_from_the_months_held_whole(pool: PgPool) {
+    let (h, bridge) = banked(pool).await;
+    let token = h.signed_in().await;
+    // With no bank and nothing imported there is nothing to work out, and the plan is the careful one.
+    let fire = h.fire(&token).await;
+    assert_eq!((&fire["counted"], &fire["savings_rate_pct"], &fire["fi_number_minor"], &fire["ahead"]), (&json!(0), &json!(null), &json!(null), &json!([])));
+    assert_eq!(fire["plan"], json!({"withdrawal_bp": 350, "return_bp": 400, "birth_year": null, "coast_age": 65}));
+
+    // September and October whole: 3,000 in and 1,200 spent in each. November is still running.
+    let chequing = vec![
+        posted("T1", "2026-09-01", "-900.00", "Landlord"),
+        posted("T2", "2026-09-10", "-300.00", "Corner Grocer"),
+        posted("T3", "2026-09-15", "3000.00", "Employer"),
+        posted("T4", "2026-10-01", "-900.00", "Landlord"),
+        posted("T5", "2026-10-10", "-300.00", "Corner Grocer"),
+        posted("T6", "2026-10-15", "3000.00", "Employer"),
+        posted("T7", "2026-11-01", "-900.00", "Landlord"),
+        posted("T8", "2026-11-14", "3000.00", "Employer"),
+        // A card payment is money moved, in any month.
+        posted("T9", "2026-10-20", "-250.00", "Card payment"),
+    ];
+    let card = vec![posted("C1", "2026-10-21", "250.00", "Payment received")];
+    bridge_answers(
+        &bridge,
+        bridge_answer(
+            vec![
+                bank_account("ACT-1", "Chequing", "2500.00", chequing),
+                bank_account("ACT-2", "Card", "-120.00", card),
+                with_holdings(
+                    bank_account("ACT-3", "Brokerage", "20000.00", vec![]),
+                    json!([holding("H1", "WRLD", "Whole World Equity Fund", "400", "20000.00", "18000.00")]),
+                ),
+            ],
+            json!([]),
+        ),
+    )
+    .await;
+    h.import().await;
+
+    let (status, _) = h.get("/v1/money/fire", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let fire = h.fire(&token).await;
+    assert_eq!(
+        fire["months"],
+        json!([
+            {"month": "2026-09", "spent_minor": 120000, "income_minor": 300000, "whole": true},
+            {"month": "2026-10", "spent_minor": 120000, "income_minor": 300000, "whole": true},
+            {"month": "2026-11", "spent_minor": 90000, "income_minor": 300000, "whole": false},
+        ])
+    );
+    assert_eq!((&fire["counted"], &fire["currency"]), (&json!(2), &json!("CAD")));
+    assert_eq!((&fire["problems"], &fire["source"]["state"]), (&json!([]), &json!("ok")));
+    assert_eq!(
+        (&fire["monthly_income_minor"], &fire["monthly_spent_minor"], &fire["monthly_kept_minor"], &fire["savings_rate_pct"]),
+        (&json!(300000), &json!(120000), &json!(180000), &json!(60.0))
+    );
+    assert_eq!((&fire["yearly_spent_minor"], &fire["yearly_kept_minor"]), (&json!(1440000), &json!(2160000)));
+    // What is set aside is the brokerage; 14,400 a year at 3.5% is the number.
+    assert_eq!((&fire["set_aside_minor"], &fire["fi_number_minor"], &fire["progress_pct"]), (&json!(2000000), &json!(41142857), &json!(4.9)));
+    assert_eq!((&fire["years_to_fi"], &fire["fi_year"], &fire["reached"]), (&json!(13.5), &json!(2040), &json!(false)));
+    // No birth year yet: no ages, and no coast number.
+    assert_eq!((&fire["age"], &fire["fi_age"], &fire["coast"]), (&json!(null), &json!(null), &json!(null)));
+    // The bank less the card covers two months of spending.
+    assert_eq!((&fire["on_hand_minor"], &fire["runway_months"]), (&json!(238000), &json!(2.0)));
+    let ahead = fire["ahead"].as_array().unwrap();
+    assert_eq!(ahead.len(), 17);
+    assert_eq!(ahead[1], json!({"year": 2027, "age": null, "kept_minor": 4240000, "coast_minor": 2080000}));
+
+    // The owner says what to assume.
+    let uri = "/v1/money/plan";
+    let plan = json!({"withdrawal_bp": 400, "return_bp": 500, "birth_year": 1990, "coast_age": 60});
+    let (status, _) = h.put(uri, None, plan.clone()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    for wrong in [
+        json!({"withdrawal_bp": 100, "return_bp": 500, "birth_year": 1990, "coast_age": 60}),
+        json!({"withdrawal_bp": 400, "return_bp": 2000, "birth_year": 1990, "coast_age": 60}),
+        json!({"withdrawal_bp": 400, "return_bp": 500, "birth_year": 2030, "coast_age": 60}),
+        json!({"withdrawal_bp": 400, "return_bp": 500, "birth_year": 1990, "coast_age": 20}),
+    ] {
+        let (status, body) = h.put(uri, Some(&token), wrong.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{wrong} {body}");
+    }
+    let (status, fire) = h.put(uri, Some(&token), plan.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{fire}");
+    assert_eq!(fire["plan"], plan);
+    assert_eq!((&fire["fi_number_minor"], &fire["years_to_fi"], &fire["fi_year"]), (&json!(36000000), &json!(11.5), &json!(2038)));
+    assert_eq!((&fire["age"], &fire["fi_age"]), (&json!(36), &json!(48)));
+    assert_eq!(
+        fire["coast"],
+        json!({"age": 60, "years": 24, "number_minor": 11162445, "progress_pct": 17.9, "reached": false})
+    );
+    assert_eq!(fire["ahead"][0], json!({"year": 2026, "age": 36, "kept_minor": 2000000, "coast_minor": 2000000}));
+    // It is kept, and the birth year can be taken back.
+    assert_eq!(h.fire(&token).await["plan"], plan);
+    let (_, fire) = h.put(uri, Some(&token), json!({"withdrawal_bp": 400, "return_bp": 500, "coast_age": 60})).await;
+    assert_eq!((&fire["plan"]["birth_year"], &fire["coast"]), (&json!(null), &json!(null)));
+
+    // An account the owner sets aside counts towards it, and what is in it is still money on hand.
+    let (status, _) = h.put(
+        &format!("/v1/money/accounts/{}", account_named(&h.worth(&token).await, "Chequing")["id"].as_str().unwrap()),
+        Some(&token),
+        json!({"set_aside": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let fire = h.fire(&token).await;
+    assert_eq!((&fire["set_aside_minor"], &fire["on_hand_minor"]), (&json!(2250000), &json!(238000)));
+    // Nothing in an account set aside is spending, so with the chequing
+    // account set aside there is no spending left to work a number from.
+    assert_eq!(fire["monthly_spent_minor"], 0);
+    assert_eq!((&fire["fi_number_minor"], &fire["runway_months"]), (&json!(null), &json!(null)));
 }
 
 #[tokio::test]

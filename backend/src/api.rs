@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::{DefaultBodyLimit, FromRequestParts, Path, State};
+use axum::extract::{DefaultBodyLimit, FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
+mod goals;
 mod money;
 mod progress;
 
@@ -24,8 +25,10 @@ use crate::garmin::sync::{Syncer, SOURCE as GARMIN};
 use crate::money::sync::Importer;
 use crate::routines::breath::{self, BreathRules};
 use crate::routines::food::{self, FoodDay, Slot};
+use crate::routines::illustration;
 use crate::routines::photo::{self, Oil};
 use crate::routines::product::{self, Product};
+use crate::routines::study::{self, StudyRules, StudyWeek};
 use crate::routines::gym::{self, GymRules, GymSession, GymStreak, Week};
 use crate::routines::weekly::WeekStreak;
 use crate::routines::weight::{self, Unit, WeightSettings, WeightTrend};
@@ -48,6 +51,7 @@ pub struct AppState {
     pub timezone: chrono_tz::Tz,
     pub gym_rules: Arc<GymRules>,
     pub breath_rules: Arc<BreathRules>,
+    pub study_rules: Arc<StudyRules>,
     pub weight: WeightSettings,
     /// Whether this server can send notifications (it has Apple's key).
     pub push_ready: bool,
@@ -58,6 +62,9 @@ pub struct AppState {
     /// Wakes the illustrator when a photo can be drawn: it arrives, or the
     /// built meal it is a part of does.
     pub illustrator_wake: Arc<tokio::sync::Notify>,
+    /// Whether this server draws the icons of the foods in the ingredient
+    /// catalogue: it does while the illustrator is on.
+    pub food_icons: bool,
     /// Imports accounts and transactions from the bridge.
     pub money: Arc<Importer>,
     /// The currency money is totalled in, when set; otherwise the one most
@@ -76,6 +83,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/home", get(home))
         .route("/v1/progress", post(progress::record))
         .route("/v1/breath/sessions", post(record_breath_session))
+        .route("/v1/study/sessions", post(record_study_session))
         .route("/v1/weigh-ins", post(record_weigh_in))
         .route("/v1/food/entries", post(record_food_entry))
         .route("/v1/food/entries/{id}", delete(remove_food_entry))
@@ -89,12 +97,20 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/food/entries/{id}/estimate", put(correct_estimate))
         .route("/v1/food/entries/{id}/photo", get(food_photo))
         .route("/v1/food/entries/{id}/illustration", get(food_illustration))
+        .route("/v1/food/icons", get(food_icon))
         .route("/v1/food/products/{code}", get(find_product).put(set_product))
         .route("/v1/food/meals/{id}", put(save_meal).delete(remove_meal))
         .route("/v1/food/targets", put(set_food_targets))
+        .route("/v1/goals/{id}", put(goals::set))
+        .route("/v1/goals/{id}/status", post(goals::set_status))
+        .route("/v1/goals/{id}/scores", post(goals::record_practice))
+        .route("/v1/goals/{id}/result", post(goals::record_result))
         .route("/v1/money", get(money::month))
         .route("/v1/money/entries/{id}/sort", post(money::sort))
         .route("/v1/money/accounts/{id}", put(money::set_account))
+        .route("/v1/money/worth", get(money::worth))
+        .route("/v1/money/fire", get(money::fire))
+        .route("/v1/money/plan", put(money::set_plan))
         .with_state(state)
 }
 
@@ -270,6 +286,8 @@ struct HomeResponse {
     week: Week,
     gym: GymWeek,
     breath: BreathWeek,
+    study: StudyWeek,
+    goals: crate::routines::goals::GoalsView,
     weight: WeightTrend,
     food: FoodDay,
     /// Missing while no bank is set up and nothing was ever imported.
@@ -389,6 +407,8 @@ async fn home_now(state: &AppState) -> Result<HomeResponse, ApiError> {
             streak,
         },
         breath: breath_week(state, today).await?,
+        study: study::week(&state.study_rules, today, &db::study_sessions(&state.pool, state.timezone).await?),
+        goals: goals::snapshot(state, today).await?,
         weight: weight::trend(&state.weight, today, &db::weigh_ins(&state.pool, state.timezone).await?),
         food: food_day(state, now, today).await?,
         money: money::glance(state).await?,
@@ -410,6 +430,7 @@ async fn food_day(state: &AppState, now: DateTime<Utc>, today: NaiveDate) -> Res
     );
     day.drafts = food::draft_views(&db::draft_parts(&state.pool, state.timezone).await?, state.estimate_range_pct);
     day.products = db::recent_products(&state.pool, RECENT_PRODUCTS).await?;
+    day.icon_look = state.food_icons.then_some(illustration::ICON_LOOK);
     Ok(day)
 }
 
@@ -501,6 +522,95 @@ async fn record_breath_session(
     };
     if db::insert_breath_session(&state.pool, &session, device.session_id).await? {
         tracing::info!(id = %session.id, holds = session.holds.len(), "breath session recorded");
+    }
+    Ok(Json(home_now(&state).await?))
+}
+
+// --- Study sessions ------------------------------------------------------
+
+#[derive(Deserialize)]
+struct StudySessionRequest {
+    /// Made on the phone when the timer starts. Sending the same session
+    /// again changes nothing.
+    id: Uuid,
+    started_at: DateTime<Utc>,
+    ended_at: DateTime<Utc>,
+    /// Seconds on the timer, less any pause.
+    active_s: u32,
+    /// The subject by name; a new name is a new subject.
+    subject: String,
+    /// `questions`, `reading` or `build`.
+    kind: String,
+    answered: Option<u32>,
+    right_first: Option<u32>,
+    /// What was built and why, for a build session.
+    explain_back: Option<String>,
+}
+
+/// The longest a session can be, start to end.
+const STUDY_LONGEST_S: i64 = 24 * 3600;
+/// The longest explain-back kept, in characters.
+const EXPLAIN_BACK_LONGEST: usize = 4000;
+
+/// Stores a session timed on the phone and answers with Home as it now
+/// stands: the week and the streak.
+async fn record_study_session(
+    State(state): State<AppState>,
+    device: Device,
+    Json(request): Json<StudySessionRequest>,
+) -> Result<Json<HomeResponse>, ApiError> {
+    let span = (request.ended_at - request.started_at).num_seconds();
+    if span < 0 {
+        return Err(ApiError::BadRequest("ended_at is before started_at"));
+    }
+    if span > STUDY_LONGEST_S {
+        return Err(ApiError::BadRequest("a session is at most a day long"));
+    }
+    if request.started_at > (state.now)() + chrono::Duration::days(1) {
+        return Err(ApiError::BadRequest("started_at is in the future"));
+    }
+    // A minute's grace for clocks read a moment apart.
+    if i64::from(request.active_s) > span + 60 {
+        return Err(ApiError::BadRequest("active_s is longer than the session"));
+    }
+    let Some(subject) = study::subject_name(&request.subject) else {
+        return Err(ApiError::BadRequest("a subject is 1 to 60 characters"));
+    };
+    let Some(kind) = study::Kind::parse(&request.kind) else {
+        return Err(ApiError::BadRequest("kind is questions, reading or build"));
+    };
+    if request.answered.is_some_and(|answered| answered > 1000) {
+        return Err(ApiError::BadRequest("answered is at most 1000"));
+    }
+    match (request.answered, request.right_first) {
+        (None, Some(_)) => return Err(ApiError::BadRequest("right_first needs answered")),
+        (Some(answered), Some(right)) if right > answered => {
+            return Err(ApiError::BadRequest("right_first is more than answered"))
+        }
+        _ => {}
+    }
+    let explain_back = request
+        .explain_back
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string);
+    if explain_back.as_ref().is_some_and(|text| text.chars().count() > EXPLAIN_BACK_LONGEST) {
+        return Err(ApiError::BadRequest("an explain-back is at most 4000 characters"));
+    }
+    let session = db::StoredStudySession {
+        id: request.id,
+        started_at: request.started_at,
+        ended_at: request.ended_at,
+        active_s: request.active_s as i32,
+        subject,
+        kind,
+        answered: request.answered.map(|n| n as i32),
+        right_first: request.right_first.map(|n| n as i32),
+        explain_back,
+    };
+    if db::insert_study_session(&state.pool, &session, device.session_id).await? {
+        tracing::info!(id = %session.id, minutes = session.active_s / 60, kind = kind.as_str(), "study session recorded");
     }
     Ok(Json(home_now(&state).await?))
 }
@@ -990,6 +1100,35 @@ async fn food_photo(State(state): State<AppState>, _device: Device, Path(id): Pa
 async fn food_illustration(State(state): State<AppState>, _device: Device, Path(id): Path<Uuid>) -> Result<Response, ApiError> {
     let png = db::food_illustration(&state.pool, id).await?.ok_or(ApiError::NotFound)?;
     Ok(([(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, "private, no-cache")], png).into_response())
+}
+
+#[derive(Deserialize)]
+struct IconQuery {
+    /// The food's name, as the ingredient catalogue has it.
+    name: String,
+}
+
+/// The icon of a food in the ingredient catalogue: a small drawing of it,
+/// made on the Spark from its name. Asking is what gets it drawn: the
+/// first time, and until it is, the answer is 202 and the app shows the
+/// drawing it has for the food's category. The app may keep an icon for
+/// as long as the day's `icon_look` stays what it was. Not found when this
+/// server draws none, or the model could not draw this one.
+async fn food_icon(State(state): State<AppState>, _device: Device, Query(query): Query<IconQuery>) -> Result<Response, ApiError> {
+    let key = illustration::icon_key(&query.name).ok_or(ApiError::BadRequest("a food's name is 1 to 80 characters"))?;
+    if !state.food_icons {
+        return Err(ApiError::NotFound);
+    }
+    match db::ask_food_icon(&state.pool, &key, &query.name).await? {
+        db::IconAsked::Drawn(png) => {
+            Ok(([(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, "private, no-cache")], png).into_response())
+        }
+        db::IconAsked::Waiting => {
+            state.illustrator_wake.notify_one();
+            Ok((StatusCode::ACCEPTED, Json(json!({ "state": "waiting" }))).into_response())
+        }
+        db::IconAsked::GivenUp => Err(ApiError::NotFound),
+    }
 }
 
 /// The label lyfe has for a barcode: the one the owner typed, else the

@@ -1,5 +1,19 @@
 import Foundation
 
+/// The three things Money shows: a month's spending, what everything comes
+/// to, and how far off financial independence is.
+public enum MoneySection: String, CaseIterable, Sendable {
+    case month, worth, fire
+
+    var title: String {
+        switch self {
+        case .month: "MONTH"
+        case .worth: "WORTH"
+        case .fire: "FIRE"
+        }
+    }
+}
+
 /// The little of money Home shows. Missing while no bank is set up.
 public struct MoneyGlance: Codable, Equatable, Sendable {
     /// "2026-11"
@@ -105,6 +119,9 @@ public struct MoneyMonth: Codable, Equatable, Sendable {
         /// The bank has not refreshed the balance for some days.
         public var stale: Bool
         public var problem: String?
+        /// The bank lists what it holds: an investment account. Missing in
+        /// an answer from a backend older than that.
+        public var invested: Bool?
     }
 
     public struct Problem: Codable, Equatable, Sendable, Hashable {
@@ -269,6 +286,7 @@ public enum MoneyText {
 
     static func accountDetail(_ account: MoneyMonth.Account, now: Date) -> String {
         var parts = [account.connection.uppercased()]
+        if account.invested == true { parts.append("INVESTED") }
         if account.setAside { parts.append("SET ASIDE") }
         if let problem = account.problem {
             parts.append(problem.uppercased())

@@ -1,11 +1,12 @@
 import SwiftUI
 
 /// The whole app: sign-in until there is a session, then Home, with the
-/// breath session taking the whole screen while one is open. Progress and
+/// breath session taking the whole screen while one is open, and the study
+/// screen while it is open (its timer runs on when it is closed). Progress and
 /// the weight entry open from Home or from the morning prompt; Food, with
 /// its meal builder and targets entry, from Home or from the logging
-/// prompt; Money, with its sorting screen, from Home. All of it is behind
-/// Face ID each time lyfe is opened.
+/// prompt; Money, with its sorting screen and what FIRE assumes, from
+/// Home. All of it is behind Face ID each time lyfe is opened.
 public struct RootView: View {
     let model: AppModel
     @Environment(\.scenePhase) private var scenePhase
@@ -26,7 +27,9 @@ public struct RootView: View {
                 case .signedOut:
                     SignInView(model: model)
                 case .signedIn:
-                    if model.isEnteringWeight, let today = model.home?.today {
+                    if model.isStudyOpen {
+                        StudySessionView(model: model)
+                    } else if model.isEnteringWeight, let today = model.home?.today {
                         WeighInView(
                             unit: model.weightUnit, latest: model.home?.weight?.latest, today: today,
                             onSave: { await model.recordWeight($0) }, onClose: { model.closeWeighIn() })
@@ -79,12 +82,42 @@ public struct RootView: View {
                                 entry: entry, categories: money.categoryNames, currency: money.currency,
                                 waiting: money.toSort, onSort: { await model.sortMoney(id, to: $0, onlyThis: $1) },
                                 onClose: { model.closeSorting() })
+                        } else if model.isEditingPlan, let fire = model.fire {
+                            PlanView(
+                                plan: fire.plan, thisYear: model.home?.today.year ?? fire.ahead.first?.year ?? 2100,
+                                onSave: { await model.setPlan($0) }, onClose: { model.closePlan() })
                         } else {
                             MoneyScreen(
-                                money: model.money, problem: model.moneyProblem, loading: model.isLoadingMoney,
+                                money: model.money, worth: model.worth, fire: model.fire, section: model.moneySection,
+                                problem: model.moneyProblem, loading: model.isFetchingMoney,
                                 onBack: { model.closeMoney() }, onMonth: { await model.loadMoney(month: $0) },
                                 onSort: { model.openSorting($0) }, onSortNext: { model.openSortingNext() },
-                                onSetAside: { await model.setAside(account: $0, $1) })
+                                onSetAside: { await model.setAside(account: $0, $1) },
+                                onSection: { model.showMoney($0) }, onReload: { await model.reloadMoneySection() },
+                                onPlan: { model.openPlan() })
+                        }
+                    } else if model.screen == .goals, let home = model.home {
+                        let goals = home.goals ?? GoalsView(limit: 3, goals: [])
+                        if let editing = model.goalEditor {
+                            let existing: Goal? =
+                                if case .change(let id) = editing { goals.goals.first { $0.id == id } } else { nil }
+                            GoalEditorView(
+                                existing: existing, home: home, weightUnit: model.weightUnit,
+                                subjects: model.studySubjects, today: home.today,
+                                onSave: { await model.saveGoal(id: editing.id, $0) },
+                                onClose: { model.closeGoalEditor() })
+                        } else if let id = model.openGoalId, let goal = goals.goals.first(where: { $0.id == id }) {
+                            GoalDetailView(
+                                goal: goal, goals: goals, home: home, weightUnit: model.weightUnit, today: home.today,
+                                onChange: { model.openGoalEditor(.change(id)) },
+                                onStatus: { await model.setGoalStatus(id, $0, note: $1) },
+                                onPractice: { await model.recordPractice(id, $0) },
+                                onResult: { await model.recordExamResult(id, passed: $0, on: $1, score: $2) },
+                                onBack: { model.closeGoal() })
+                        } else {
+                            GoalsScreen(
+                                goals: goals, home: home, weightUnit: model.weightUnit,
+                                onOpen: { model.openGoal($0) }, onNew: { model.openGoalEditor(.new(UUID())) })
                         }
                     } else if model.screen == .progress, let home = model.home {
                         ProgressScreen(
@@ -101,7 +134,8 @@ public struct RootView: View {
         .safeAreaInset(edge: .bottom, spacing: 0) {
             if model.phase == .signedIn, !model.isLocked, model.home != nil, model.breathSession == nil,
                 !model.isEnteringWeight, model.foodFlow == nil, model.mealDraft == nil,
-                !model.isEnteringTargets, model.sortingEntry == nil
+                !model.isEnteringTargets, model.sortingEntry == nil, !model.isEditingPlan, !model.isStudyOpen,
+                model.goalEditor == nil
             {
                 VStack(spacing: 0) {
                     PosterRule()
@@ -110,6 +144,7 @@ public struct RootView: View {
                         if model.home?.food != nil { tab(.food, "Food", "fork.knife") }
                         tab(.progress, "Progress", "chart.xyaxis.line")
                         tab(.money, "Money", "wallet.pass")
+                        tab(.goals, "Goals", "flag")
                     }
                 }.background(Poster.paper)
             }
@@ -117,6 +152,13 @@ public struct RootView: View {
         // Rows show a meal's illustration once drawn, fetched once.
         .environment(
             \.mealIllustration, IllustrationSource { [model] in await model.mealIllustration($0) }
+        )
+        // The picker's tiles show a food's icon once the Spark has drawn it.
+        .environment(
+            \.foodIcons,
+            FoodIconSource(
+                kept: { [model] in model.keptFoodIcon(named: $0) },
+                ask: { [model] in await model.askForFoodIcon(named: $0) })
         )
         // The Poster palette is fixed; it does not follow dark mode. The
         // lock is ink, so the clock and battery over it are drawn light.
@@ -141,12 +183,14 @@ public struct RootView: View {
             case .money: model.closeMoney()
             case .food: model.closeFood()
             case .progress: model.closeProgress()
+            case .goals: model.closeGoals()
             case .home: break
             }
             switch screen {
             case .money: model.openMoney()
             case .food: model.openFood()
             case .progress: model.openProgress()
+            case .goals: model.openGoals()
             case .home: break
             }
         } label: {

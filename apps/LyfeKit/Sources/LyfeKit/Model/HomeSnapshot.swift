@@ -9,6 +9,10 @@ public struct HomeSnapshot: Codable, Equatable, Sendable {
     public var gym: GymWeek
     /// Missing in answers cached before breath sessions existed.
     public var breath: BreathWeek?
+    /// Missing in answers cached before study sessions existed.
+    public var study: StudyWeek?
+    /// Missing in answers cached before goals existed.
+    public var goals: GoalsView?
     /// Missing in answers cached before weigh-ins existed.
     public var weight: WeightTrend?
     /// Missing in answers cached before food logging existed.
@@ -422,6 +426,10 @@ public struct FoodDay: Codable, Equatable, Sendable {
     /// The saved meals, by slot, the one logged most recently first.
     public var meals: [SavedMeal]
     public var streak: DayStreak
+    /// The look the backend draws the icons of the catalogue's foods in
+    /// now; an icon kept from an earlier one is fetched again. Nil when the
+    /// backend draws none, and in answers cached before it drew any.
+    public var iconLook: Int?
 
     public struct Target: Codable, Equatable, Sendable {
         /// The day it took effect.

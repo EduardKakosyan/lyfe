@@ -1,6 +1,6 @@
 # lyfe
 
-lyfe is a private app that keeps one person's routines going and shows them where their money went.
+lyfe is a private app that keeps one person's routines going, holds them to the goals the routines serve, and shows them where their money went, what it all comes to, and how far off financial independence is.
 
 ## Language
 
@@ -8,7 +8,7 @@ lyfe is a private app that keeps one person's routines going and shows them wher
 Following a planned exercise routine repeatedly over time, distinct from improvements in strength, endurance, or body composition.
 
 **Streak**:
-A count of consecutive periods in which a supporting routine was kept: weeks with four completed gym sessions, weeks with three completed breath-training sessions, or days on which a food log happened. Sessions count on whichever days they happen. A streak measures showing up; it is separate from progression.
+A count of consecutive periods in which a supporting routine was kept: weeks with four completed gym sessions, weeks with three completed breath-training sessions, weeks with four days of study, or days on which a food log happened. Sessions count on whichever days they happen. A streak measures showing up; it is separate from progression.
 _Avoid_: Daily gym streak, fixed-day streak
 
 **Progression**:
@@ -17,6 +17,34 @@ Measured improvement in a capability, such as breath-hold time, which lyfe track
 **Recovery**:
 Keeping a streak alive after a single missed period by completing the very next one. It never requires make-up sessions; two missed periods in a row end the streak.
 _Avoid_: Catch-up, make-up session, streak freeze
+
+**Study session**:
+A stretch of study timed in lyfe on one subject. It counts toward the week once its timer passes a minimum, and a day counts once. What it was (questions, reading or a build) and how it went are kept beside it and never decide whether it counted.
+_Avoid_: Study block, focus session, pomodoro
+
+**Subject**:
+What a study session was about, named by the owner. Every minute given to it is added up, counted or not.
+_Avoid_: Topic, course, track
+
+**Explain-back**:
+What the owner says, without looking it up, about what a build session built and why. A build session counts only with one, and no more than two a week count.
+_Avoid_: Reflection, journal entry, summary
+
+**Goal**:
+Where the owner means to get by a date: a figure lyfe already reads, reached (net worth, a breath hold, the weight trend); a total built up (hours on a subject); or a result got (a certification). It names the routine that moves it and is shown against its pace. Three are active at once; the rest are parked, never deleted. lyfe never moves a goal's date; it may suggest it.
+_Avoid_: Target (that is what a day is held to), objective, resolution, OKR
+
+**Exam**:
+A result to get, such as a certification: passed or not on the day it is sat, held to the pass mark its owner publishes. It has no pace; practice says whether the owner is ready.
+_Avoid_: Test (that is a practice test), certificate (that is what a pass gives)
+
+**Practice score**:
+The score of one practice test for an exam, typed after it, with each part's percentage where the test gave one. Ready is the owner's own rule: so many practice scores in a row at least so far over the pass mark.
+_Avoid_: Mock (that is the four-weekly interview), quiz score
+
+**Pace**:
+Where a goal would be today had it moved in a straight line from where it started to its figure on its date. Behind pace is an amount, and what would now be needed to make it, never a failure.
+_Avoid_: On track, off track (as states), schedule
 
 **Weigh-in**:
 A weight the owner types, normally into the morning prompt without opening lyfe. A day's weight is the last one typed that day. Not a streak: a missed morning costs nothing, and there is no second reminder.
@@ -27,7 +55,7 @@ A meal the owner eats repeatedly, defined once from its ingredients with the num
 _Avoid_: Recipe (for the saved meal itself), favourite, template
 
 **Part**:
-One thing in a meal that is built rather than tapped: a packet scanned by its barcode with the grams eaten, a food typed by hand, or a photo and one line. A meal is what its parts add up to, and each part is measured or estimated by itself.
+One thing in a meal that is built rather than tapped: a packet scanned by its barcode with the grams eaten, a food typed by hand or picked from the catalogue, or a photo and one line. A meal is what its parts add up to, and each part is measured or estimated by itself.
 _Avoid_: Item (that is a food a model saw in a photo), component, ingredient (that is what goes into a saved meal)
 
 **Food log**:
@@ -45,6 +73,18 @@ _Avoid_: Guess (in the app), approximation
 **Illustration**:
 A meal photo redrawn on the Spark as the meal it shows: the food in its own colours, black ink outlines, and its dish in a Poster colour, shown in the photo's place once it is ready. It only ever adds to a meal: the meal counts without it, and the photo stays if it never comes.
 _Avoid_: Filter, AI image, thumbnail, pictogram (that was the first look, which lost the meal)
+
+**Macros**:
+The grams of protein, carbs and fat in a food. A food can be typed as its macros alone, and what it comes to is then worked out at 4 kcal a gram of protein or carbs and 9 a gram of fat, the figures labels are worked out with. It is measured, not estimated.
+_Avoid_: Macro calories (as something typed), nutrients
+
+**Catalogue**:
+The foods lyfe comes with, each with its figures per 100 g: twenty staples and the generic foods of the USDA database, browsed by category and searched by name. A food picked from it is weighed, so it is measured.
+_Avoid_: Food database (that is the downloaded one barcodes are looked up in), library
+
+**Icon**:
+A small drawing of one food in the catalogue, drawn on the Spark from the food's name alone and kept. Every food's is drawn ahead of time, so none is waited for; one not drawn yet is shown by its category's.
+_Avoid_: Emoji, stock image, thumbnail, illustration (that is a meal photo redrawn)
 
 **Label**:
 The calories and protein per 100 g printed on packaged food, found by its barcode in the downloaded food database or typed once by the owner. A meal logged from a label is measured.
@@ -96,5 +136,45 @@ One of twelve fixed kinds of spending an expense or refund is sorted into. The o
 _Avoid_: Tag, budget line, envelope
 
 **Set aside**:
-An account the owner has marked as savings or investments. Its balance is shown; nothing that moves in it counts as spending or waits to be sorted. Every other account is an everyday account.
+An account the owner has marked as savings or investments. Its balance is shown; nothing that moves in it counts as spending or waits to be sorted. Every other account is an everyday account. What is set aside is what counts towards financial independence.
 _Avoid_: Hidden account, excluded account, savings (for the mark itself)
+
+**Investment account**:
+An account the bank lists holdings for. Its balance is invested, not money in the bank. That is the bank's to say, each time it is asked; whether the account is set aside is still the owner's, and it starts that way.
+_Avoid_: Brokerage (as a term in lyfe), portfolio, trading account
+
+**Holding**:
+One thing an investment account is in: a fund or a share, with how many of it, what they are worth as the bank last priced them and, where the bank says, what was paid for them. The same fund in two accounts is one holding. lyfe looks no prices up.
+_Avoid_: Position, stock (for a holding), asset, ticker (that is only its symbol)
+
+**Net worth**:
+Every account added up: what is in the bank and what is invested, less what is owed. Kept once a day from the day lyfe began keeping it, which is as far back as its line goes.
+_Avoid_: Balance (that is one account's), wealth, total assets
+
+**Whole month**:
+A finished month that the entries lyfe holds reach back to the first day of. Only whole months are compared with or averaged over, the last twelve at most; the month still running never is one.
+_Avoid_: Full month, complete month, closed month
+
+**Kept**:
+What came in less what was spent over the whole months counted. As a share of what came in it is the savings rate. It is measured from pay as it lands in the bank, so what is taken off before that is in neither figure.
+_Avoid_: Saved (set aside is the mark on an account), surplus, cash flow
+
+**Plan**:
+What the owner assumes when lyfe works out the way to financial independence: the withdrawal rate, growth above inflation, the age to coast by, and their birth year. The owner sets it; lyfe never changes it. Everything worked out from it is in today's money.
+_Avoid_: Settings, forecast, goal, target (that is food's)
+
+**Withdrawal rate**:
+The share of what is set aside that could be spent each year for good. Part of the plan.
+_Avoid_: Safe withdrawal rate (nothing about it is certain), SWR, drawdown
+
+**FI number**:
+What would have to be set aside for the owner's spending to be covered for good: a year's spending divided by the withdrawal rate. Financial independence is having it. FIRE is the name of the screen that shows how far off that is.
+_Avoid_: FIRE number, retirement goal, nest egg
+
+**Coast number**:
+What would have to be set aside today to grow to the FI number by a given age with nothing more added.
+_Avoid_: Coast FIRE (as a figure), halfway point
+
+**Runway**:
+How many months of spending the money on hand would cover: what is in the bank less what is owed, over a month's spending.
+_Avoid_: Emergency fund (lyfe does not know what the money is for), buffer, cushion (as a figure)

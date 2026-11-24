@@ -791,6 +791,11 @@ pub struct FoodDay {
     /// Packaged food logged lately, most recent first, so a code scanned
     /// again can be looked up without a connection.
     pub products: Vec<Product>,
+    /// The look the icons of the catalogue's foods are drawn in now
+    /// (`illustration::ICON_LOOK`), so the phone fetches an icon again once
+    /// it moves on. Null when this server draws none, and the phone then
+    /// does not ask.
+    pub icon_look: Option<i32>,
     pub streak: DayStreak,
 }
 
@@ -975,6 +980,7 @@ pub fn day(today: NaiveDate, meals: &[SavedMeal], entries: &[Entry], targets: &[
             })
             .collect(),
         products: Vec::new(),
+        icon_look: None,
         streak: streak(today, &logged_days(entries)),
     }
 }

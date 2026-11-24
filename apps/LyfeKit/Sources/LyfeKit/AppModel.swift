@@ -42,6 +42,18 @@ public final class AppModel {
     /// Set when the backend answered but would not take a saved session.
     public private(set) var breathProblem: String?
 
+    /// The study session on this phone, from START until the owner says
+    /// what it was. It keeps running while its screen is closed.
+    public private(set) var studyRun: StudyRun?
+    /// True while the study screen is on top: picking a subject, the timer,
+    /// or saying what a session was.
+    public private(set) var isStudyOpen = false
+    /// Finished study sessions kept on this phone that the backend has not
+    /// confirmed yet, oldest first.
+    public private(set) var unsentStudy: [UUID]
+    /// Set when the backend answered but would not take a saved session.
+    public private(set) var studyProblem: String?
+
     /// Weights typed on this phone that the backend has not confirmed yet,
     /// oldest first.
     public private(set) var unsentWeighIns: [UUID]
@@ -94,6 +106,25 @@ public final class AppModel {
         case progress
         case food
         case money
+        case goals
+    }
+
+    /// The goal open on the Goals screen.
+    public private(set) var openGoalId: UUID?
+    /// The goal being set or changed, while its editor is on screen.
+    public private(set) var goalEditor: GoalEditing?
+
+    public enum GoalEditing: Equatable, Sendable {
+        /// With the id the new goal will have, made once when the editor
+        /// opens, so a goal sent again after a lost answer is set once.
+        case new(UUID)
+        case change(UUID)
+
+        public var id: UUID {
+            switch self {
+            case .new(let id), .change(let id): id
+            }
+        }
     }
 
     /// True while lyfe is waiting for Face ID. Set when it is opened and
@@ -110,6 +141,25 @@ public final class AppModel {
     /// What went wrong fetching or changing it, in words for the owner.
     public private(set) var moneyProblem: String?
     public private(set) var isLoadingMoney = false
+    /// Which of Money's three sections is on screen.
+    public private(set) var moneySection: MoneySection = .month
+    /// What everything comes to, as the backend last answered. Like the
+    /// month, kept only while lyfe runs.
+    public private(set) var worth: MoneyWorth?
+    /// How far off financial independence is, likewise.
+    public private(set) var fire: MoneyFire?
+    private var isLoadingWorth = false
+    private var isLoadingFire = false
+    /// Set when one of them is asked for while it is already being
+    /// fetched: something has changed since that fetch left, so it is
+    /// fetched again once it is back.
+    private var worthAskedAgain = false
+    private var fireAskedAgain = false
+    /// Counts up each time what `fire` should hold is changed from here,
+    /// so an answer asked for before that is not shown over it.
+    private var fireChanges = 0
+    /// True while what FIRE assumes is open to change.
+    public private(set) var isEditingPlan = false
     /// The entry whose sorting screen is open.
     public private(set) var sortingEntry: UUID?
     /// True while the weight entry is on screen.
@@ -126,6 +176,8 @@ public final class AppModel {
     private let addresses: any ServerAddressStore
     private let cache: HomeCache
     private let breath: BreathStore
+    private let study: StudyStore
+    private var isSendingStudy = false
     private let weighIns: WeighInStore
     private var isSendingWeighIns = false
     private let food: FoodStore
@@ -143,6 +195,7 @@ public final class AppModel {
         if receipt?.id == id { receipt = nil }
     }
     private let illustrations: IllustrationStore
+    private let foodIcons: FoodIconStore
     private var isSendingFood = false
     private let ownerCheck: any OwnerCheck
     private let makeCues: @MainActor () -> any BreathCues
@@ -156,11 +209,13 @@ public final class AppModel {
         addresses: any ServerAddressStore,
         cache: HomeCache,
         breath: BreathStore,
+        study: StudyStore? = nil,
         weighIns: WeighInStore,
         food: FoodStore,
         captures: CaptureStore? = nil,
         drafts: DraftStore? = nil,
         illustrations: IllustrationStore? = nil,
+        foodIcons: FoodIconStore? = nil,
         transport: any HTTPTransport,
         deviceName: String,
         defaultServerAddress: String = "",
@@ -172,6 +227,9 @@ public final class AppModel {
         self.addresses = addresses
         self.cache = cache
         self.breath = breath
+        self.study =
+            study
+            ?? StudyStore(directory: FileManager.default.temporaryDirectory.appending(path: "lyfe-\(UUID().uuidString)"))
         self.weighIns = weighIns
         self.food = food
         // Tests that do not care keep them in a folder of their own.
@@ -185,6 +243,9 @@ public final class AppModel {
             illustrations
             ?? IllustrationStore(
                 directory: FileManager.default.temporaryDirectory.appending(path: "lyfe-\(UUID().uuidString)"))
+        self.foodIcons =
+            foodIcons
+            ?? FoodIconStore(directory: FileManager.default.temporaryDirectory.appending(path: "lyfe-\(UUID().uuidString)"))
         self.ownerCheck = ownerCheck
         makeCues = cues
         self.transport = transport
@@ -202,6 +263,7 @@ public final class AppModel {
         home = hasSession ? cached?.snapshot : nil
         homeFetchedAt = hasSession ? cached?.fetchedAt : nil
         unsentBreath = breath.outbox().map(\.id)
+        unsentStudy = self.study.outbox().map(\.id)
         unsentWeighIns = weighIns.outbox().map(\.id)
         unsentFood = food.outbox()
         recentPortions = hasSession ? self.drafts.recentPortions() : []
@@ -220,6 +282,7 @@ public final class AppModel {
         unsentCaptures = self.captures.outbox()
         self.captures.prunePhotos(olderThan: 3 * 86_400, now: now())
         pickUpBreathSession()
+        pickUpStudy()
         lock()
     }
 
@@ -235,11 +298,13 @@ public final class AppModel {
             addresses: DefaultsServerAddressStore(),
             cache: .standard(),
             breath: .standard(),
+            study: .standard(),
             weighIns: .standard(),
             food: .standard(),
             captures: .standard(),
             drafts: .standard(),
             illustrations: .standard(),
+            foodIcons: .standard(),
             transport: TailnetTransport.live(),
             deviceName: deviceName,
             defaultServerAddress: defaultServerAddress,
@@ -383,6 +448,8 @@ public final class AppModel {
         offlineReason = nil
         refreshProblem = nil
         breathProblem = nil
+        studyProblem = nil
+        isStudyOpen = false
         weighInProblem = nil
         foodProblem = nil
         setAside()
@@ -390,7 +457,13 @@ public final class AppModel {
         foodFlow = nil
         money = nil
         moneyProblem = nil
+        worth = nil
+        fire = nil
+        moneySection = .month
+        isEditingPlan = false
         sortingEntry = nil
+        openGoalId = nil
+        goalEditor = nil
         screen = .home
         isEnteringWeight = false
         isLocked = false
@@ -407,6 +480,7 @@ public final class AppModel {
         defer { isRefreshing = false }
         await sendPushToken()
         await sendUnsentBreath()
+        await sendUnsentStudy()
         await sendUnsentWeighIns()
         await sendUnsentFood()
         guard phase == .signedIn else { return }
@@ -558,17 +632,244 @@ public final class AppModel {
         unsentBreath.removeAll { $0 == id }
     }
 
+    // MARK: Study sessions
+
+    /// What the timer is held to: the backend's, or the usual ones before
+    /// it has said.
+    public var studyRules: StudyRules { home?.study?.rules ?? StudyRules() }
+
+    /// Subjects to pick from, most recent first: the backend's, and any
+    /// typed on this phone that it has not heard of yet.
+    public var studySubjects: [String] {
+        var names = home?.study?.subjects.map(\.name) ?? []
+        for run in study.outbox() + [studyRun].compactMap({ $0 })
+        where !names.contains(where: { $0.caseInsensitiveCompare(run.subject) == .orderedSame }) {
+            names.insert(run.subject, at: 0)
+        }
+        return names
+    }
+
+    /// Opens the study screen: the timer when one is running, otherwise
+    /// the subjects to start one on. Works offline.
+    public func openStudy() {
+        settleStudy()
+        isStudyOpen = true
+    }
+
+    /// Leaves the study screen. A timer that is running keeps running.
+    public func closeStudy() {
+        isStudyOpen = false
+    }
+
+    /// The owner tapped START on a subject.
+    public func startStudy(subject: String, kind: StudyKind) {
+        guard studyRun == nil, let name = Self.subjectName(subject) else { return }
+        let run = StudyRun(subject: name, kind: kind, startedAt: now())
+        studyRun = run
+        study.saveActive(run)
+    }
+
+    /// Changes the session in progress and keeps it on disk at once.
+    public func changeStudy(_ change: (inout StudyRun) -> Void) {
+        guard var run = studyRun else { return }
+        change(&run)
+        studyRun = run
+        study.saveActive(run)
+    }
+
+    public func pauseStudy() {
+        let at = now()
+        changeStudy { $0.pause(at: at) }
+    }
+
+    public func resumeStudy() {
+        let at = now()
+        changeStudy { $0.resume(at: at) }
+    }
+
+    /// The owner started before tapping START.
+    public func startStudyEarlier(minutes: Int) {
+        changeStudy { $0.startEarlier(by: TimeInterval(minutes * 60)) }
+    }
+
+    /// The owner ended the session; what it was is asked next.
+    public func endStudy() {
+        let at = now()
+        changeStudy { $0.stop(at: at) }
+    }
+
+    /// Ends a timer that has been left running past the longest a session
+    /// is taken to be. Called whenever the screen looks at the clock.
+    public func settleStudy() {
+        guard let run = studyRun, !run.isEnded else { return }
+        let at = now()
+        let stopAfter = TimeInterval(studyRules.stopAfterMinutes * 60)
+        changeStudy { $0.settle(at: at, stopAfter: stopAfter) }
+    }
+
+    /// Keeps the ended session and sends it.
+    public func finishStudy() async {
+        guard let run = studyRun, run.isEnded else { return }
+        study.enqueue(run)
+        if !unsentStudy.contains(run.id) {
+            unsentStudy.append(run.id)
+        }
+        study.clearActive()
+        studyRun = nil
+        isStudyOpen = false
+        await sendUnsentStudy()
+    }
+
+    /// Throws the session away: a timer started by mistake.
+    public func discardStudy() {
+        study.clearActive()
+        studyRun = nil
+        isStudyOpen = false
+    }
+
+    /// A session that was in progress when the app was last closed: back
+    /// on screen, ended by itself if it was left too long.
+    private func pickUpStudy() {
+        guard let run = study.loadActive() else { return }
+        studyRun = run
+        settleStudy()
+        isStudyOpen = true
+    }
+
+    /// Sends every finished session the backend has not confirmed, oldest
+    /// first, and shows the state it answers with. Each carries its own
+    /// id, so one that was received but whose answer was lost is not
+    /// counted again.
+    public func sendUnsentStudy() async {
+        guard phase == .signedIn, !isSendingStudy, let api, let token else { return }
+        isSendingStudy = true
+        defer { isSendingStudy = false }
+        for run in study.outbox() {
+            do {
+                let snapshot = try await api.recordStudySession(token: token, run: run)
+                confirmedStudy(run.id)
+                show(snapshot)
+                studyProblem = nil
+            } catch LyfeAPIError.unreadableResponse {
+                // The backend took it; only its answer could not be read.
+                confirmedStudy(run.id)
+                refreshProblem = "The server's answer could not be read. The app may be older than the server."
+            } catch LyfeAPIError.unauthorized {
+                forgetSession()
+                return
+            } catch LyfeAPIError.unreachable(let why) {
+                isOffline = true
+                offlineReason = why
+                return
+            } catch LyfeAPIError.server(let status) {
+                studyProblem = "The server would not take a saved study session (\(status)). It stays on this phone."
+                return
+            } catch {
+                return
+            }
+        }
+    }
+
+    private func confirmedStudy(_ id: UUID) {
+        study.remove(id)
+        unsentStudy.removeAll { $0 == id }
+    }
+
+    /// A subject's name as it is kept: runs of spaces made one, at most 60
+    /// characters. Nil when nothing is left.
+    static func subjectName(_ text: String) -> String? {
+        let name = text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        return name.isEmpty ? nil : String(name.prefix(60))
+    }
+
+    // MARK: Goals
+
+    public func openGoals() {
+        openGoalId = nil
+        goalEditor = nil
+        screen = .goals
+    }
+
+    public func closeGoals() {
+        openGoalId = nil
+        goalEditor = nil
+        screen = .home
+    }
+
+    public func openGoal(_ id: UUID) {
+        screen = .goals
+        openGoalId = id
+    }
+
+    public func closeGoal() {
+        openGoalId = nil
+    }
+
+    public func openGoalEditor(_ editing: GoalEditing) {
+        screen = .goals
+        goalEditor = editing
+    }
+
+    public func closeGoalEditor() {
+        goalEditor = nil
+    }
+
+    /// Sets a goal or changes one, and shows it. Needs a connection: where
+    /// a new goal starts is the backend's reading of today.
+    public func saveGoal(id: UUID, _ request: GoalRequest) async -> String? {
+        let problem = await changeFood("save the goal") { api, token in
+            try await api.setGoal(token: token, id: id, request: request)
+        }
+        if problem == nil {
+            goalEditor = nil
+            openGoalId = id
+        }
+        return problem
+    }
+
+    /// Makes a goal active, parks it, or ends it. Only so many are active
+    /// at once; making another active is refused here before it is asked.
+    public func setGoalStatus(_ id: UUID, _ status: GoalStatus, note: String? = nil) async -> String? {
+        if status == .active, let goals = home?.goals, goals.active.count >= goals.limit,
+            goals.goals.first(where: { $0.id == id })?.status != .active
+        {
+            return "\(goals.limit) goals are active. Park one first."
+        }
+        return await changeFood("change the goal") { api, token in
+            try await api.setGoalStatus(token: token, id: id, status: status, note: note)
+        }
+    }
+
+    /// Keeps a practice test's score for an exam. Needs a connection.
+    public func recordPractice(_ goal: UUID, _ entry: PracticeEntry) async -> String? {
+        await changeFood("keep the score") { api, token in
+            try await api.recordPractice(token: token, goal: goal, entry: entry)
+        }
+    }
+
+    /// Keeps how an exam went: a pass ends its goal as reached; a fail
+    /// leaves it, for its date to be moved to the next sitting.
+    public func recordExamResult(_ goal: UUID, passed: Bool, on: CalendarDay, score: Int?) async -> String? {
+        await changeFood("keep the result") { api, token in
+            try await api.recordExamResult(token: token, goal: goal, passed: passed, on: on, score: score)
+        }
+    }
+
     // MARK: Money
 
     /// Opens Money on the current month, showing the last answer until the
-    /// new one arrives.
+    /// new one arrives. It opens on the section it was left on.
     public func openMoney() {
         screen = .money
-        Task { await loadMoney(month: nil) }
+        Task {
+            await loadMoney(month: nil)
+            await reloadMoneySection()
+        }
     }
 
     public func closeMoney() {
         sortingEntry = nil
+        isEditingPlan = false
         screen = .home
         // Home's strip says how many are left to sort.
         Task { await reloadHome() }
@@ -622,12 +923,112 @@ public final class AppModel {
     }
 
     /// Sets an account aside, or brings it back. Returns what went wrong.
+    /// What is set aside changes what everything is made of and what
+    /// counts towards independence, so those are fetched again.
     @discardableResult
     public func setAside(account id: UUID, _ aside: Bool) async -> String? {
         guard let month = money?.month else { return "Open the month first." }
-        return await changeMoney("change the account") { api, token in
+        let problem = await changeMoney("change the account") { api, token in
             try await api.setMoneyAccount(token: token, id: id, setAside: aside, month: month)
         }
+        guard problem == nil else { return problem }
+        fire = nil
+        fireChanges += 1
+        if worth != nil { await loadWorth() }
+        return nil
+    }
+
+    /// Shows another of Money's sections, with the last answer until the
+    /// new one arrives.
+    public func showMoney(_ section: MoneySection) {
+        moneySection = section
+        moneyProblem = nil
+        Task { await reloadMoneySection() }
+    }
+
+    /// Fetches what the section on screen shows. The month has its own
+    /// way, since it is asked for by month.
+    public func reloadMoneySection() async {
+        switch moneySection {
+        case .month: break
+        case .worth: await loadWorth()
+        case .fire: await loadFire()
+        }
+    }
+
+    /// Fetches what everything comes to. One fetch at a time: asked for
+    /// again meanwhile, it is fetched once more when that one is back.
+    public func loadWorth() async {
+        guard phase == .signedIn else { return }
+        guard !isLoadingWorth else {
+            worthAskedAgain = true
+            return
+        }
+        isLoadingWorth = true
+        defer { isLoadingWorth = false }
+        repeat {
+            worthAskedAgain = false
+            let (answer, problem) = await askMoney("fetch what everything comes to") { api, token in
+                try await api.moneyWorth(token: token)
+            }
+            if let answer { worth = answer }
+            if moneySection == .worth { moneyProblem = problem }
+        } while worthAskedAgain && phase == .signedIn
+    }
+
+    /// Fetches how far off financial independence is, likewise. An answer
+    /// asked for before the plan or an account was changed is out of date
+    /// when it comes, and is asked for again instead of shown.
+    public func loadFire() async {
+        guard phase == .signedIn else { return }
+        guard !isLoadingFire else {
+            fireAskedAgain = true
+            return
+        }
+        isLoadingFire = true
+        defer { isLoadingFire = false }
+        repeat {
+            fireAskedAgain = false
+            let asked = fireChanges
+            let (answer, problem) = await askMoney("fetch the way to independence") { api, token in
+                try await api.moneyFire(token: token)
+            }
+            guard asked == fireChanges else {
+                fireAskedAgain = true
+                continue
+            }
+            if let answer { fire = answer }
+            if moneySection == .fire { moneyProblem = problem }
+        } while fireAskedAgain && phase == .signedIn
+    }
+
+    /// True while any of Money is being fetched.
+    public var isFetchingMoney: Bool {
+        isLoadingMoney || isLoadingWorth || isLoadingFire
+    }
+
+    /// Opens what FIRE assumes, to change it.
+    public func openPlan() {
+        guard fire != nil else { return }
+        isEditingPlan = true
+    }
+
+    public func closePlan() {
+        isEditingPlan = false
+    }
+
+    /// Says what to assume, and closes the entry once the backend has it.
+    /// Returns what went wrong, or nil.
+    @discardableResult
+    public func setPlan(_ plan: MoneyPlan) async -> String? {
+        let (answer, problem) = await askMoney("change what it assumes") { api, token in
+            try await api.setMoneyPlan(token: token, plan: plan)
+        }
+        guard let answer else { return problem }
+        fire = answer
+        fireChanges += 1
+        isEditingPlan = false
+        return nil
     }
 
     /// Asks the backend about money and shows the month it answers with.
@@ -635,27 +1036,39 @@ public final class AppModel {
     private func changeMoney(
         _ what: String, _ change: (LyfeAPI, String) async throws -> MoneyMonth
     ) async -> String? {
-        guard phase == .signedIn, let api, let token else { return "Sign in first." }
+        let (month, problem) = await askMoney(what, change)
+        if let month { money = month }
+        return problem
+    }
+
+    /// Asks the backend something about money. `what` finishes
+    /// "Could not …". Answers with what it said, or with what went wrong.
+    private func askMoney<Answer>(
+        _ what: String, _ ask: (LyfeAPI, String) async throws -> Answer
+    ) async -> (answer: Answer?, problem: String?) {
+        guard phase == .signedIn, let api, let token else { return (nil, "Sign in first.") }
         do {
-            money = try await change(api, token)
+            let answer = try await ask(api, token)
+            // Signed out while it was on its way: nothing of it is kept.
+            guard phase == .signedIn else { return (nil, "Signed out.") }
             isOffline = false
             offlineReason = nil
-            return nil
+            return (answer, nil)
         } catch LyfeAPIError.unauthorized {
             forgetSession()
-            return "Signed out."
+            return (nil, "Signed out.")
         } catch LyfeAPIError.unreachable(let why) {
             isOffline = true
             offlineReason = why
-            return "Could not \(what): can't reach the server (\(why))."
+            return (nil, "Could not \(what): can't reach the server (\(why)).")
         } catch LyfeAPIError.unreadableResponse {
-            return "The server's answer could not be read. The app may be older than the server."
+            return (nil, "The server's answer could not be read. The app may be older than the server.")
         } catch LyfeAPIError.server(let status) where (400..<500).contains(status) {
-            return "The server would not \(what) (\(status))."
+            return (nil, "The server would not \(what) (\(status)).")
         } catch LyfeAPIError.server(let status) {
-            return "Could not \(what): the server answered with an error (\(status))."
+            return (nil, "Could not \(what): the server answered with an error (\(status)).")
         } catch {
-            return "Could not \(what)."
+            return (nil, "Could not \(what).")
         }
     }
 
@@ -1368,6 +1781,30 @@ public final class AppModel {
         guard let png = try? await api.foodIllustration(token: token, illustration) else { return nil }
         illustrations.keep(png, for: illustration)
         return png
+    }
+
+    /// A food's icon as this phone has it, asking nobody: in the look the
+    /// backend draws now, else in whichever look it was kept, which is
+    /// shown rather than nothing until the new one comes.
+    public func keptFoodIcon(named name: String) -> Data? {
+        if let look = home?.food?.iconLook, let kept = foodIcons.picture(FoodIcon(name: name, look: look)) {
+            return kept
+        }
+        return foodIcons.anyPicture(named: name)
+    }
+
+    /// Asks the backend for a food's icon, and keeps it here once it is
+    /// drawn. Asking is what has the Spark draw it, so while the answer is
+    /// `waiting` it is worth asking again. None while the backend draws no
+    /// icons or cannot be reached.
+    public func askForFoodIcon(named name: String) async -> FoodIconAnswer {
+        guard let look = home?.food?.iconLook else { return .none }
+        let icon = FoodIcon(name: name, look: look)
+        if let kept = foodIcons.picture(icon) { return .drawn(kept) }
+        guard phase == .signedIn, let api, let token else { return .none }
+        guard let answer = try? await api.foodIcon(token: token, icon) else { return .none }
+        if case .drawn(let png) = answer { foodIcons.keep(png, for: icon) }
+        return answer
     }
 
     /// Makes a change to food that needs the backend now, and shows the

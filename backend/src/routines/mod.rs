@@ -1,9 +1,12 @@
 pub mod breath;
+pub mod exam;
 pub mod food;
+pub mod goals;
 pub mod gym;
 pub mod illustration;
 pub mod photo;
 pub mod product;
 pub mod streak;
+pub mod study;
 pub mod weekly;
 pub mod weight;

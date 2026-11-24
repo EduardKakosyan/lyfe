@@ -237,6 +237,14 @@ pub fn sort_all(rows: &[Row], rules: &HashMap<String, Rule>) -> Vec<Sorting> {
 /// minor units. Anything past the second decimal is rounded half away
 /// from zero. `None` for anything that is not a plain number.
 pub fn minor_units(text: &str) -> Option<i64> {
+    scaled(text, 2)
+}
+
+/// A plain decimal number in units of ten to the minus `places`: an amount
+/// in cents with two, a number of shares in millionths with six. Anything
+/// past that is rounded half away from zero. `None` for anything that is
+/// not a plain number.
+pub fn scaled(text: &str, places: usize) -> Option<i64> {
     let text = text.trim();
     let (negative, digits) = match text.strip_prefix('-') {
         Some(rest) => (true, rest),
@@ -249,12 +257,15 @@ pub fn minor_units(text: &str) -> Option<i64> {
     if !whole.chars().all(|c| c.is_ascii_digit()) || !fraction.chars().all(|c| c.is_ascii_digit()) {
         return None;
     }
-    let whole: i64 = if whole.is_empty() { 0 } else { whole.parse().ok()? };
-    let mut places = fraction.bytes().map(|b| i64::from(b - b'0'));
-    let cents = places.next().unwrap_or(0) * 10 + places.next().unwrap_or(0);
-    let round_up = places.next().is_some_and(|third| third >= 5);
-    let minor = whole.checked_mul(100)?.checked_add(cents + i64::from(round_up))?;
-    Some(if negative { -minor } else { minor })
+    let mut value: i64 = if whole.is_empty() { 0 } else { whole.parse().ok()? };
+    let mut rest = fraction.bytes().map(|b| i64::from(b - b'0'));
+    for _ in 0..places {
+        value = value.checked_mul(10)?.checked_add(rest.next().unwrap_or(0))?;
+    }
+    if rest.next().is_some_and(|next| next >= 5) {
+        value = value.checked_add(1)?;
+    }
+    Some(if negative { -value } else { value })
 }
 
 /// What a payee is told by, so the same shop is the same payee whatever
@@ -378,6 +389,8 @@ pub struct Account {
     pub available_minor: Option<i64>,
     pub balance_at: DateTime<Utc>,
     pub set_aside: bool,
+    /// The bank lists what it holds: an investment account.
+    pub invested: bool,
     pub problem: Option<String>,
 }
 
@@ -426,9 +439,29 @@ pub struct AccountView {
     #[serde(serialize_with = "seconds")]
     pub balance_at: DateTime<Utc>,
     pub set_aside: bool,
+    /// The bank lists what it holds: an investment account.
+    pub invested: bool,
     /// The bank has not refreshed the balance for some days.
     pub stale: bool,
     pub problem: Option<String>,
+}
+
+impl AccountView {
+    pub fn of(account: &Account, now: DateTime<Utc>) -> AccountView {
+        AccountView {
+            id: account.id,
+            name: account.name.clone(),
+            connection: account.connection.clone(),
+            currency: account.currency.clone(),
+            balance_minor: account.balance_minor,
+            available_minor: account.available_minor,
+            balance_at: account.balance_at,
+            set_aside: account.set_aside,
+            invested: account.invested,
+            stale: (now - account.balance_at).num_days() >= STALE_AFTER_DAYS,
+            problem: account.problem.clone(),
+        }
+    }
 }
 
 fn seconds<S: serde::Serializer>(at: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error> {
@@ -591,25 +624,33 @@ pub fn month(input: MonthInput<'_>) -> MonthView {
         previous,
         categories,
         entries: entries_shown,
-        accounts: accounts
-            .iter()
-            .map(|account| AccountView {
-                id: account.id,
-                name: account.name.clone(),
-                connection: account.connection.clone(),
-                currency: account.currency.clone(),
-                balance_minor: account.balance_minor,
-                available_minor: account.available_minor,
-                balance_at: account.balance_at,
-                set_aside: account.set_aside,
-                stale: (now - account.balance_at).num_days() >= STALE_AFTER_DAYS,
-                problem: account.problem.clone(),
-            })
-            .collect(),
+        accounts: accounts.iter().map(|account| AccountView::of(account, now)).collect(),
         everyday_minor: total(false),
         set_aside_minor: total(true),
         category_names: CATEGORIES.to_vec(),
     }
+}
+
+/// What came in and what was spent over a stretch of days.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Flow {
+    /// Expenses less refunds, sorted or not.
+    pub spent_minor: i64,
+    pub income_minor: i64,
+}
+
+/// Adds entries up by the month they count in, by the same rules as a
+/// month's own figures: in `currency` only, and money moved never counts.
+pub fn flows(entries: &[Entry], currency: &str) -> BTreeMap<Month, Flow> {
+    let mut months = BTreeMap::<Month, Flow>::new();
+    for entry in entries.iter().filter(|entry| entry.currency == currency) {
+        let flow = months.entry(Month::containing(entry.day)).or_default();
+        flow.spent_minor += entry.spent_minor();
+        if entry.sorting.kind == Kind::Income {
+            flow.income_minor += entry.amount_minor;
+        }
+    }
+    months
 }
 
 #[cfg(test)]
@@ -658,6 +699,18 @@ mod tests {
             assert_eq!(minor_units(wrong), None, "{wrong}");
         }
         assert_eq!(minor_units("99999999999999999999"), None);
+    }
+
+    #[test]
+    fn shares_are_read_to_the_millionth() {
+        assert_eq!(scaled("120.5", 6), Some(120_500_000));
+        assert_eq!(scaled("0.1234567", 6), Some(123_457));
+        assert_eq!(scaled("3", 6), Some(3_000_000));
+        assert_eq!(scaled("-0.0000005", 6), Some(-1));
+        assert_eq!(scaled("12", 0), Some(12));
+        assert_eq!(scaled("12.5", 0), Some(13));
+        assert_eq!(scaled("1e-7", 6), None);
+        assert_eq!(scaled("99999999999999", 6), None);
     }
 
     #[test]
@@ -834,6 +887,7 @@ mod tests {
             available_minor: None,
             balance_at: now() - chrono::Duration::days(age_days),
             set_aside,
+            invested: false,
             problem: None,
         }
     }
@@ -887,6 +941,31 @@ mod tests {
         assert_eq!(listed, vec![6, 5, 7, 4, 3, 2, 1]);
         assert!(view.current);
         assert_eq!((view.earlier, view.later), (Some(Month { year: 2026, month: 10 }), None));
+    }
+
+    #[test]
+    fn months_add_up_what_came_in_and_what_was_spent() {
+        let mut usd = entry(7, "2026-11-09", -9900, Kind::Expense, Some("Travel"));
+        usd.currency = "USD".into();
+        let entries = [
+            entry(1, "2026-11-02", -8000, Kind::Expense, Some("Groceries")),
+            entry(2, "2026-11-04", 1500, Kind::Refund, Some("Groceries")),
+            entry(3, "2026-11-06", -1300, Kind::Expense, None),
+            entry(4, "2026-11-10", -50000, Kind::Transfer, None),
+            entry(5, "2026-11-14", 300000, Kind::Income, None),
+            usd,
+            entry(8, "2026-10-20", -99900, Kind::Expense, Some("Home")),
+            entry(9, "2026-10-30", 250000, Kind::Income, None),
+        ];
+        let months = flows(&entries, "CAD");
+        assert_eq!(
+            months.into_iter().collect::<Vec<_>>(),
+            vec![
+                (Month { year: 2026, month: 10 }, Flow { spent_minor: 99900, income_minor: 250000 }),
+                (Month { year: 2026, month: 11 }, Flow { spent_minor: 8000 - 1500 + 1300, income_minor: 300000 }),
+            ]
+        );
+        assert!(flows(&entries, "EUR").is_empty());
     }
 
     #[test]

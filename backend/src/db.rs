@@ -7,12 +7,15 @@ use sqlx::Row;
 
 use uuid::Uuid;
 
-use crate::money::{self, ledger};
+use crate::money::{self, fire, ledger, worth};
 use crate::routines::breath;
 use crate::routines::food::{self, Detail, Figures, Label, PhotoDetail, Quantity, Slot};
+use crate::routines::exam;
+use crate::routines::goals;
 use crate::routines::illustration;
 use crate::routines::photo::{self, Oil};
 use crate::routines::product::{self, Origin, Product};
+use crate::routines::study;
 use crate::routines::gym::Activity;
 use crate::routines::weight::{self, Unit};
 
@@ -23,8 +26,36 @@ pub async fn connect(database_url: &str) -> anyhow::Result<PgPool> {
         .max_connections(5)
         .connect(database_url)
         .await?;
-    MIGRATOR.run(&pool).await?;
+    migrate(&pool).await?;
     Ok(pool)
+}
+
+/// A migration whose wording changed after databases had run it. It made
+/// only the two tables the next migration drops, so a database that ran
+/// the earlier wording ends up exactly where one that ran this wording
+/// does.
+const REWORDED_MIGRATION: i64 = 13;
+
+/// Brings the database up to date. Every migration already run must be the
+/// one in this build, as sqlx checks, except the reworded one: a database
+/// that ran its earlier wording, on the Spark or restored from a backup,
+/// is told it ran this one, so that it is not refused.
+pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
+    let reworded = MIGRATOR.iter().find(|migration| migration.version == REWORDED_MIGRATION);
+    let has_run_any: bool = sqlx::query_scalar("select to_regclass('_sqlx_migrations') is not null").fetch_one(pool).await?;
+    if let (Some(reworded), true) = (reworded, has_run_any) {
+        let accepted = sqlx::query("update _sqlx_migrations set checksum = $2 where version = $1 and success and checksum <> $2")
+            .bind(REWORDED_MIGRATION)
+            .bind(reworded.checksum.as_ref())
+            .execute(pool)
+            .await?
+            .rows_affected();
+        if accepted > 0 {
+            tracing::info!(version = REWORDED_MIGRATION, "a migration reworded since this database ran it is taken as run");
+        }
+    }
+    MIGRATOR.run(pool).await?;
+    Ok(())
 }
 
 // --- Owner and device sessions -------------------------------------------
@@ -372,6 +403,372 @@ pub async fn breath_sessions(pool: &PgPool, timezone: chrono_tz::Tz) -> sqlx::Re
             }
         })
         .collect())
+}
+
+// --- Study sessions ------------------------------------------------------
+
+/// A study session as the phone timed it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredStudySession {
+    pub id: Uuid,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: DateTime<Utc>,
+    pub active_s: i32,
+    /// The subject's name, as tidied by `study::subject_name`.
+    pub subject: String,
+    pub kind: study::Kind,
+    pub answered: Option<i32>,
+    pub right_first: Option<i32>,
+    pub explain_back: Option<String>,
+}
+
+/// Stores a session, and its subject when the name is new. Returns false,
+/// and changes nothing, when a session with this id is already stored.
+pub async fn insert_study_session(
+    pool: &PgPool,
+    session: &StoredStudySession,
+    device_session_id: i64,
+) -> sqlx::Result<bool> {
+    let mut tx = pool.begin().await?;
+    let known: bool = sqlx::query_scalar("select exists (select 1 from study_sessions where id = $1)")
+        .bind(session.id)
+        .fetch_one(&mut *tx)
+        .await?;
+    if known {
+        return Ok(false);
+    }
+    sqlx::query("insert into study_subjects (name) values ($1) on conflict ((lower(name))) do nothing")
+        .bind(&session.subject)
+        .execute(&mut *tx)
+        .await?;
+    let subject_id: Uuid = sqlx::query_scalar("select id from study_subjects where lower(name) = lower($1)")
+        .bind(&session.subject)
+        .fetch_one(&mut *tx)
+        .await?;
+    let inserted = sqlx::query(
+        "insert into study_sessions
+            (id, started_at, ended_at, active_s, subject_id, kind, answered, right_first, explain_back, device_session_id)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         on conflict (id) do nothing",
+    )
+    .bind(session.id)
+    .bind(session.started_at)
+    .bind(session.ended_at)
+    .bind(session.active_s)
+    .bind(subject_id)
+    .bind(session.kind.as_str())
+    .bind(session.answered)
+    .bind(session.right_first)
+    .bind(&session.explain_back)
+    .bind(device_session_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        == 1;
+    tx.commit().await?;
+    Ok(inserted)
+}
+
+/// Every study session, oldest first, with its start read in the owner's
+/// time zone.
+pub async fn study_sessions(pool: &PgPool, timezone: chrono_tz::Tz) -> sqlx::Result<Vec<study::Session>> {
+    let rows = sqlx::query(
+        "select s.id, s.started_at, s.active_s, s.subject_id, sub.name as subject, s.kind,
+                s.answered, s.right_first, s.explain_back
+         from study_sessions s
+         join study_subjects sub on sub.id = s.subject_id
+         order by s.started_at, s.id",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let started_at: DateTime<Utc> = r.get("started_at");
+            let kind: String = r.get("kind");
+            study::Session {
+                id: r.get("id"),
+                started_local: started_at.with_timezone(&timezone).naive_local(),
+                active_s: r.get::<i32, _>("active_s").max(0) as u32,
+                subject_id: r.get("subject_id"),
+                subject: r.get("subject"),
+                kind: study::Kind::parse(&kind).unwrap_or(study::Kind::Reading),
+                answered: r.get::<Option<i32>, _>("answered").map(|n| n.max(0) as u32),
+                right_first: r.get::<Option<i32>, _>("right_first").map(|n| n.max(0) as u32),
+                explain_back: r.get("explain_back"),
+            }
+        })
+        .collect())
+}
+
+// --- Goals ---------------------------------------------------------------
+
+/// Every goal with its changes, in no particular order.
+pub async fn goals(conn: &mut sqlx::PgConnection) -> sqlx::Result<Vec<goals::Goal>> {
+    let rows = sqlx::query(
+        "select g.id, g.title, g.reading, g.subject_id, s.name as subject, g.start_on, g.start_value,
+                g.target_value, g.due_on, g.status, g.ended_on, g.note
+         from goals g left join study_subjects s on s.id = g.subject_id
+         order by g.created_at, g.id",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    let changes = sqlx::query("select goal_id, changed_on, what, was, became from goal_changes order by id")
+        .fetch_all(&mut *conn)
+        .await?;
+    let mut exams = exams(conn).await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| {
+            let id: Uuid = r.get("id");
+            let reading: String = r.get("reading");
+            let status: String = r.get("status");
+            Some(goals::Goal {
+                id,
+                title: r.get("title"),
+                reading: goals::Reading::parse(&reading)?,
+                subject_id: r.get("subject_id"),
+                subject: r.get("subject"),
+                start_on: r.get("start_on"),
+                start_value: r.get("start_value"),
+                target_value: r.get("target_value"),
+                due_on: r.get("due_on"),
+                status: goals::Status::parse(&status)?,
+                ended_on: r.get("ended_on"),
+                note: r.get("note"),
+                changes: changes
+                    .iter()
+                    .filter(|c| c.get::<Uuid, _>("goal_id") == id)
+                    .map(|c| goals::Change {
+                        on: c.get("changed_on"),
+                        what: c.get("what"),
+                        was: c.get("was"),
+                        now: c.get("became"),
+                    })
+                    .collect(),
+                exam: exams.remove(&id),
+            })
+        })
+        .collect())
+}
+
+/// Every exam with its parts, practice and result, by its goal.
+async fn exams(conn: &mut sqlx::PgConnection) -> sqlx::Result<std::collections::HashMap<Uuid, exam::Exam>> {
+    let rows = sqlx::query(
+        "select goal_id, name, scale_max, pass_mark, ready_margin, ready_runs, valid_months, result, result_on, result_score
+         from exams",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    let domains = sqlx::query("select goal_id, name, weight_pct from exam_domains order by goal_id, position")
+        .fetch_all(&mut *conn)
+        .await?;
+    let practice = sqlx::query("select id, goal_id, taken_on, score from practice_scores order by taken_on, id")
+        .fetch_all(&mut *conn)
+        .await?;
+    let parts = sqlx::query("select score_id, domain, pct from practice_domain_scores order by score_id, domain")
+        .fetch_all(&mut *conn)
+        .await?;
+    let count = |r: &sqlx::postgres::PgRow, column: &str| r.get::<i32, _>(column).max(0) as u32;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let goal_id: Uuid = r.get("goal_id");
+            let result: Option<String> = r.get("result");
+            let exam = exam::Exam {
+                name: r.get("name"),
+                scale_max: count(&r, "scale_max"),
+                pass_mark: count(&r, "pass_mark"),
+                ready_margin: count(&r, "ready_margin"),
+                ready_runs: count(&r, "ready_runs"),
+                valid_months: r.get::<Option<i32>, _>("valid_months").map(|m| m.max(0) as u32),
+                domains: domains
+                    .iter()
+                    .filter(|d| d.get::<Uuid, _>("goal_id") == goal_id)
+                    .map(|d| exam::Domain { name: d.get("name"), weight_pct: count(d, "weight_pct") })
+                    .collect(),
+                result: result.as_deref().and_then(exam::Outcome::parse).map(|outcome| exam::Sitting {
+                    outcome,
+                    on: r.get("result_on"),
+                    score: r.get::<Option<i32>, _>("result_score").map(|n| n.max(0) as u32),
+                }),
+                practice: practice
+                    .iter()
+                    .filter(|p| p.get::<Uuid, _>("goal_id") == goal_id)
+                    .map(|p| {
+                        let id: Uuid = p.get("id");
+                        exam::Practice {
+                            id,
+                            taken_on: p.get("taken_on"),
+                            score: count(p, "score"),
+                            domains: parts
+                                .iter()
+                                .filter(|d| d.get::<Uuid, _>("score_id") == id)
+                                .map(|d| (d.get("domain"), count(d, "pct")))
+                                .collect(),
+                        }
+                    })
+                    .collect(),
+            };
+            (goal_id, exam)
+        })
+        .collect())
+}
+
+/// Stores what an exam is held to, its parts replaced by these. Its
+/// practice and result are left alone.
+pub async fn save_exam(conn: &mut sqlx::PgConnection, goal_id: Uuid, exam: &exam::Exam) -> sqlx::Result<()> {
+    sqlx::query(
+        "insert into exams (goal_id, name, scale_max, pass_mark, ready_margin, ready_runs, valid_months)
+         values ($1, $2, $3, $4, $5, $6, $7)
+         on conflict (goal_id) do update set name = excluded.name, scale_max = excluded.scale_max,
+            pass_mark = excluded.pass_mark, ready_margin = excluded.ready_margin,
+            ready_runs = excluded.ready_runs, valid_months = excluded.valid_months",
+    )
+    .bind(goal_id)
+    .bind(&exam.name)
+    .bind(exam.scale_max as i32)
+    .bind(exam.pass_mark as i32)
+    .bind(exam.ready_margin as i32)
+    .bind(exam.ready_runs as i32)
+    .bind(exam.valid_months.map(|m| m as i32))
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query("delete from exam_domains where goal_id = $1").bind(goal_id).execute(&mut *conn).await?;
+    for (index, domain) in exam.domains.iter().enumerate() {
+        sqlx::query("insert into exam_domains (goal_id, position, name, weight_pct) values ($1, $2, $3, $4)")
+            .bind(goal_id)
+            .bind(index as i32 + 1)
+            .bind(&domain.name)
+            .bind(domain.weight_pct as i32)
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Stores a practice test with how each part went. Returns false, and
+/// changes nothing, when one with this id is already stored.
+pub async fn insert_practice(conn: &mut sqlx::PgConnection, goal_id: Uuid, practice: &exam::Practice) -> sqlx::Result<bool> {
+    let inserted = sqlx::query(
+        "insert into practice_scores (id, goal_id, taken_on, score) values ($1, $2, $3, $4) on conflict (id) do nothing",
+    )
+    .bind(practice.id)
+    .bind(goal_id)
+    .bind(practice.taken_on)
+    .bind(practice.score as i32)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected()
+        == 1;
+    if inserted {
+        for (domain, pct) in &practice.domains {
+            sqlx::query("insert into practice_domain_scores (score_id, domain, pct) values ($1, $2, $3)")
+                .bind(practice.id)
+                .bind(domain)
+                .bind(*pct as i32)
+                .execute(&mut *conn)
+                .await?;
+        }
+    }
+    Ok(inserted)
+}
+
+pub async fn set_exam_result(conn: &mut sqlx::PgConnection, goal_id: Uuid, sitting: &exam::Sitting) -> sqlx::Result<()> {
+    sqlx::query("update exams set result = $2, result_on = $3, result_score = $4 where goal_id = $1")
+        .bind(goal_id)
+        .bind(sitting.outcome.as_str())
+        .bind(sitting.on)
+        .bind(sitting.score.map(|n| n as i32))
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// Holds every other change to goals back until this transaction ends, so
+/// two at once cannot both make a fourth goal active.
+pub async fn lock_goals(conn: &mut sqlx::PgConnection) -> sqlx::Result<()> {
+    sqlx::query("lock table goals in share row exclusive mode").execute(conn).await?;
+    Ok(())
+}
+
+pub async fn active_goals(conn: &mut sqlx::PgConnection, other_than: Uuid) -> sqlx::Result<i64> {
+    sqlx::query_scalar("select count(*) from goals where status = 'active' and id <> $1")
+        .bind(other_than)
+        .fetch_one(conn)
+        .await
+}
+
+/// The id of a study subject by its name whatever the case, made when new.
+pub async fn study_subject(conn: &mut sqlx::PgConnection, name: &str) -> sqlx::Result<Uuid> {
+    sqlx::query("insert into study_subjects (name) values ($1) on conflict ((lower(name))) do nothing")
+        .bind(name)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query_scalar("select id from study_subjects where lower(name) = lower($1)")
+        .bind(name)
+        .fetch_one(conn)
+        .await
+}
+
+pub async fn insert_goal(conn: &mut sqlx::PgConnection, goal: &goals::Goal) -> sqlx::Result<()> {
+    sqlx::query(
+        "insert into goals (id, title, reading, subject_id, start_on, start_value, target_value, due_on, status)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+    )
+    .bind(goal.id)
+    .bind(&goal.title)
+    .bind(goal.reading.as_str())
+    .bind(goal.subject_id)
+    .bind(goal.start_on)
+    .bind(goal.start_value)
+    .bind(goal.target_value)
+    .bind(goal.due_on)
+    .bind(goal.status.as_str())
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// Stores a goal's title, figure, date, status and note as they now are,
+/// and the changes that led there.
+pub async fn update_goal(
+    conn: &mut sqlx::PgConnection,
+    goal: &goals::Goal,
+    changes: &[goals::Change],
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "update goals set title = $2, target_value = $3, due_on = $4, status = $5, ended_on = $6, note = $7
+         where id = $1",
+    )
+    .bind(goal.id)
+    .bind(&goal.title)
+    .bind(goal.target_value)
+    .bind(goal.due_on)
+    .bind(goal.status.as_str())
+    .bind(goal.ended_on)
+    .bind(&goal.note)
+    .execute(&mut *conn)
+    .await?;
+    for change in changes {
+        sqlx::query("insert into goal_changes (goal_id, changed_on, what, was, became) values ($1, $2, $3, $4, $5)")
+            .bind(goal.id)
+            .bind(change.on)
+            .bind(&change.what)
+            .bind(&change.was)
+            .bind(&change.now)
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(())
+}
+
+/// The latest body-fat estimate on or before `day`.
+pub async fn latest_body_fat(conn: &mut sqlx::PgConnection, day: NaiveDate) -> sqlx::Result<Option<f64>> {
+    sqlx::query_scalar("select estimate from tape_entries where day <= $1 order by day desc, id desc limit 1")
+        .bind(day)
+        .fetch_optional(conn)
+        .await
 }
 
 // --- Weigh-ins -----------------------------------------------------------
@@ -1212,6 +1609,167 @@ pub async fn food_illustration(pool: &PgPool, id: Uuid) -> sqlx::Result<Option<V
     .await
 }
 
+// --- Food icons ----------------------------------------------------------
+
+/// A food's icon waiting to be drawn.
+#[derive(Debug, Clone)]
+pub struct PendingIcon {
+    pub id: Uuid,
+    /// The food's name, as the phone gave it.
+    pub name: String,
+    pub tries: i32,
+}
+
+/// Where a food's icon stands when the phone asks for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IconAsked {
+    /// Drawn, in the look of now.
+    Drawn(Vec<u8>),
+    /// Waiting to be drawn, since this asking or an earlier one.
+    Waiting,
+    /// The model could not draw it; it is not tried again in this look.
+    GivenUp,
+}
+
+/// The phone asks for a food's icon, which is what gets it drawn: one
+/// never asked for joins the queue, and so does one drawn, or given up on,
+/// in an older look. Asking again moves it to the front. `key` is
+/// `illustration::icon_key` of `name`.
+pub async fn ask_food_icon(pool: &PgPool, key: &str, name: &str) -> sqlx::Result<IconAsked> {
+    let row = sqlx::query(
+        "insert into food_icons (key, name) values ($1, $2)
+         on conflict (key) do update set
+            asked_at = now(),
+            tries = case when food_icons.due_at is null and coalesce(food_icons.look, 0) < $3 then 0
+                         else food_icons.tries end,
+            due_at = case when food_icons.due_at is null and coalesce(food_icons.look, 0) < $3 then now()
+                          else food_icons.due_at end
+         returning case when look = $3 then png end as png, due_at is not null as waiting",
+    )
+    .bind(key)
+    .bind(name.trim())
+    .bind(illustration::ICON_LOOK)
+    .fetch_one(pool)
+    .await?;
+    Ok(match (row.get::<Option<Vec<u8>>, _>("png"), row.get::<bool, _>("waiting")) {
+        (Some(png), false) => IconAsked::Drawn(png),
+        (_, true) => IconAsked::Waiting,
+        (None, false) => IconAsked::GivenUp,
+    })
+}
+
+/// How many icons there are of each kind: drawn, waiting, given up on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IconCounts {
+    pub drawn: i64,
+    pub waiting: i64,
+    pub given_up: i64,
+}
+
+/// Puts a food's icon in the queue ahead of anyone asking for it, so that
+/// it is already drawn when the phone first shows the food. `place` is
+/// where it stands in the list being queued: icons queued this way are
+/// drawn in that order, and after any the phone is asking for now. One
+/// already drawn in the look of now, waiting, or given up on is left as it
+/// is. Returns whether it was queued.
+pub async fn queue_food_icon(pool: &PgPool, key: &str, name: &str, place: i64) -> sqlx::Result<bool> {
+    let queued: Option<bool> = sqlx::query_scalar(
+        "insert into food_icons (key, name, asked_at) values ($1, $2, to_timestamp(-$4::float8))
+         on conflict (key) do update set tries = 0, due_at = now(), asked_at = excluded.asked_at
+            where food_icons.due_at is null and coalesce(food_icons.look, 0) < $3
+         returning true",
+    )
+    .bind(key)
+    .bind(name.trim())
+    .bind(illustration::ICON_LOOK)
+    .bind(place)
+    .fetch_optional(pool)
+    .await?;
+    Ok(queued.is_some())
+}
+
+pub async fn food_icon_counts(pool: &PgPool) -> sqlx::Result<IconCounts> {
+    let row = sqlx::query(
+        "select count(*) filter (where png is not null and look = $1) as drawn,
+                count(*) filter (where due_at is not null) as waiting,
+                count(*) filter (where due_at is null and (png is null or look <> $1)) as given_up
+         from food_icons",
+    )
+    .bind(illustration::ICON_LOOK)
+    .fetch_one(pool)
+    .await?;
+    Ok(IconCounts { drawn: row.get("drawn"), waiting: row.get("waiting"), given_up: row.get("given_up") })
+}
+
+/// The icon whose turn has come that was asked for latest: the one the
+/// owner is looking at now, ahead of ones scrolled past earlier, and
+/// those ahead of ones queued before anyone asked.
+pub async fn next_pending_food_icon(pool: &PgPool) -> sqlx::Result<Option<PendingIcon>> {
+    let row = sqlx::query(
+        "select id, name, tries from food_icons where due_at <= now() order by asked_at desc, key limit 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| PendingIcon { id: r.get("id"), name: r.get("name"), tries: r.get("tries") }))
+}
+
+/// Keeps a food's icon, drawn in the look of now, in place of one drawn in
+/// an older look if it had one. Returns false when it was not waiting.
+pub async fn record_food_icon(pool: &PgPool, id: Uuid, png: &[u8]) -> sqlx::Result<bool> {
+    let result = sqlx::query(
+        "update food_icons set png = $2, look = $3, drawn_at = now(), due_at = null, problem = null, tries = 0
+         where id = $1 and due_at is not null",
+    )
+    .bind(id)
+    .bind(png)
+    .bind(illustration::ICON_LOOK)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// An icon the model could not draw. It is tried again after `retry_in`,
+/// and after `illustration::MAX_TRIES` failures not until the look moves
+/// on. Returns true when it has been given up on. One that was being drawn
+/// again keeps the drawing it had.
+pub async fn record_food_icon_problem(
+    pool: &PgPool,
+    id: Uuid,
+    problem: &str,
+    retry_in: chrono::Duration,
+) -> sqlx::Result<bool> {
+    let gave_up: Option<bool> = sqlx::query_scalar(
+        "update food_icons set
+            problem = $2,
+            tries = tries + 1,
+            look = case when tries + 1 >= $4 then $5 else look end,
+            due_at = case when tries + 1 >= $4 then null else now() + make_interval(secs => $3) end
+         where id = $1 and due_at is not null
+         returning due_at is null",
+    )
+    .bind(id)
+    .bind(problem)
+    .bind(retry_in.num_seconds() as f64)
+    .bind(illustration::MAX_TRIES)
+    .bind(illustration::ICON_LOOK)
+    .fetch_optional(pool)
+    .await?;
+    Ok(gave_up.unwrap_or(false))
+}
+
+/// Puts off every icon whose turn has come, when the Spark cannot draw any
+/// of them now. No icon is blamed for it.
+pub async fn put_off_food_icons(pool: &PgPool, problem: &str, retry_in: chrono::Duration) -> sqlx::Result<u64> {
+    let result = sqlx::query(
+        "update food_icons set problem = $1, due_at = now() + make_interval(secs => $2) where due_at <= now()",
+    )
+    .bind(problem)
+    .bind(retry_in.num_seconds() as f64)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 // --- Packaged food -------------------------------------------------------
 
 fn read_product(r: &sqlx::postgres::PgRow, origin: Origin) -> Product {
@@ -1688,7 +2246,9 @@ pub async fn upsert_money_connection(
 /// Stores an account's name and balance as the bank has them now, and
 /// returns lyfe's id for it. A new account that holds investments starts
 /// set aside; after that, whether it is set aside is the owner's to say
-/// and is left alone.
+/// and is left alone. Whether it is an investment account is the bank's
+/// to say, each time it lists what the account holds; an answer with no
+/// such list leaves that as it was.
 pub async fn upsert_money_account(
     conn: &mut sqlx::PgConnection,
     account: &money::BankAccount,
@@ -1696,12 +2256,13 @@ pub async fn upsert_money_account(
 ) -> sqlx::Result<Uuid> {
     sqlx::query_scalar(
         "insert into money_accounts
-            (connection_id, provider_id, name, currency, balance_minor, available_minor, balance_at, problem, set_aside)
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            (connection_id, provider_id, name, currency, balance_minor, available_minor, balance_at, problem,
+             set_aside, invested)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, coalesce($10, false))
          on conflict (connection_id, provider_id) do update set
             name = excluded.name, currency = excluded.currency, balance_minor = excluded.balance_minor,
             available_minor = excluded.available_minor, balance_at = excluded.balance_at,
-            problem = excluded.problem, seen_at = now()
+            problem = excluded.problem, invested = coalesce($10, money_accounts.invested), seen_at = now()
          returning id",
     )
     .bind(&account.connection_id)
@@ -1713,8 +2274,66 @@ pub async fn upsert_money_account(
     .bind(account.balance_at)
     .bind(problem)
     .bind(account.holds_investments)
+    .bind(account.holdings.as_ref().map(|_| account.holds_investments))
     .fetch_one(conn)
     .await
+}
+
+/// Keeps what an account's balance was on `day`: the last one seen that
+/// day stands.
+pub async fn keep_money_balance(
+    conn: &mut sqlx::PgConnection,
+    account_id: Uuid,
+    day: NaiveDate,
+    balance_minor: i64,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "insert into money_balances (account_id, day, balance_minor) values ($1, $2, $3)
+         on conflict (account_id, day) do update set balance_minor = excluded.balance_minor",
+    )
+    .bind(account_id)
+    .bind(day)
+    .bind(balance_minor)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// Makes what an account holds what the bank lists now: a holding it no
+/// longer lists was sold and goes, and the rest are brought up to date.
+pub async fn replace_money_holdings(
+    conn: &mut sqlx::PgConnection,
+    account_id: Uuid,
+    holdings: &[money::BankHolding],
+) -> sqlx::Result<()> {
+    let listed: Vec<&str> = holdings.iter().map(|holding| holding.id.as_str()).collect();
+    sqlx::query("delete from money_holdings where account_id = $1 and provider_id <> all($2)")
+        .bind(account_id)
+        .bind(&listed)
+        .execute(&mut *conn)
+        .await?;
+    for holding in holdings {
+        sqlx::query(
+            "insert into money_holdings
+                (account_id, provider_id, symbol, name, currency, shares_micro, value_minor, cost_minor)
+             values ($1, $2, $3, $4, $5, $6, $7, $8)
+             on conflict (account_id, provider_id) do update set
+                symbol = excluded.symbol, name = excluded.name, currency = excluded.currency,
+                shares_micro = excluded.shares_micro, value_minor = excluded.value_minor,
+                cost_minor = excluded.cost_minor, seen_at = now()",
+        )
+        .bind(account_id)
+        .bind(&holding.id)
+        .bind(&holding.symbol)
+        .bind(&holding.name)
+        .bind(&holding.currency)
+        .bind(holding.shares_micro)
+        .bind(holding.value_minor)
+        .bind(holding.cost_minor)
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(())
 }
 
 /// What storing one transaction came to.
@@ -1914,17 +2533,33 @@ pub async fn money_history(pool: &PgPool, from: NaiveDate, to: NaiveDate) -> sql
     Ok(ledger::History { first: row.get("first"), before: row.get("before"), after: row.get("after") })
 }
 
-/// The accounts the bridge still lists, a bank at a time. One whose
-/// connection was deleted at the bridge drops out; what was imported from
-/// it stays in its months.
+/// True of a connection `c` the bridge still lists: one seen in the last
+/// import. One deleted at the bridge drops out.
+const MONEY_LISTED: &str = "c.seen_at >= (select max(seen_at) from money_connections) - interval '1 hour'";
+
+/// True of an account `a` under a connection `c` when the bridge still
+/// lists both: the account was seen in the last import, like its
+/// connection. One closed at its bank drops out. While its bank has a
+/// problem, an account is held to the last import that bank's accounts
+/// were seen in instead: a bank waiting to be signed in to again has not
+/// lost its accounts, whether or not the bridge goes on listing them, and
+/// one closed before that stays out.
+const MONEY_ACCOUNT_LISTED: &str = "c.seen_at >= (select max(seen_at) from money_connections) - interval '1 hour'
+    and a.seen_at >= (case when c.problem is null then (select max(seen_at) from money_accounts)
+                           else (select max(sibling.seen_at) from money_accounts sibling
+                                 where sibling.connection_id = a.connection_id) end) - interval '1 hour'";
+
+/// The accounts the bridge still lists, a bank at a time. One closed at
+/// its bank, or whose connection was deleted at the bridge, drops out;
+/// what was imported from it stays in its months.
 pub async fn money_accounts(pool: &PgPool) -> sqlx::Result<Vec<ledger::Account>> {
-    let rows = sqlx::query(
+    let rows = sqlx::query(&format!(
         "select a.id, a.name, c.name as connection, a.currency, a.balance_minor, a.available_minor, a.balance_at,
-                a.set_aside, a.problem
+                a.set_aside, a.invested, a.problem
          from money_accounts a join money_connections c on c.id = a.connection_id
-         where c.seen_at >= (select max(seen_at) from money_connections) - interval '1 hour'
-         order by a.set_aside, c.name, a.name, a.id",
-    )
+         where {MONEY_ACCOUNT_LISTED}
+         order by a.set_aside, c.name, a.name, a.id"
+    ))
     .fetch_all(pool)
     .await?;
     Ok(rows
@@ -1938,9 +2573,89 @@ pub async fn money_accounts(pool: &PgPool) -> sqlx::Result<Vec<ledger::Account>>
             available_minor: r.get("available_minor"),
             balance_at: r.get("balance_at"),
             set_aside: r.get("set_aside"),
+            invested: r.get("invested"),
             problem: r.get("problem"),
         })
         .collect())
+}
+
+/// What the accounts the bridge still lists hold.
+pub async fn money_holdings(pool: &PgPool) -> sqlx::Result<Vec<worth::Holding>> {
+    let rows = sqlx::query(&format!(
+        "select h.account_id, h.symbol, h.name, h.currency, h.shares_micro, h.value_minor, h.cost_minor
+         from money_holdings h join money_accounts a on a.id = h.account_id
+              join money_connections c on c.id = a.connection_id
+         where {MONEY_ACCOUNT_LISTED}
+         order by a.name, a.id, h.provider_id"
+    ))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| worth::Holding {
+            account_id: r.get("account_id"),
+            symbol: r.get("symbol"),
+            name: r.get("name"),
+            currency: r.get("currency"),
+            shares_micro: r.get("shares_micro"),
+            value_minor: r.get("value_minor"),
+            cost_minor: r.get("cost_minor"),
+        })
+        .collect())
+}
+
+/// Every balance kept, of every account ever imported: an account closed
+/// since still counts on the days it was there.
+pub async fn money_balances(pool: &PgPool) -> sqlx::Result<Vec<worth::Balance>> {
+    let rows = sqlx::query(
+        "select b.account_id, a.currency, b.day, b.balance_minor
+         from money_balances b join money_accounts a on a.id = b.account_id
+         order by b.day, b.account_id",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| worth::Balance {
+            account_id: r.get("account_id"),
+            currency: r.get("currency"),
+            day: r.get("day"),
+            balance_minor: r.get("balance_minor"),
+        })
+        .collect())
+}
+
+/// What the owner assumes about the way to financial independence.
+pub async fn money_plan(pool: &PgPool) -> sqlx::Result<fire::Plan> {
+    let row = sqlx::query("select withdrawal_bp, return_bp, birth_year, coast_age from money_plan").fetch_optional(pool).await?;
+    Ok(row.map_or_else(fire::Plan::default, |r| fire::Plan {
+        withdrawal_bp: r.get::<i32, _>("withdrawal_bp") as u32,
+        return_bp: r.get::<i32, _>("return_bp") as u32,
+        birth_year: r.get("birth_year"),
+        coast_age: r.get::<i32, _>("coast_age") as u32,
+    }))
+}
+
+pub async fn set_money_plan(pool: &PgPool, plan: &fire::Plan) -> sqlx::Result<()> {
+    sqlx::query(
+        "insert into money_plan (id, withdrawal_bp, return_bp, birth_year, coast_age) values (true, $1, $2, $3, $4)
+         on conflict (id) do update set
+            withdrawal_bp = excluded.withdrawal_bp, return_bp = excluded.return_bp,
+            birth_year = excluded.birth_year, coast_age = excluded.coast_age",
+    )
+    .bind(plan.withdrawal_bp as i32)
+    .bind(plan.return_bp as i32)
+    .bind(plan.birth_year)
+    .bind(plan.coast_age as i32)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The day of the oldest entry stored, which is as far back as a month can
+/// be held whole.
+pub async fn money_first_day(pool: &PgPool) -> sqlx::Result<Option<NaiveDate>> {
+    sqlx::query_scalar("select min(day) from money_entries").fetch_one(pool).await
 }
 
 /// A connection the bridge says is broken.
@@ -1953,11 +2668,11 @@ pub struct BrokenConnection {
 }
 
 pub async fn broken_money_connections(pool: &PgPool) -> sqlx::Result<Vec<BrokenConnection>> {
-    let rows = sqlx::query(
-        "select name, problem_code, problem, problem_since from money_connections
-         where problem is not null and seen_at >= (select max(seen_at) from money_connections) - interval '1 hour'
-         order by problem_since, name",
-    )
+    let rows = sqlx::query(&format!(
+        "select c.name, c.problem_code, c.problem, c.problem_since from money_connections c
+         where c.problem is not null and {MONEY_LISTED}
+         order by c.problem_since, c.name"
+    ))
     .fetch_all(pool)
     .await?;
     Ok(rows
