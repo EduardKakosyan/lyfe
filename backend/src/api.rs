@@ -108,6 +108,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/money", get(money::month))
         .route("/v1/money/entries/{id}/sort", post(money::sort))
         .route("/v1/money/accounts/{id}", put(money::set_account))
+        .route("/v1/money/accounts/{id}/currency", put(money::set_account_currency))
         .route("/v1/money/worth", get(money::worth))
         .route("/v1/money/fire", get(money::fire))
         .route("/v1/money/plan", put(money::set_plan))

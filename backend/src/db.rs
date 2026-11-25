@@ -2256,11 +2256,11 @@ pub async fn upsert_money_account(
 ) -> sqlx::Result<Uuid> {
     sqlx::query_scalar(
         "insert into money_accounts
-            (connection_id, provider_id, name, currency, balance_minor, available_minor, balance_at, problem,
+            (connection_id, provider_id, name, bank_currency, balance_minor, available_minor, balance_at, problem,
              set_aside, invested)
          values ($1, $2, $3, $4, $5, $6, $7, $8, $9, coalesce($10, false))
          on conflict (connection_id, provider_id) do update set
-            name = excluded.name, currency = excluded.currency, balance_minor = excluded.balance_minor,
+            name = excluded.name, bank_currency = excluded.bank_currency, balance_minor = excluded.balance_minor,
             available_minor = excluded.available_minor, balance_at = excluded.balance_at,
             problem = excluded.problem, invested = coalesce($10, money_accounts.invested), seen_at = now(),
             set_aside = money_accounts.set_aside or (coalesce($10, false) and not money_accounts.invested)
@@ -2565,7 +2565,8 @@ const MONEY_ACCOUNT_LISTED: &str = "c.seen_at >= (select max(seen_at) from money
 pub async fn money_accounts(pool: &PgPool) -> sqlx::Result<Vec<ledger::Account>> {
     let rows = sqlx::query(&format!(
         "select a.id, a.name, c.name as connection, a.currency, a.balance_minor, a.available_minor, a.balance_at,
-                a.set_aside, a.invested, a.problem
+                a.set_aside, a.invested, a.problem,
+                case when a.owner_currency <> a.bank_currency then a.bank_currency end as bank_currency
          from money_accounts a join money_connections c on c.id = a.connection_id
          where {MONEY_ACCOUNT_LISTED}
          order by a.set_aside, c.name, a.name, a.id"
@@ -2585,6 +2586,7 @@ pub async fn money_accounts(pool: &PgPool) -> sqlx::Result<Vec<ledger::Account>>
             set_aside: r.get("set_aside"),
             invested: r.get("invested"),
             problem: r.get("problem"),
+            bank_currency: r.get("bank_currency"),
         })
         .collect())
 }
@@ -2592,7 +2594,8 @@ pub async fn money_accounts(pool: &PgPool) -> sqlx::Result<Vec<ledger::Account>>
 /// What the accounts the bridge still lists hold.
 pub async fn money_holdings(pool: &PgPool) -> sqlx::Result<Vec<worth::Holding>> {
     let rows = sqlx::query(&format!(
-        "select h.account_id, h.symbol, h.name, h.currency, h.shares_micro, h.value_minor, h.cost_minor
+        "select h.account_id, h.symbol, h.name, coalesce(h.currency, a.currency) as currency, h.shares_micro,
+                h.value_minor, h.cost_minor
          from money_holdings h join money_accounts a on a.id = h.account_id
               join money_connections c on c.id = a.connection_id
          where {MONEY_ACCOUNT_LISTED}
@@ -2762,6 +2765,17 @@ pub async fn set_money_rule(conn: &mut sqlx::PgConnection, payee_key: &str, rule
 
 /// Sets an account aside or brings it back. False when there is no such
 /// account.
+/// Says what currency an account is in, whatever the bank says; `None`
+/// takes the owner's word back. False when there is no such account.
+pub async fn set_money_account_currency(conn: &mut sqlx::PgConnection, id: Uuid, currency: Option<&str>) -> sqlx::Result<bool> {
+    let result = sqlx::query("update money_accounts set owner_currency = $2 where id = $1")
+        .bind(id)
+        .bind(currency)
+        .execute(conn)
+        .await?;
+    Ok(result.rows_affected() == 1)
+}
+
 pub async fn set_money_account_aside(conn: &mut sqlx::PgConnection, id: Uuid, set_aside: bool) -> sqlx::Result<bool> {
     let result = sqlx::query("update money_accounts set set_aside = $2 where id = $1")
         .bind(id)

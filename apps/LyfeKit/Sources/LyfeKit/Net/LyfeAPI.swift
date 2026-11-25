@@ -480,6 +480,18 @@ public struct LyfeAPI: Sendable {
             "PUT", "v1/money/accounts/\(id.uuidString.lowercased())", token: token, body: body, timeout: 15)
     }
 
+    /// Says what currency an account is in, whatever the bank says; nil
+    /// takes the bank's word again.
+    public func setMoneyAccountCurrency(token: String, id: UUID, currency: String?, month: String) async throws -> MoneyMonth {
+        struct Body: Encodable {
+            var currency: String?
+            var month: String
+        }
+        let body = try JSONEncoder.lyfe.encode(Body(currency: currency, month: month))
+        return try await call(
+            "PUT", "v1/money/accounts/\(id.uuidString.lowercased())/currency", token: token, body: body, timeout: 15)
+    }
+
     /// What everything comes to, the line it has drawn, and what the
     /// investments are in.
     public func moneyWorth(token: String) async throws -> MoneyWorth {

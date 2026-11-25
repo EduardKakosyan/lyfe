@@ -938,6 +938,20 @@ public final class AppModel {
         return nil
     }
 
+    /// Says what currency an account is in where the bank has it wrong, or
+    /// takes that back with nil. Which totals it is in changes everything.
+    public func setCurrency(account id: UUID, _ currency: String?) async -> String? {
+        guard let month = money?.month else { return "Open the month first." }
+        let problem = await changeMoney("change the account") { api, token in
+            try await api.setMoneyAccountCurrency(token: token, id: id, currency: currency, month: month)
+        }
+        guard problem == nil else { return problem }
+        fire = nil
+        fireChanges += 1
+        if worth != nil { await loadWorth() }
+        return nil
+    }
+
     /// Shows another of Money's sections, with the last answer until the
     /// new one arrives.
     public func showMoney(_ section: MoneySection) {

@@ -4751,6 +4751,74 @@ async fn an_account_first_seen_holding_investments_is_set_aside_once(pool: PgPoo
     assert_eq!(account_named(&h.worth(&token).await, "Brokerage")["set_aside"], false);
 }
 
+#[sqlx::test(migrator = "lyfe_server::db::MIGRATOR")]
+async fn an_account_the_bank_puts_in_the_wrong_currency_is_counted_in_the_owners(pool: PgPool) {
+    let (h, bridge) = banked(pool).await;
+    let token = h.signed_in().await;
+    let (chequing, card) = chequing_and_card();
+    // The bridge says the brokerage is in dollars of another kind. One
+    // holding gives no currency of its own; the other says USD itself.
+    let mut brokerage = with_holdings(
+        bank_account("ACT-3", "Brokerage", "20000.00", vec![]),
+        json!([
+            {"id": "H1", "currency": "", "symbol": "WRLD", "description": "Whole World Equity Fund",
+             "shares": "300", "market_value": "15000.00", "cost_basis": "12000.00"},
+            {"id": "H2", "currency": "USD", "symbol": "BIG", "description": "Big Tech Co",
+             "shares": "10", "market_value": "4000.00", "cost_basis": "0.00"},
+        ]),
+    );
+    brokerage["currency"] = json!("USD");
+    let answer = bridge_answer(
+        vec![bank_account("ACT-1", "Chequing", "2500.00", chequing), bank_account("ACT-2", "Card", "-120.00", card), brokerage],
+        json!([]),
+    );
+    bridge_answers(&bridge, answer).await;
+    h.import().await;
+
+    // Nothing is converted, so it is in no total and counts for nothing.
+    let worth = h.worth(&token).await;
+    let account = account_named(&worth, "Brokerage").clone();
+    assert_eq!((&account["currency"], &account["bank_currency"], &account["set_aside"]), (&json!("USD"), &json!(null), &json!(true)));
+    assert_eq!((&worth["currency"], &worth["invested_minor"]), (&json!("CAD"), &json!(0)));
+    assert_eq!(h.fire(&token).await["set_aside_minor"], 0);
+
+    let uri = format!("/v1/money/accounts/{}/currency", account["id"].as_str().unwrap());
+    let (status, _) = h.put(&uri, None, json!({"currency": "CAD"})).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    for wrong in ["cad", "CA", "C4D"] {
+        let (status, _) = h.put(&uri, Some(&token), json!({"currency": wrong})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{wrong}");
+    }
+    let (status, _) = h.put(&format!("/v1/money/accounts/{}/currency", uuid::Uuid::nil()), Some(&token), json!({"currency": "CAD"})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // The owner says it is in CAD: it counts, with the holding that gave no
+    // currency of its own; the one the bank said is in USD stays in USD.
+    let (status, month) = h.put(&uri, Some(&token), json!({"currency": "CAD"})).await;
+    assert_eq!(status, StatusCode::OK, "{month}");
+    assert_eq!(account_named(&month, "Brokerage")["currency"], "CAD");
+    let check = |worth: &Value| {
+        let account = account_named(worth, "Brokerage");
+        assert_eq!((&account["currency"], &account["bank_currency"]), (&json!("CAD"), &json!("USD")));
+        assert_eq!(worth["invested_minor"], 2000000);
+        let currencies = worth["holdings"].as_array().unwrap().iter().map(|h| (h["symbol"].as_str().unwrap(), h["currency"].as_str().unwrap())).collect::<Vec<_>>();
+        assert_eq!(currencies, [("WRLD", "CAD"), ("BIG", "USD")]);
+    };
+    check(&h.worth(&token).await);
+    assert_eq!(h.fire(&token).await["set_aside_minor"], 2000000);
+
+    // The bank goes on saying USD; the owner's word stands.
+    h.import().await;
+    check(&h.worth(&token).await);
+
+    // Taken back, it is the bank's word again.
+    let (status, _) = h.put(&uri, Some(&token), json!({"currency": null})).await;
+    assert_eq!(status, StatusCode::OK);
+    let worth = h.worth(&token).await;
+    let account = account_named(&worth, "Brokerage");
+    assert_eq!((&account["currency"], &account["bank_currency"], &worth["invested_minor"]), (&json!("USD"), &json!(null), &json!(0)));
+}
+
 #[tokio::test]
 async fn a_setup_token_is_traded_once_for_the_access_address() {
     use base64::Engine;
