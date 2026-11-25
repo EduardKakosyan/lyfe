@@ -310,7 +310,7 @@ docker exec lyfe-dev-db createdb -U postgres lyfe_restored
 docker exec -i lyfe-dev-db pg_restore -U postgres --no-owner --dbname=lyfe_restored < lyfe.dump
 ```
 
-The backend can then run against it as in [Working on it locally](../README.md#working-on-it-locally), with that `LYFE_DATABASE_URL`. Delete `lyfe.dump` and the copies of the secrets when done.
+The backend can then run against it as in [the README](../README.md#on-a-mac), with that `LYFE_DATABASE_URL`. Delete `lyfe.dump` and the copies of the secrets when done.
 
 ## Security model
 

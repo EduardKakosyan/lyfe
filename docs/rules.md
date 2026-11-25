@@ -15,7 +15,7 @@ The types and the minimum are settings (`LYFE_GYM_ACTIVITY_TYPES`, `LYFE_GYM_MIN
 
 ## Streaks and recovery
 
-The rules are one module shared by every routine (`backend/src/routines/streak.rs`). The gym, breath training and study apply them to weeks (`weekly.rs`): four sessions keep a gym week, three keep a breath week, four days of study keep a study week. Food logging applies them to days ([Food](#food)).
+The rules are one module shared by every routine (`backend/src/routines/streak.rs`). The gym, breath training and study apply them to weeks (`weekly.rs`): four days with a session keep a gym week, three keep a breath week, four days of study keep a study week. Food logging applies them to days ([Food](#food)).
 
 - A week that reaches its count is kept, and the streak counts kept weeks in a row. The current week counts as soon as it reaches its count.
 - One missed week does not end the streak. Keeping the very next week recovers it, and the missed week is then shown as recovered (striped). Nothing has to be made up, and a missed week never adds to the count.

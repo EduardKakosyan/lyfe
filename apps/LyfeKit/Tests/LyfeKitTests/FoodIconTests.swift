@@ -132,7 +132,7 @@ struct FoodIconTests {
 /// Runs the app's own client against a backend started for the purpose:
 /// a food's icon is asked for, drawn and fetched, and a food typed as its
 /// macros is logged and read back. The backend's LYFE_ILLUSTRATOR should
-/// be the stand-in (see the README), and its database a scratch one:
+/// be the stand-in (see docs/development.md), and its database a scratch one:
 /// `LYFE_LOCAL_SERVER=http://127.0.0.1:8799 LYFE_LOCAL_PASSWORD=... swift test`.
 @MainActor
 @Suite(.enabled(if: ProcessInfo.processInfo.environment["LYFE_LOCAL_SERVER"] != nil))
@@ -149,7 +149,7 @@ struct IconsAndMacrosAgainstARealBackendTests {
 
     @Test func aFoodsIconIsDrawnOnceAskedForAndKept() async throws {
         let (world, model) = try await signedIn()
-        let look = try #require(model.home?.food?.iconLook, "set LYFE_ILLUSTRATOR to the stand-in (see the README)")
+        let look = try #require(model.home?.food?.iconLook, "set LYFE_ILLUSTRATOR to the stand-in (see docs/development.md)")
         // A name of its own each run, as the catalogue spells them, so it
         // is drawn afresh.
         let name = "Client check, raw, with salt & 2% \(Int.random(in: 0..<1_000_000))"
