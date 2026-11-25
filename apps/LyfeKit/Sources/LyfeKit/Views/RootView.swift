@@ -93,6 +93,7 @@ public struct RootView: View {
                                 onBack: { model.closeMoney() }, onMonth: { await model.loadMoney(month: $0) },
                                 onSort: { model.openSorting($0) }, onSortNext: { model.openSortingNext() },
                                 onSetAside: { await model.setAside(account: $0, $1) },
+                                onCurrency: { await model.setCurrency(account: $0, $1) },
                                 onSection: { model.showMoney($0) }, onReload: { await model.reloadMoneySection() },
                                 onPlan: { model.openPlan() })
                         }

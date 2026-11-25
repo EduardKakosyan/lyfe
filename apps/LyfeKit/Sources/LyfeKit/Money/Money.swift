@@ -122,6 +122,9 @@ public struct MoneyMonth: Codable, Equatable, Sendable {
         /// The bank lists what it holds: an investment account. Missing in
         /// an answer from a backend older than that.
         public var invested: Bool?
+        /// What the bank says the account is in, where the owner said it is
+        /// in `currency` instead.
+        public var bankCurrency: String?
     }
 
     public struct Problem: Codable, Equatable, Sendable, Hashable {
@@ -288,6 +291,7 @@ public enum MoneyText {
         var parts = [account.connection.uppercased()]
         if account.invested == true { parts.append("INVESTED") }
         if account.setAside { parts.append("SET ASIDE") }
+        if let bank = account.bankCurrency { parts.append("THE BANK SAYS \(bank)") }
         if let problem = account.problem {
             parts.append(problem.uppercased())
         } else if account.stale {
@@ -344,6 +348,21 @@ public enum MoneyText {
         guard problem.reconnect else { return problem.text }
         let said = problem.text.hasSuffix(".") ? String(problem.text.dropLast()) : problem.text
         return "\(said). Sign in to it again at SimpleFIN Bridge."
+    }
+
+    /// What can be said of an account's currency, with the currency it
+    /// would then be in: that it is in the totals' when the bank put it in
+    /// another, or to take that back. Nil when there is nothing to say.
+    static func currencyChoice(_ account: MoneyMonth.Account, totals: String) -> (label: String, currency: String?)? {
+        if let bank = account.bankCurrency { return ("Back to the bank's \(bank)", nil) }
+        if account.currency != totals { return ("It is in \(totals), not \(account.currency)", totals) }
+        return nil
+    }
+
+    /// Under the question, for an account the bank puts in another currency.
+    static func currencyNote(_ account: MoneyMonth.Account, totals: String) -> String? {
+        guard account.bankCurrency == nil, account.currency != totals else { return nil }
+        return "The bank says it is in \(account.currency). Nothing is converted, so it is left out of every total until you say it is in \(totals)."
     }
 
     static func asideQuestion(_ account: MoneyMonth.Account) -> String {

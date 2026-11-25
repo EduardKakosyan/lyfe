@@ -234,6 +234,38 @@ pub(super) async fn set_account(
     Ok(Json(month_now(&state, month).await?))
 }
 
+#[derive(Deserialize)]
+pub(super) struct CurrencyRequest {
+    /// The three letters the account is in, whatever the bank says, or
+    /// null to take the bank's word again.
+    currency: Option<String>,
+    month: Option<String>,
+}
+
+/// The owner says what currency an account is in, where the bank has it
+/// wrong. Nothing is converted: this only says which totals it is in.
+pub(super) async fn set_account_currency(
+    State(state): State<AppState>,
+    _device: Device,
+    Path(id): Path<Uuid>,
+    Json(request): Json<CurrencyRequest>,
+) -> Result<Json<MoneyResponse>, ApiError> {
+    let month = parse_month(request.month.as_deref())?;
+    let currency = match request.currency.as_deref().map(str::trim) {
+        None => None,
+        Some(code) if code.len() == 3 && code.chars().all(|c| c.is_ascii_uppercase()) => Some(code),
+        Some(_) => return Err(ApiError::BadRequest("currency must be three capital letters, like CAD")),
+    };
+    let mut tx = state.pool.begin().await?;
+    if !db::set_money_account_currency(&mut tx, id, currency).await? {
+        return Err(ApiError::NotFound);
+    }
+    // Money moved is matched only within one currency.
+    db::resort_money(&mut tx).await?;
+    tx.commit().await?;
+    Ok(Json(month_now(&state, month).await?))
+}
+
 // --- Worth ---------------------------------------------------------------
 
 #[derive(Serialize)]

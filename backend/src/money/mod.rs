@@ -165,8 +165,10 @@ pub struct BankHolding {
     /// The ticker, where the bank gives one.
     pub symbol: String,
     pub name: String,
-    /// The currency its value is in, which need not be the account's.
-    pub currency: String,
+    /// The currency its value is in, where the bank gives one, which need
+    /// not be the account's. Without one it is in the account's, whichever
+    /// that is said to be.
+    pub currency: Option<String>,
     /// How many are held, in millionths; zero when the bank does not say.
     pub shares_micro: i64,
     /// What they are worth now, as the bank last priced them.
@@ -385,7 +387,7 @@ fn parse_account(value: &Value) -> Option<(BankAccount, String)> {
     let listed = object.get("holdings").and_then(Value::as_array);
     let (holdings, unreadable_holdings) = match listed {
         Some(listed) => {
-            let (holdings, unreadable) = parse_holdings(listed, &currency);
+            let (holdings, unreadable) = parse_holdings(listed);
             (Some(holdings), unreadable)
         }
         None => (None, 0),
@@ -443,11 +445,11 @@ fn parse_transaction(value: &Value) -> Option<BankTransaction> {
 /// is taken for granted: a holding with no value is counted and left out,
 /// as is one the bridge gives the same id twice. Where the bridge gives no
 /// ids, the same fund listed twice is two lots of it, and both are kept.
-fn parse_holdings(listed: &[Value], account_currency: &str) -> (Vec<BankHolding>, usize) {
+fn parse_holdings(listed: &[Value]) -> (Vec<BankHolding>, usize) {
     let mut holdings: Vec<BankHolding> = Vec::new();
     let mut unreadable = 0;
     for item in listed {
-        let Some((mut holding, has_id)) = parse_holding(item, account_currency) else {
+        let Some((mut holding, has_id)) = parse_holding(item) else {
             unreadable += 1;
             continue;
         };
@@ -466,7 +468,7 @@ fn parse_holdings(listed: &[Value], account_currency: &str) -> (Vec<BankHolding>
 }
 
 /// One holding, and whether the bridge gave an id for it.
-fn parse_holding(value: &Value, account_currency: &str) -> Option<(BankHolding, bool)> {
+fn parse_holding(value: &Value) -> Option<(BankHolding, bool)> {
     let object = value.as_object()?;
     let line = |name: &str, most: usize| ledger::shown(&text(object.get(name)).unwrap_or_default(), most);
     let symbol = line("symbol", 20);
@@ -474,9 +476,7 @@ fn parse_holding(value: &Value, account_currency: &str) -> Option<(BankHolding, 
     // Told apart by the bridge's id, or failing that by what it is.
     let given = line("id", 200);
     let id = [given.clone(), symbol.clone(), name.clone()].into_iter().find(|id| !id.is_empty())?;
-    let currency = text(object.get("currency"))
-        .filter(|code| code.len() == 3 && code.chars().all(|c| c.is_ascii_uppercase()))
-        .unwrap_or_else(|| account_currency.to_string());
+    let currency = text(object.get("currency")).filter(|code| code.len() == 3 && code.chars().all(|c| c.is_ascii_uppercase()));
     let holding = BankHolding {
         id,
         symbol,
@@ -658,7 +658,7 @@ mod tests {
                     id: "HOL-1".into(),
                     symbol: "WRLD".into(),
                     name: "Whole World Equity Fund".into(),
-                    currency: "CAD".into(),
+                    currency: Some("CAD".into()),
                     shares_micro: 350_125_400,
                     value_minor: 1_204_830,
                     cost_minor: Some(1_000_000),
@@ -667,7 +667,7 @@ mod tests {
                     id: "HOL-2".into(),
                     symbol: "BIG".into(),
                     name: "Big Tech Co".into(),
-                    currency: "USD".into(),
+                    currency: Some("USD".into()),
                     shares_micro: 4_000_000,
                     value_minor: 150_050,
                     cost_minor: None,
@@ -676,7 +676,7 @@ mod tests {
                     id: "Savings Bond".into(),
                     symbol: String::new(),
                     name: "Savings Bond".into(),
-                    currency: "CAD".into(),
+                    currency: None,
                     shares_micro: 0,
                     value_minor: 60_000,
                     cost_minor: None,
@@ -685,7 +685,7 @@ mod tests {
                     id: "Savings Bond #2".into(),
                     symbol: String::new(),
                     name: "Savings Bond".into(),
-                    currency: "CAD".into(),
+                    currency: None,
                     shares_micro: 1_000_000,
                     value_minor: 15_000,
                     cost_minor: None,

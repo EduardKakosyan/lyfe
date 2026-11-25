@@ -175,6 +175,27 @@ enum WorthFixture {
         #expect(MoneyText.accountDetail(worth.accounts[0], now: now) == "FIRST BANK")
     }
 
+    @Test func anAccountTheBankPutsInAnotherCurrencyCanBeSaidToBeInTheTotals() {
+        let worth = WorthFixture.decoded()
+        let now = ISO8601DateFormatter().date(from: "2026-11-17T15:00:00Z")!
+        var account = worth.accounts[2]
+        // In the totals' currency: nothing to say.
+        #expect(MoneyText.currencyChoice(account, totals: "CAD") == nil)
+        #expect(MoneyText.currencyNote(account, totals: "CAD") == nil)
+        // The bank says USD.
+        account.currency = "USD"
+        #expect(MoneyText.currencyChoice(account, totals: "CAD")! == ("It is in CAD, not USD", "CAD"))
+        #expect(
+            MoneyText.currencyNote(account, totals: "CAD")
+                == "The bank says it is in USD. Nothing is converted, so it is left out of every total until you say it is in CAD.")
+        // The owner said CAD: it says what the bank says, and can be taken back.
+        account.currency = "CAD"
+        account.bankCurrency = "USD"
+        #expect(MoneyText.accountDetail(account, now: now) == "FIRST BANK · INVESTED · SET ASIDE · THE BANK SAYS USD")
+        #expect(MoneyText.currencyChoice(account, totals: "CAD")! == ("Back to the bank's USD", nil))
+        #expect(MoneyText.currencyNote(account, totals: "CAD") == nil)
+    }
+
     @Test func theLineRunsFromTheFirstDayKeptToToday() {
         let worth = WorthFixture.decoded()
         let layout = WorthChartLayout(points: worth.series, size: CGSize(width: 312, height: 150))
@@ -204,6 +225,34 @@ enum WorthFixture {
 
 @MainActor
 @Suite struct WorthModelTests {
+    func sent(_ world: World, _ route: String) -> [[String: Any]] {
+        world.backend.bodies(route).compactMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+    }
+
+    @Test func sayingWhatCurrencyAnAccountIsInFetchesWhatItChanges() async throws {
+        let world = World.signedIn()
+        let route = "PUT /v1/money/accounts/\(MoneyFixture.id(901))/currency"
+        world.backend.on("GET /v1/money", .ok(MoneyFixture.month()))
+        world.backend.on("GET /v1/money/worth", .ok(WorthFixture.worth()), .ok(WorthFixture.worth(setAside: 2_850_000)))
+        world.backend.on("GET /v1/money/fire", .ok(FireFixture.fire()))
+        world.backend.on(route, .ok(MoneyFixture.month()))
+        let model = world.launch()
+        await model.loadMoney(month: nil)
+        await model.loadWorth()
+        await model.loadFire()
+
+        let id = UUID(uuidString: MoneyFixture.id(901))!
+        #expect(await model.setCurrency(account: id, "CAD") == nil)
+        let body = try #require(sent(world, route).first)
+        #expect(body["currency"] as? String == "CAD")
+        #expect(body["month"] as? String == model.money?.month)
+        #expect(model.worth?.setAsideMinor == 2_850_000)
+        #expect(model.fire == nil)
+        // Taken back, it says no currency.
+        #expect(await model.setCurrency(account: id, nil) == nil)
+        #expect(sent(world, route).last?["currency"] == nil)
+    }
+
     @Test func worthIsFetchedWhenItsSectionOpensAndKeptWhileLyfeRuns() async throws {
         let world = World.signedIn()
         world.backend.on("GET /v1/money/worth", .ok(WorthFixture.worth()))
