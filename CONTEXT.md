@@ -139,6 +139,10 @@ _Avoid_: Tag, budget line, envelope
 An account the owner has marked as savings or investments. Its balance is shown; nothing that moves in it counts as spending or waits to be sorted. Every other account is an everyday account. What is set aside is what counts towards financial independence.
 _Avoid_: Hidden account, excluded account, savings (for the mark itself)
 
+**Currency**:
+What an account's money is in: the bank's to say, unless the owner says otherwise, as a bank can name the wrong one. Totals are in one currency, and an account or holding in another is left out of them; nothing is converted.
+_Avoid_: Exchange rate (lyfe has none), FX
+
 **Investment account**:
 An account the bank lists holdings for. Its balance is invested, not money in the bank. That is the bank's to say, each time it is asked; whether the account is set aside is still the owner's, and it starts that way the first time the bank lists what it holds.
 _Avoid_: Brokerage (as a term in lyfe), portfolio, trading account

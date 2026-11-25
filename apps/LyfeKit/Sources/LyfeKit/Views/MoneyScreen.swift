@@ -23,6 +23,8 @@ public struct MoneyScreen: View {
     let onSortNext: () -> Void
     /// Sets an account aside or brings it back; answers with what went wrong.
     let onSetAside: (UUID, Bool) async -> String?
+    /// Says what currency an account is in, or takes that back with nil.
+    var onCurrency: (UUID, String?) async -> String? = { _, _ in nil }
     /// Shows another section.
     var onSection: (MoneySection) -> Void = { _ in }
     /// Fetches the section on screen again, when it is not the month.
@@ -127,9 +129,21 @@ public struct MoneyScreen: View {
                 Button(account.setAside ? "Bring it back" : "Set it aside") {
                     Task { note = await onSetAside(account.id, !account.setAside) }
                 }
+                if let choice = MoneyText.currencyChoice(account, totals: totals) {
+                    Button(choice.label) {
+                        Task { note = await onCurrency(account.id, choice.currency) }
+                    }
+                }
+            }
+        } message: {
+            if let account = asking, let currency = MoneyText.currencyNote(account, totals: totals) {
+                Text(currency)
             }
         }
     }
+
+    /// The currency the totals are in.
+    private var totals: String { worth?.currency ?? money?.currency ?? "" }
 
     private var askingShown: Binding<Bool> {
         Binding(get: { asking != nil }, set: { if !$0 { asking = nil } })

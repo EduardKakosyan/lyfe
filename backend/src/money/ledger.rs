@@ -392,6 +392,9 @@ pub struct Account {
     /// The bank lists what it holds: an investment account.
     pub invested: bool,
     pub problem: Option<String>,
+    /// What the bank says the account is in, where the owner said it is in
+    /// another: `currency` is the owner's word.
+    pub bank_currency: Option<String>,
 }
 
 /// Something wrong with where the figures come from, worded for the owner.
@@ -444,6 +447,8 @@ pub struct AccountView {
     /// The bank has not refreshed the balance for some days.
     pub stale: bool,
     pub problem: Option<String>,
+    /// What the bank says the account is in, where the owner said otherwise.
+    pub bank_currency: Option<String>,
 }
 
 impl AccountView {
@@ -460,6 +465,7 @@ impl AccountView {
             invested: account.invested,
             stale: (now - account.balance_at).num_days() >= STALE_AFTER_DAYS,
             problem: account.problem.clone(),
+            bank_currency: account.bank_currency.clone(),
         }
     }
 }
@@ -890,6 +896,7 @@ mod tests {
             set_aside,
             invested: false,
             problem: None,
+            bank_currency: None,
         }
     }
 

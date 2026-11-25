@@ -576,7 +576,7 @@ async fn money_check(config: MoneyConfig) -> anyhow::Result<()> {
         );
         // Counts and a share only: what is held and what it is worth stay out of the terminal.
         if let Some(holdings) = account.holdings.as_ref().filter(|_| account.holds_investments) {
-            let same_currency = holdings.iter().filter(|holding| holding.currency == account.currency);
+            let same_currency = holdings.iter().filter(|holding| holding.currency.as_ref().is_none_or(|currency| *currency == account.currency));
             let held: i64 = same_currency.clone().map(|holding| holding.value_minor).sum();
             let of_balance = if same_currency.count() == holdings.len() && account.balance_minor > 0 {
                 format!(", coming to {}% of its balance", (held as f64 / account.balance_minor as f64 * 100.0).round())

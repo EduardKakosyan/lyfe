@@ -352,6 +352,7 @@ mod tests {
             set_aside,
             invested,
             problem: None,
+            bank_currency: None,
         }
     }
 
