@@ -14,3 +14,7 @@ Full two-way synchronisation between equal replicas was not chosen: with one use
 - Nothing may require Spark to accept connections from the public internet in the first version. A bank-data provider that needs to call in would reopen this.
 - Tailnet access rules for other Spark users, key custody, the backup destination and restore testing remain open.
 - This does not authorize deploying anything to Spark.
+
+## Note, 2026-11-25
+
+The backup destination and restore testing are no longer open. The destination was decided on 2026-11-18: a private bucket in Supabase Storage, sent to nightly and encrypted on the Spark before it leaves. One of the first backups, taken that day, was fetched back, restored into a scratch database on the Spark and matched the live one (`docs/build-plan.md`). How to restore is in `docs/operations.md`. The other two open items, tailnet access rules for other Spark users and key custody, are unchanged by this note.

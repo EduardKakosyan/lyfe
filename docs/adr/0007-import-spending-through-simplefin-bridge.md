@@ -21,3 +21,7 @@ What lyfe does with the transactions is decided here too, because the provider s
 - The bridge is a small paid subscription, and a single small provider. The bridge's client is one module and the entries it fills are not shaped by it beyond the bank's id for a transaction, so another source could fill the same tables.
 - Sorting is by hand, once for each payee. It was chosen over a model's guess because a wrong category is worse than an unsorted one in a figure the owner is meant to trust; a model on the Spark suggesting a category is a later option.
 - The two migrations that made and dropped the Plaid tables stay, as the database on the Spark has run them.
+
+## Amended, 2026-11-25
+
+"Nothing about money is stored on the phone" is not quite so. The phone keeps the last Home it was sent in a file (`home.json`, `HomeCache` in `apps/LyfeKit/Sources/LyfeKit/Store/Stores.swift`), so that Home can be shown offline with its age, and Home carries the money strip (`MoneyGlance` in `Money/Money.swift`, the `money` field of `HomeSnapshot`): the month, its currency, what has been spent in it so far, how many entries wait to be sorted, the first problem with the import, which can name a bank, and when the last import succeeded. The file is written with the protection that keeps it encrypted until the phone is first unlocked after a restart. MONTH, WORTH and FIRE themselves are fetched when they are opened and held only in memory while lyfe runs.

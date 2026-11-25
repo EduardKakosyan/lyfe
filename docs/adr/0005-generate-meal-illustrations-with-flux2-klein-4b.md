@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: accepted, amended by 0006
 ---
 
 # Generate meal illustrations with FLUX.2 klein 4B on Spark
@@ -12,6 +12,6 @@ The look described here, the pictogram prompt and the snap to five colours, was 
 
 - Generation never blocks logging: the meal is saved first, the illustration is attached afterwards, and the plain photo is shown if generation fails or Spark has too little free memory.
 - The model takes about two minutes to load from disk, so jobs should be batched or the worker kept warm briefly; it must check available memory before loading because the machine is shared.
-- A strict five-colour palette recolours food unnaturally and mixed dishes become abstract; this is accepted as part of the look.
+- A strict five-colour palette recolours food unnaturally and mixed dishes become abstract; this is accepted as part of the look. No longer so: ADR 0006 dropped the five-colour snap, and drawings in the current look (`illustration::LOOK`) keep the food's own colours.
 - The test was eight images per round on stock photos. Consistency across many of the owner's own meals is unproven; a fixed style reference, a tuned style or the 9B model are the fallbacks if the look drifts.
 - This does not authorize deploying a service on Spark; the test files left there are a prototype.
