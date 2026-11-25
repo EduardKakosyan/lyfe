@@ -934,7 +934,7 @@ enum BuiltFixture {
 /// Runs the app's own client against a backend started for the purpose,
 /// for a meal built from parts: what is sent, and that the answers read.
 /// The backend's LYFE_OLLAMA_URL should point at the stand-in that answers
-/// every chat with rice and chicken (see the README). It logs a meal and
+/// every chat with rice and chicken (see docs/development.md). It logs a meal and
 /// saves one, so point it at a scratch database:
 /// `LYFE_LOCAL_SERVER=http://127.0.0.1:8799 LYFE_LOCAL_PASSWORD=... swift test --no-parallel`.
 @MainActor

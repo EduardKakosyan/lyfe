@@ -110,12 +110,12 @@ install -m 644 "$STAGE/lyfe-illustrate.py" ~/illustrator/lyfe-illustrate.py
 install -m 755 "$STAGE/lyfe-illustrate" ~/bin/lyfe-illustrate
 install -m 755 "$STAGE/lyfe-illustrator-setup" ~/bin/lyfe-illustrator-setup
 if [ ! -e ~/illustrator/ready ]; then
-    echo "Meals are not illustrated, and food icons not drawn, yet: run ~/bin/lyfe-illustrator-setup once as lyfe (about 21 GB; see the README)."
+    echo "Meals are not illustrated, and food icons not drawn, yet: run ~/bin/lyfe-illustrator-setup once as lyfe (about 21 GB; see docs/operations.md)."
 fi
 # Money. The access address is written once, by `lyfe-server money-connect`.
 MONEY_FILE=$(sed -n 's/^LYFE_SIMPLEFIN_ACCESS_FILE=//p' ~/.config/lyfe/lyfe.env | tail -1)
 if [ -z "$MONEY_FILE" ]; then
-    echo "Money is off: LYFE_SIMPLEFIN_ACCESS_FILE is not set in ~/.config/lyfe/lyfe.env (see the README)."
+    echo "Money is off: LYFE_SIMPLEFIN_ACCESS_FILE is not set in ~/.config/lyfe/lyfe.env (see docs/operations.md)."
 elif [ ! -s "$MONEY_FILE" ]; then
     echo "No bank is connected yet: make a setup token at SimpleFIN Bridge, then run"
     echo "  set -a; . ~/.config/lyfe/lyfe.env; set +a; ~/bin/lyfe-server money-connect"
@@ -127,7 +127,7 @@ if BACKUP_MISSING=$(~/bin/lyfe-backup ready); then
     echo "The nightly backup is on. Last run: $(systemctl --user show lyfe-backup.service -p ExecMainExitTimestamp --value | grep . || echo never)."
 else
     systemctl --user disable --now lyfe-backup.timer >/dev/null 2>&1 || true
-    echo "NO BACKUP YET: the database on this machine is the only copy. Still to do (see the README):"
+    echo "NO BACKUP YET: the database on this machine is the only copy. Still to do (see docs/operations.md):"
     echo "$BACKUP_MISSING" | sed 's/^/  - /'
 fi
 rm -rf "$STAGE"

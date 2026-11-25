@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: accepted, amended by 0007
 ---
 
 # Build routines first, then study, then money

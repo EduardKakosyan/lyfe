@@ -31,7 +31,7 @@ What the owner says, without looking it up, about what a build session built and
 _Avoid_: Reflection, journal entry, summary
 
 **Goal**:
-Where the owner means to get by a date: a figure lyfe already reads, reached (net worth, a breath hold, the weight trend); a total built up (hours on a subject); or a result got (a certification). It names the routine that moves it and is shown against its pace. Three are active at once; the rest are parked, never deleted. lyfe never moves a goal's date; it may suggest it.
+Where the owner means to get by a date: a figure lyfe already reads, reached (a breath hold, the weight trend, the body-fat estimate; net worth is planned, not built); a total built up (hours on a subject); or a result got (a certification). It names the routine that moves it and is shown against its pace. Three are active at once; the rest are parked, never deleted. lyfe never moves a goal's date; it may suggest it.
 _Avoid_: Target (that is what a day is held to), objective, resolution, OKR
 
 **Exam**:
@@ -40,7 +40,7 @@ _Avoid_: Test (that is a practice test), certificate (that is what a pass gives)
 
 **Practice score**:
 The score of one practice test for an exam, typed after it, with each part's percentage where the test gave one. Ready is the owner's own rule: so many practice scores in a row at least so far over the pass mark.
-_Avoid_: Mock (that is the four-weekly interview), quiz score
+_Avoid_: Mock (that is the four-weekly interview, which is planned, not built), quiz score
 
 **Pace**:
 Where a goal would be today had it moved in a straight line from where it started to its figure on its date. Behind pace is an amount, and what would now be needed to make it, never a failure.
@@ -98,6 +98,25 @@ _Avoid_: Goal, budget, limit
 The mean of the day's weights over the last seven days that have one, given once at least three do. It is the weight trend; a single morning's reading is not.
 _Avoid_: Weight trend line (as a separate figure), moving average
 
+**Weekly rate**:
+How fast the owner means their weight to change, as a percentage of it a week, from −1 to +1; 0 holds it. Set on Progress. A target review measures the seven-day averages against it. It is not a goal.
+_Avoid_: Weight goal, trend goal, target (that is what a day is held to)
+
+**Confirmed day**:
+A day the owner has said holds everything they ate, said on that day. Only confirmed days with every figure known can back a target review.
+_Avoid_: Complete day (lyfe does not decide it), closed day
+
+**Target review**:
+lyfe's proposal to move the calorie target by 100 kcal a day. It is made only after fourteen confirmed days, with the target unchanged, and three weeks of weigh-ins in which the week-to-week change in the seven-day average missed the weekly rate twice running, on the same side, by more than 0.25 percentage points. It changes nothing until the owner approves it, and protein stays as it was.
+_Avoid_: Auto-adjustment, coaching, recommendation
+
+**Tape measurement**:
+Height, waist and neck, and the hip for the formula that uses it, measured with a tape in centimetres. lyfe works out a body-fat estimate from them, which is what a goal on body fat reads. One is due every two weeks; Progress says so, and nothing is sent.
+_Avoid_: Body scan, body composition (as something measured)
+
+**Pool distance**:
+The metres of one dynamic apnea swim, typed on Progress. Garmin's own swims are shown apart from it.
+_Avoid_: Swim (that is Garmin's), lap count
 
 **Bridge**:
 SimpleFIN Bridge, the outside service the owner connects their banks to. It holds the bank sign-ins and hands lyfe a read-only view of the accounts. lyfe asks it; it never calls lyfe.

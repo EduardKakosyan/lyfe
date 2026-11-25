@@ -521,7 +521,7 @@ enum CaptureFixture {
 /// Runs the app's own client against a backend started for the purpose,
 /// for photo and barcode meals: what is sent, and that the answers read.
 /// The backend's LYFE_OLLAMA_URL should point at a stand-in that answers
-/// every chat with rice and chicken (see the README). It logs meals and
+/// every chat with rice and chicken (see docs/development.md). It logs meals and
 /// stores labels, so point it at a scratch database:
 /// `LYFE_LOCAL_SERVER=http://127.0.0.1:8799 LYFE_LOCAL_PASSWORD=... swift test`.
 @MainActor
@@ -569,7 +569,7 @@ struct CapturesAgainstARealBackendTests {
             await model.reloadHome()
             entry = try #require(model.home?.food?.entries.first { $0.id == id })
         }
-        let drawn = try #require(entry.illustration, "set LYFE_ILLUSTRATOR to the stand-in (see the README)")
+        let drawn = try #require(entry.illustration, "set LYFE_ILLUSTRATOR to the stand-in (see docs/development.md)")
         #expect((drawn.meal, drawn.version > 0) == (id, true))
         let png = try #require(await model.mealIllustration(drawn))
         #expect(png.starts(with: [0x89, 0x50, 0x4E, 0x47]))
