@@ -8,10 +8,11 @@
 #   lyfe-backup fetch NAME OUT  download one and decrypt it to the file OUT
 #   lyfe-backup ready           say whether the settings are complete (no network)
 #
-# The dump is encrypted here, before it leaves, with a passphrase only you
-# hold: the bucket's owner sees a file it cannot read. Keep a copy of the
-# passphrase somewhere other than the Spark, or a lost Spark takes the
-# backups with it.
+# The dump is encrypted here, before it leaves, with the passphrase in a
+# file next to the S3 key: the bucket's owner sees a file it cannot read,
+# though anyone who can read lyfe's files on the Spark (its admins) can
+# read the passphrase too. Keep a copy of the passphrase somewhere other
+# than the Spark, or a lost Spark takes the backups with it.
 #
 # Settings are in ~/.config/lyfe/backup.env. The two secrets are files it
 # points at, never values in it, and never arguments on a command line,
