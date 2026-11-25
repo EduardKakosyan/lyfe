@@ -110,7 +110,7 @@ install -m 644 "$STAGE/lyfe-illustrate.py" ~/illustrator/lyfe-illustrate.py
 install -m 755 "$STAGE/lyfe-illustrate" ~/bin/lyfe-illustrate
 install -m 755 "$STAGE/lyfe-illustrator-setup" ~/bin/lyfe-illustrator-setup
 if [ ! -e ~/illustrator/ready ]; then
-    echo "Meals are not illustrated, and food icons not drawn, yet: run ~/bin/lyfe-illustrator-setup once as lyfe (about 21 GB; see the README)."
+    echo "Meals are not illustrated, and food icons not drawn, yet: run ~/bin/lyfe-illustrator-setup once as lyfe (about 21 GB; see docs/operations.md)."
 fi
 # Money. The access address is written once, by `lyfe-server money-connect`.
 MONEY_FILE=$(sed -n 's/^LYFE_SIMPLEFIN_ACCESS_FILE=//p' ~/.config/lyfe/lyfe.env | tail -1)

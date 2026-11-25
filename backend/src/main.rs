@@ -455,7 +455,7 @@ async fn push_test(config: ServeConfig) -> anyhow::Result<()> {
         .context("could not open the database")?;
     let syncer = garmin_syncer(&config, &pool)?;
     let Some(notifier) = notifier(&config, &pool, syncer)? else {
-        bail!("set LYFE_APNS_KEY_FILE to the key Apple issued (.p8); see the README");
+        bail!("set LYFE_APNS_KEY_FILE to the key Apple issued (.p8); see docs/operations.md");
     };
     let now = Utc::now();
     notifier.apns.check_key(now).await?;
@@ -604,7 +604,7 @@ async fn money_import(config: ServeConfig) -> anyhow::Result<()> {
         .context("could not open the database")?;
     let importer = money_importer(&config, &pool)?;
     let Some(result) = importer.import_once(Utc::now()).await else {
-        bail!("set LYFE_SIMPLEFIN_ACCESS_FILE to the file `lyfe-server money-connect` wrote; see the README");
+        bail!("set LYFE_SIMPLEFIN_ACCESS_FILE to the file `lyfe-server money-connect` wrote; see docs/operations.md");
     };
     let report = result?;
     println!(
